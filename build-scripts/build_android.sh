@@ -75,6 +75,10 @@ info "✅ Go 引擎编译成功: client-android-native-shell/android/app/libs/en
 info "第二步：使用 Gradle 组装 Android Kotlin 壳应用..."
 cd client-android-native-shell/android
 
+# macOS Finder may create .DS_Store inside app/build while Gradle clean is deleting it.
+# Removing the generated build directory first makes repeated local builds deterministic.
+rm -rf app/build
+
 if [[ -x "./gradlew" ]]; then
     chmod +x ./gradlew
     ./gradlew --no-daemon clean assembleDebug assembleRelease

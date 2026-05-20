@@ -210,8 +210,9 @@ func (h *FileTransferHandler) Download(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "missing relay id"})
 	}
 
+	username := currentUsername(c)
 	var record model.FileTransfer
-	if err := h.DB.Where("relay_id = ?", relayID).First(&record).Error; err != nil {
+	if err := h.DB.Where("relay_id = ? AND owner_username = ?", relayID, username).First(&record).Error; err != nil {
 		if err == gorm.ErrRecordNotFound {
 			return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "file not found"})
 		}

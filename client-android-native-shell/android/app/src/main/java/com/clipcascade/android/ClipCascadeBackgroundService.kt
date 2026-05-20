@@ -13,6 +13,7 @@ import android.graphics.PixelFormat
 import android.os.Binder
 import android.os.Build
 import android.os.IBinder
+import android.util.Base64
 import android.util.Log
 import android.view.WindowManager
 import android.widget.LinearLayout
@@ -20,10 +21,23 @@ import androidx.core.content.ContextCompat
 import bridge.bridge.Bridge
 import bridge.bridge.Engine
 import bridge.bridge.MessageCallback
+import java.io.File
+import java.io.FileOutputStream
+import java.util.UUID
 
 class ClipCascadeBackgroundService : Service(), MessageCallback {
 
     private val TAG = "ClipCascade_BgSvc"
+
+    companion object {
+        const val ACTION_STATUS_CHANGED = "com.clipcascade.android.action.STATUS_CHANGED"
+        const val ACTION_SEND_SHARED_TEXT = "com.clipcascade.android.action.SEND_SHARED_TEXT"
+        const val ACTION_SEND_SHARED_IMAGE = "com.clipcascade.android.action.SEND_SHARED_IMAGE"
+        const val EXTRA_STATUS = "com.clipcascade.android.extra.STATUS"
+        const val EXTRA_DETAIL = "com.clipcascade.android.extra.DETAIL"
+        const val EXTRA_SHARED_TEXT = "com.clipcascade.android.extra.SHARED_TEXT"
+        const val EXTRA_SHARED_IMAGE = "com.clipcascade.android.extra.SHARED_IMAGE"
+    }
     
     private val notificationId = 1001
     private val channelId = "clipcascade_sync_channel"
@@ -67,6 +81,17 @@ class ClipCascadeBackgroundService : Service(), MessageCallback {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         Log.i(TAG, "🚀 后台服务已启动 (onStartCommand)")
         startEngineIfNeeded()
+        if (intent?.action == ACTION_SEND_SHARED_TEXT) {
+            val sharedText = intent.getStringExtra(EXTRA_SHARED_TEXT)?.trim().orEmpty()
+            if (sharedText.isNotBlank()) {
+                sendSharedPayloadWhenReady(sharedText, "text")
+            }
+        } else if (intent?.action == ACTION_SEND_SHARED_IMAGE) {
+            val sharedImage = intent.getStringExtra(EXTRA_SHARED_IMAGE)?.trim().orEmpty()
+            if (sharedImage.isNotBlank()) {
+                sendSharedPayloadWhenReady(sharedImage, "image")
+            }
+        }
         
         // 保证服务被杀后系统自动重启它
         return START_STICKY
@@ -133,17 +158,28 @@ class ClipCascadeBackgroundService : Service(), MessageCallback {
             } catch (e: Exception) {
                 Log.e(TAG, "写入剪贴板失败: ${e.message}")
             }
+        } else if (payloadType == "image") {
+            try {
+                val bytes = Base64.decode(payload, Base64.DEFAULT)
+                val file = saveHistoryImage(bytes, "received")
+                if (file != null) {
+                    ClipboardHistoryStore.appendImage(this, file.absolutePath, "received")
+                    Log.i(TAG, "✅ 已保存远端图片历史")
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "保存远端图片失败: ${e.message}", e)
+            }
         }
     }
 
     override fun onStatusChange(status: String) {
         Log.i(TAG, "网络状态变更: $status")
         when (status) {
-            "connected" -> updateNotificationContent("已连接到服务器，实时同步中")
-            "disconnected" -> updateNotificationContent("连接已断开，等待自动重连")
-            "reconnecting" -> updateNotificationContent("正在重连服务器...")
-            "error" -> updateNotificationContent("连接错误")
-            else -> updateNotificationContent("状态: $status")
+            "connected" -> updateStatus("connected", "已连接到服务器，实时同步中")
+            "disconnected" -> updateStatus("disconnected", "连接已断开，等待自动重连")
+            "reconnecting" -> updateStatus("reconnecting", "正在重连服务器...")
+            "error" -> updateStatus("error", "连接错误")
+            else -> updateStatus(status, "状态: $status")
         }
     }
 
@@ -177,8 +213,51 @@ class ClipCascadeBackgroundService : Service(), MessageCallback {
         }
     }
 
+    private fun sendSharedPayloadWhenReady(payload: String, payloadType: String) {
+        Thread {
+            val deadline = System.currentTimeMillis() + 8000L
+            while (engine == null && engineStarting && System.currentTimeMillis() < deadline) {
+                try {
+                    Thread.sleep(120L)
+                } catch (_: InterruptedException) {
+                    return@Thread
+                }
+            }
+
+            val currentEngine = engine
+            if (currentEngine == null) {
+                updateStatus("error", "分享失败：请先配置并连接服务器")
+                Log.w(TAG, "分享失败：engine 尚未连接")
+                return@Thread
+            }
+
+            try {
+                if (payloadType == "text") {
+                    lastWrittenText = payload
+                    ClipboardHistoryStore.append(this, payload, "sent")
+                } else if (payloadType == "image") {
+                    val bytes = Base64.decode(payload, Base64.DEFAULT)
+                    saveHistoryImage(bytes, "sent")?.let {
+                        ClipboardHistoryStore.appendImage(this, it.absolutePath, "sent")
+                    }
+                }
+                currentEngine.sendClipboard(payload, payloadType)
+                updateStatus("connected", if (payloadType == "image") "已发送分享图片" else "已发送分享文本")
+                Log.i(TAG, "✅ 分享内容已发送: $payloadType")
+            } catch (e: Exception) {
+                updateStatus("error", "分享失败：${e.message}")
+                Log.e(TAG, "分享发送失败", e)
+            }
+        }.start()
+    }
+
     private fun startEngineIfNeeded() {
-        if (engine != null || engineStarting) {
+        if (engine != null) {
+            updateStatus("connected", "已连接到服务器，实时同步中")
+            return
+        }
+        if (engineStarting) {
+            updateStatus("connecting", "正在连接服务器...")
             return
         }
         val prefs = getSharedPreferences("clipcascade", Context.MODE_PRIVATE)
@@ -188,22 +267,23 @@ class ClipCascadeBackgroundService : Service(), MessageCallback {
         val e2e = prefs.getBoolean("E2EE", true)
 
         if (url.isBlank() || user.isBlank() || pass.isBlank()) {
-            updateNotificationContent("未配置服务器账号，请先在应用内填写配置")
+            updateStatus("disconnected", "未配置服务器账号，请先在应用内填写配置")
             return
         }
 
         engineStarting = true
+        updateStatus("connecting", "正在连接 $url")
         Thread {
             try {
                 val created = Bridge.newEngine(url, user, pass, e2e)
                 created.setCallback(this)
                 created.start()
                 engine = created
-                updateNotificationContent("已连接到服务器，实时同步中")
+                updateStatus("connected", "已连接到 $url")
             } catch (e: Exception) {
                 engine = null
                 Log.e(TAG, "Go 引擎启动失败", e)
-                updateNotificationContent("连接失败: ${e.message}")
+                updateStatus("error", "连接失败: ${e.message}")
             } finally {
                 engineStarting = false
             }
@@ -304,6 +384,34 @@ class ClipCascadeBackgroundService : Service(), MessageCallback {
             .setOngoing(true)
             .build()
         notificationManager.notify(notificationId, notification)
+    }
+
+    private fun updateStatus(status: String, detail: String) {
+        val prefs = getSharedPreferences("clipcascade", Context.MODE_PRIVATE)
+        prefs.edit()
+            .putString("ConnectionStatus", status)
+            .putString("ConnectionDetail", detail)
+            .putLong("ConnectionUpdatedAt", System.currentTimeMillis())
+            .apply()
+
+        updateNotificationContent(detail)
+        sendBroadcast(Intent(ACTION_STATUS_CHANGED).apply {
+            setPackage(packageName)
+            putExtra(EXTRA_STATUS, status)
+            putExtra(EXTRA_DETAIL, detail)
+        })
+    }
+
+    private fun saveHistoryImage(bytes: ByteArray, direction: String): File? {
+        return try {
+            val dir = File(cacheDir, "history-images").apply { mkdirs() }
+            val file = File(dir, "${System.currentTimeMillis()}-$direction-${UUID.randomUUID()}.bin")
+            FileOutputStream(file).use { it.write(bytes) }
+            file
+        } catch (e: Exception) {
+            Log.w(TAG, "保存图片历史失败", e)
+            null
+        }
     }
 
     override fun onDestroy() {

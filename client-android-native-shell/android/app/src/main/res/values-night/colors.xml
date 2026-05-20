@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="cc_primary">#7DA2FF</color>
+    <color name="cc_primary_dark">#9BB7FF</color>
+    <color name="cc_on_primary">#071326</color>
+    <color name="cc_secondary">#5EEAD4</color>
+    <color name="cc_background">#0F172A</color>
+    <color name="cc_surface">#172033</color>
+    <color name="cc_surface_variant">#23304A</color>
+    <color name="cc_outline">#34415E</color>
+    <color name="cc_text_primary">#F8FAFC</color>
+    <color name="cc_text_secondary">#A8B3C7</color>
+    <color name="cc_success">#64D7A4</color>
+    <color name="cc_warning">#F6C177</color>
+</resources>

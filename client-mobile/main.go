@@ -17,6 +17,7 @@ import (
 	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
 
+	"github.com/clipcascade/pkg/netutil"
 	"github.com/grandcat/zeroconf"
 )
 
@@ -84,7 +85,7 @@ func main() {
 	addDiscoveredHost(serverURL)
 
 	go func() {
-		resolver, err := zeroconf.NewResolver(nil)
+		resolver, err := zeroconf.NewResolver(zeroconf.SelectIfaces(netutil.UsableLANInterfaces()))
 		if err != nil {
 			return
 		}
@@ -104,12 +105,12 @@ func main() {
 					continue
 				}
 				for _, ip := range entry.AddrIPv4 {
+					if !netutil.IsUsableLANIPv4(ip) {
+						continue
+					}
 					addDiscoveredHost(fmt.Sprintf("http://%s:%d", ip, entry.Port))
 				}
-				for _, ip := range entry.AddrIPv6 {
-					addDiscoveredHost(fmt.Sprintf("http://[%s]:%d", ip, entry.Port))
-				}
-				if len(entry.AddrIPv4) == 0 && len(entry.AddrIPv6) == 0 && entry.HostName != "" {
+				if len(entry.AddrIPv4) == 0 && entry.HostName != "" {
 					host := strings.TrimSuffix(entry.HostName, ".")
 					addDiscoveredHost(fmt.Sprintf("http://%s:%d", host, entry.Port))
 				}

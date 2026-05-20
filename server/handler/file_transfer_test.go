@@ -190,6 +190,50 @@ func TestProgressAndCompleteDeferredFile(t *testing.T) {
 	}
 }
 
+func TestDownloadRelayFileRequiresOwner(t *testing.T) {
+	db := newTestDB(t)
+	tempDir := t.TempDir()
+	cfg := &config.Config{
+		FileRelayEnabled:    true,
+		FileRelayDir:        tempDir,
+		FileRelayMaxBytes:   constants.DefaultFileRelayMaxBytes,
+		FileRelayTTLSeconds: 3600,
+	}
+	h := NewFileTransferHandler(db, cfg, NewWSHub())
+
+	filePath := filepath.Join(tempDir, "private.txt")
+	content := []byte("alice private file")
+	if err := os.WriteFile(filePath, content, 0o644); err != nil {
+		t.Fatalf("write relay file failed: %v", err)
+	}
+	relay := &model.FileTransfer{
+		RelayID:       "relay-private",
+		OwnerUsername: "alice",
+		FileName:      "private.txt",
+		FileSize:      int64(len(content)),
+		SHA256:        "abc123",
+		MimeType:      "text/plain",
+		StoragePath:   filePath,
+		ExpiresAt:     time.Now().Add(time.Hour),
+	}
+	if err := db.Create(relay).Error; err != nil {
+		t.Fatalf("create relay record failed: %v", err)
+	}
+
+	app := fiber.New()
+	app.Get("/api/files/:relayID", withUser("bob", h.Download))
+
+	req := httptest.NewRequest(http.MethodGet, "/api/files/relay-private", nil)
+	resp, err := app.Test(req, -1)
+	if err != nil {
+		t.Fatalf("download request failed: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("expected non-owner download to be hidden as 404, got %d", resp.StatusCode)
+	}
+}
+
 func TestRequestDeferredWithoutOnlineSourceReturnsPendingMessage(t *testing.T) {
 	db := newTestDB(t)
 	cfg := &config.Config{

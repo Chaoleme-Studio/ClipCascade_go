@@ -8,12 +8,20 @@ import (
 	"embed"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
+	"github.com/clipcascade/pkg/netutil"
+	"github.com/clipcascade/server/config"
+	"github.com/clipcascade/server/handler"
+	"github.com/clipcascade/server/middleware"
+	"github.com/clipcascade/server/model"
 	"github.com/glebarez/sqlite" // 纯 Go 实现的 SQLite (无需 CGO)
 	"github.com/gofiber/contrib/websocket"
 	"github.com/gofiber/fiber/v2"
@@ -22,17 +30,9 @@ import (
 	"github.com/gofiber/fiber/v2/middleware/logger"
 	"github.com/gofiber/fiber/v2/middleware/session"
 	"github.com/gofiber/template/html/v2"
+	"github.com/grandcat/zeroconf"
 	"golang.org/x/crypto/bcrypt"
 	"gorm.io/gorm"
-
-	"github.com/clipcascade/server/config"
-	"github.com/clipcascade/server/handler"
-	"github.com/clipcascade/server/middleware"
-	"github.com/clipcascade/server/model"
-	"github.com/grandcat/zeroconf"
-	"net"
-	"os/signal"
-	"syscall"
 )
 
 //go:embed web/templates/*.html
@@ -203,6 +203,18 @@ func main() {
 	app.Get("/api/ws-stats", func(c *fiber.Ctx) error {
 		return c.JSON(wsHub.Stats())
 	})
+	app.Get("/api/devices/online", func(c *fiber.Ctx) error {
+		username, _ := c.Locals("username").(string)
+		online := wsHub.UserConnectionCount(username)
+		syncTargets := online - 1
+		if syncTargets < 0 {
+			syncTargets = 0
+		}
+		return c.JSON(fiber.Map{
+			"online_devices": online,
+			"sync_targets":   syncTargets,
+		})
+	})
 	app.Get("/api/files/deferred", fileTransferHandler.ListDeferred)
 	app.Get("/api/files/deferred/:deferredID", fileTransferHandler.GetDeferred)
 	app.Delete("/api/files/deferred/:deferredID", fileTransferHandler.DeleteDeferred)
@@ -295,12 +307,13 @@ func main() {
 
 	// 启动 mDNS 服务广播
 	serverName := fmt.Sprintf("ClipCascade-%d", actualPort)
-	mdnsServer, err := zeroconf.Register(serverName, "_clipcascade._tcp", "local.", actualPort, []string{"txtv=1", "app=clipcascade"}, nil)
+	mdnsIfaces := netutil.UsableLANInterfaces()
+	mdnsServer, err := zeroconf.Register(serverName, "_clipcascade._tcp", "local.", actualPort, []string{"txtv=1", "app=clipcascade"}, mdnsIfaces)
 	if err != nil {
 		slog.Warn("注册 mDNS 服务失败", "error", err)
 	} else {
 		defer mdnsServer.Shutdown()
-		slog.Info("📢 局域网发现已激活 (mDNS)", "service", "_clipcascade._tcp", "name", serverName)
+		slog.Info("📢 局域网发现已激活 (mDNS)", "service", "_clipcascade._tcp", "name", serverName, "interfaces", interfaceNames(mdnsIfaces))
 	}
 
 	// 优雅关机处理
@@ -356,19 +369,15 @@ func seedAdminUser(db *gorm.DB) {
 	slog.Info("✅ 默认管理员用户已创建 (admin / admin123)")
 }
 
-// getLocalIPs 返回所有非回环 IPv4 地址。
+// getLocalIPs 返回适合局域网访问的 IPv4 地址。
 func getLocalIPs() []string {
-	var ips []string
-	addrs, err := net.InterfaceAddrs()
-	if err != nil {
-		return ips
+	return netutil.LocalIPv4s()
+}
+
+func interfaceNames(ifaces []net.Interface) []string {
+	names := make([]string, 0, len(ifaces))
+	for _, iface := range ifaces {
+		names = append(names, iface.Name)
 	}
-	for _, addr := range addrs {
-		if ipnet, ok := addr.(*net.IPNet); ok && !ipnet.IP.IsLoopback() {
-			if ipnet.IP.To4() != nil {
-				ips = append(ips, ipnet.IP.String())
-			}
-		}
-	}
-	return ips
+	return names
 }

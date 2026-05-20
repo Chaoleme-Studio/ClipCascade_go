@@ -11,8 +11,8 @@ android {
         applicationId = "com.clipcascade.android"
         minSdk = 26
         targetSdk = 34
-        versionCode = 1
-        versionName = "1.0.0"
+        versionCode = 11
+        versionName = "1.11"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }

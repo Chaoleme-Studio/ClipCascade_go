@@ -20,6 +20,7 @@ import (
 
 	"github.com/clipcascade/pkg/constants"
 	pkgcrypto "github.com/clipcascade/pkg/crypto"
+	"github.com/clipcascade/pkg/netutil"
 	"github.com/clipcascade/pkg/protocol"
 	"github.com/clipcascade/pkg/sizefmt"
 
@@ -126,7 +127,7 @@ func (a *Application) Run() {
 
 // discoverServer 尝试在局域网中发现所有可用的 ClipCascade 服务器。
 func (a *Application) discoverServer() ([]string, error) {
-	resolver, err := zeroconf.NewResolver(nil)
+	resolver, err := zeroconf.NewResolver(zeroconf.SelectIfaces(netutil.UsableLANInterfaces()))
 	if err != nil {
 		return nil, err
 	}
@@ -147,6 +148,7 @@ func (a *Application) discoverServer() ([]string, error) {
 		select {
 		case <-ctx.Done():
 			if len(foundURLs) > 0 {
+				netutil.SortDiscoveredURLs(foundURLs)
 				return foundURLs, nil
 			}
 			return nil, fmt.Errorf("server discovery timed out")
@@ -154,6 +156,10 @@ func (a *Application) discoverServer() ([]string, error) {
 			if entry != nil {
 				// 收集该服务条目下的所有 IPv4 地址
 				for _, ip := range entry.AddrIPv4 {
+					if !netutil.IsUsableLANIPv4(ip) {
+						slog.Debug("应用：跳过虚拟或不可用发现地址", "地址", ip.String())
+						continue
+					}
 					url := fmt.Sprintf("http://%s:%d", ip, entry.Port)
 					if !seen[url] {
 						foundURLs = append(foundURLs, url)

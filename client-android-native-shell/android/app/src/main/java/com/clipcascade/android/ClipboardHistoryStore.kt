@@ -6,8 +6,10 @@ import org.json.JSONObject
 
 data class ClipboardHistoryItem(
     val text: String,
+    val type: String,
     val direction: String,
-    val timestamp: Long
+    val timestamp: Long,
+    val imagePath: String? = null
 )
 
 object ClipboardHistoryStore {
@@ -21,24 +23,49 @@ object ClipboardHistoryStore {
             return
         }
 
+        val item = JSONObject()
+            .put("text", normalized.take(500))
+            .put("type", "text")
+            .put("direction", direction)
+            .put("timestamp", System.currentTimeMillis())
+
+        appendItem(context, item)
+    }
+
+    fun appendImage(context: Context, imagePath: String, direction: String) {
+        val normalized = imagePath.trim()
+        if (normalized.isBlank()) {
+            return
+        }
+        val item = JSONObject()
+            .put("text", "图片")
+            .put("type", "image")
+            .put("image_path", normalized)
+            .put("direction", direction)
+            .put("timestamp", System.currentTimeMillis())
+
+        appendItem(context, item)
+    }
+
+    private fun appendItem(context: Context, item: JSONObject) {
         val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
         val arr = readJsonArray(prefs.getString(KEY_HISTORY, "[]"))
+        val type = item.optString("type", "text")
+        val text = item.optString("text")
+        val direction = item.optString("direction")
 
         // Avoid duplicate consecutive records.
         if (arr.length() > 0) {
             val last = arr.optJSONObject(0)
             if (last != null &&
-                last.optString("text") == normalized &&
+                last.optString("type", "text") == type &&
+                last.optString("text") == text &&
+                last.optString("image_path") == item.optString("image_path") &&
                 last.optString("direction") == direction
             ) {
                 return
             }
         }
-
-        val item = JSONObject()
-            .put("text", normalized.take(500))
-            .put("direction", direction)
-            .put("timestamp", System.currentTimeMillis())
 
         val next = JSONArray().put(item)
         for (i in 0 until arr.length()) {
@@ -66,8 +93,10 @@ object ClipboardHistoryStore {
             out.add(
                 ClipboardHistoryItem(
                     text = text,
+                    type = item.optString("type", "text"),
                     direction = item.optString("direction", "sent"),
-                    timestamp = item.optLong("timestamp", 0L)
+                    timestamp = item.optLong("timestamp", 0L),
+                    imagePath = item.optString("image_path").ifBlank { null }
                 )
             )
         }
@@ -87,4 +116,3 @@ object ClipboardHistoryStore {
         }
     }
 }
-

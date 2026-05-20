@@ -255,3 +255,10 @@ func (h *WSHub) Stats() map[string]int64 {
 		"total_outbound_msgs": h.totalOutboundMsgs.Load(),
 	}
 }
+
+// UserConnectionCount returns the number of active WebSocket connections for one user.
+func (h *WSHub) UserConnectionCount(username string) int {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return len(h.connections[username])
+}
