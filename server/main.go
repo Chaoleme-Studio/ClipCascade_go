@@ -210,9 +210,11 @@ func main() {
 		if syncTargets < 0 {
 			syncTargets = 0
 		}
+		slog.Debug("API：在线设备统计", "用户名", username, "在线设备", online, "同步目标", syncTargets)
 		return c.JSON(fiber.Map{
 			"online_devices": online,
 			"sync_targets":   syncTargets,
+			"username":       username,
 		})
 	})
 	app.Get("/api/files/deferred", fileTransferHandler.ListDeferred)

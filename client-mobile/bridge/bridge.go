@@ -1,6 +1,8 @@
 package bridge
 
 import (
+	"fmt"
+
 	"github.com/clipcascade/fynemobile/engine"
 )
 
@@ -63,4 +65,13 @@ func (e *Engine) SendClipboard(payload string, payloadType string) error {
 // IsConnected returns connection state.
 func (e *Engine) IsConnected() bool {
 	return e.inner.IsConnected()
+}
+
+// DeviceCounts returns "online_devices,sync_targets" for gomobile callers.
+func (e *Engine) DeviceCounts() (string, error) {
+	online, targets, err := e.inner.DeviceCounts()
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("%d,%d", online, targets), nil
 }

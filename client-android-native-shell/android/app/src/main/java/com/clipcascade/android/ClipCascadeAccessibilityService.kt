@@ -1,27 +1,16 @@
 package com.clipcascade.android
 
 import android.accessibilityservice.AccessibilityService
-import android.content.ClipData
-import android.content.ClipboardManager
-import android.content.ComponentName
-import android.content.Context
 import android.content.Intent
-import android.content.ServiceConnection
 import android.os.Build
 import android.os.Handler
-import android.os.IBinder
 import android.os.Looper
 import android.util.Log
 import android.view.accessibility.AccessibilityEvent
-import android.widget.Toast
 
 class ClipCascadeAccessibilityService : AccessibilityService() {
 
     private val TAG = "ClipCascade_A11y"
-    
-    // 连接到后台剪贴板服务的桥梁
-    private var backgroundService: ClipCascadeBackgroundService? = null
-    private var isBound = false
 
     private val handler = Handler(Looper.getMainLooper())
     private var lastTriggerTime: Long = 0
@@ -30,37 +19,13 @@ class ClipCascadeAccessibilityService : AccessibilityService() {
     // 延迟执行实际读取动作的 Runnable
     private val copyTriggerRunnable = Runnable {
         Log.i(TAG, "🟢 触发剪贴板同步检测流程...")
-        // 通知后台服务去（通过悬浮窗焦点）读取剪贴板
-        backgroundService?.requestClipboardReadForSync()
-    }
-
-    private val serviceConnection = object : ServiceConnection {
-        override fun onServiceConnected(name: ComponentName?, binder: IBinder?) {
-            Log.i(TAG, "🔌 已成功绑定到后台剪贴板服务")
-            val localBinder = binder as ClipCascadeBackgroundService.LocalBinder
-            backgroundService = localBinder.getService()
-            isBound = true
-        }
-
-        override fun onServiceDisconnected(name: ComponentName?) {
-            Log.w(TAG, "❌ 与后台剪贴板服务断开连接")
-            backgroundService = null
-            isBound = false
-        }
+        startBackgroundClipboardSync()
     }
 
     override fun onServiceConnected() {
         super.onServiceConnected()
         Log.i(TAG, "🚀 ClipCascade 无障碍服务已启动")
-        
-        // 先确保后台服务处于运行状态，再绑定
-        val intent = Intent(this, ClipCascadeBackgroundService::class.java)
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            startForegroundService(intent)
-        } else {
-            startService(intent)
-        }
-        bindService(intent, serviceConnection, Context.BIND_AUTO_CREATE)
+        startBackgroundClipboardSync()
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
@@ -112,11 +77,6 @@ class ClipCascadeAccessibilityService : AccessibilityService() {
      * 防抖触发器：过滤高频连续事件，降低功耗
      */
     private fun debounceAndTriggerCopy(forceImmediate: Boolean = false) {
-        if (!isBound || backgroundService == null) {
-            Log.w(TAG, "⚠️ 尚未绑定后台服务，跳过触发")
-            return
-        }
-
         val currentTime = System.currentTimeMillis()
         
         // 如果距离上次触发太近（小于防抖时间），且不是强制立刻触发，就跳过
@@ -145,10 +105,17 @@ class ClipCascadeAccessibilityService : AccessibilityService() {
     override fun onUnbind(intent: Intent?): Boolean {
         Log.i(TAG, "🛑 无障碍服务正在解绑")
         handler.removeCallbacks(copyTriggerRunnable)
-        if (isBound) {
-            unbindService(serviceConnection)
-            isBound = false
-        }
         return super.onUnbind(intent)
+    }
+
+    private fun startBackgroundClipboardSync() {
+        val intent = Intent(this, ClipCascadeBackgroundService::class.java).apply {
+            action = ClipCascadeBackgroundService.ACTION_SYNC_CLIPBOARD_NOW
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            startForegroundService(intent)
+        } else {
+            startService(intent)
+        }
     }
 }

@@ -133,7 +133,7 @@ func (a *Application) discoverServer() ([]string, error) {
 	}
 
 	entries := make(chan *zeroconf.ServiceEntry)
-	ctx, cancel := context.WithTimeout(a.ctx, 3*time.Second)
+	ctx, cancel := context.WithTimeout(a.ctx, 5*time.Second)
 	defer cancel()
 
 	err = resolver.Browse(ctx, "_clipcascade._tcp", "local.", entries)

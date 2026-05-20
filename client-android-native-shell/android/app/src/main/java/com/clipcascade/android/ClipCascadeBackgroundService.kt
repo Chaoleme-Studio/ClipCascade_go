@@ -10,7 +10,6 @@ import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.graphics.PixelFormat
-import android.os.Binder
 import android.os.Build
 import android.os.IBinder
 import android.util.Base64
@@ -33,10 +32,14 @@ class ClipCascadeBackgroundService : Service(), MessageCallback {
         const val ACTION_STATUS_CHANGED = "com.clipcascade.android.action.STATUS_CHANGED"
         const val ACTION_SEND_SHARED_TEXT = "com.clipcascade.android.action.SEND_SHARED_TEXT"
         const val ACTION_SEND_SHARED_IMAGE = "com.clipcascade.android.action.SEND_SHARED_IMAGE"
+        const val ACTION_SYNC_CLIPBOARD_NOW = "com.clipcascade.android.action.SYNC_CLIPBOARD_NOW"
+        const val ACTION_REFRESH_DEVICE_COUNTS = "com.clipcascade.android.action.REFRESH_DEVICE_COUNTS"
         const val EXTRA_STATUS = "com.clipcascade.android.extra.STATUS"
         const val EXTRA_DETAIL = "com.clipcascade.android.extra.DETAIL"
         const val EXTRA_SHARED_TEXT = "com.clipcascade.android.extra.SHARED_TEXT"
         const val EXTRA_SHARED_IMAGE = "com.clipcascade.android.extra.SHARED_IMAGE"
+        const val EXTRA_ONLINE_DEVICES = "com.clipcascade.android.extra.ONLINE_DEVICES"
+        const val EXTRA_SYNC_TARGETS = "com.clipcascade.android.extra.SYNC_TARGETS"
     }
     
     private val notificationId = 1001
@@ -58,13 +61,6 @@ class ClipCascadeBackgroundService : Service(), MessageCallback {
     // 记录最后一次自己写入的记录，防止回环死循环同步
     private var lastWrittenText: String? = null
 
-    // 给无障碍服务使用的 Binder
-    private val binder = LocalBinder()
-
-    inner class LocalBinder : Binder() {
-        fun getService(): ClipCascadeBackgroundService = this@ClipCascadeBackgroundService
-    }
-
     override fun onCreate() {
         super.onCreate()
         Log.i(TAG, "🟢 后台服务正在初始化...")
@@ -81,7 +77,11 @@ class ClipCascadeBackgroundService : Service(), MessageCallback {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         Log.i(TAG, "🚀 后台服务已启动 (onStartCommand)")
         startEngineIfNeeded()
-        if (intent?.action == ACTION_SEND_SHARED_TEXT) {
+        if (intent?.action == ACTION_REFRESH_DEVICE_COUNTS) {
+            refreshDeviceCounts()
+        } else if (intent?.action == ACTION_SYNC_CLIPBOARD_NOW) {
+            requestClipboardReadForSync()
+        } else if (intent?.action == ACTION_SEND_SHARED_TEXT) {
             val sharedText = intent.getStringExtra(EXTRA_SHARED_TEXT)?.trim().orEmpty()
             if (sharedText.isNotBlank()) {
                 sendSharedPayloadWhenReady(sharedText, "text")
@@ -97,8 +97,8 @@ class ClipCascadeBackgroundService : Service(), MessageCallback {
         return START_STICKY
     }
 
-    override fun onBind(intent: Intent?): IBinder {
-        return binder
+    override fun onBind(intent: Intent?): IBinder? {
+        return null
     }
 
     /**
@@ -280,6 +280,7 @@ class ClipCascadeBackgroundService : Service(), MessageCallback {
                 created.start()
                 engine = created
                 updateStatus("connected", "已连接到 $url")
+                refreshDeviceCounts()
             } catch (e: Exception) {
                 engine = null
                 Log.e(TAG, "Go 引擎启动失败", e)
@@ -384,6 +385,37 @@ class ClipCascadeBackgroundService : Service(), MessageCallback {
             .setOngoing(true)
             .build()
         notificationManager.notify(notificationId, notification)
+    }
+
+    private fun refreshDeviceCounts() {
+        val currentEngine = engine
+        if (currentEngine == null || !currentEngine.isConnected) {
+            Log.d(TAG, "跳过在线设备刷新：engine 尚未连接")
+            return
+        }
+        Thread {
+            try {
+                val raw = currentEngine.deviceCounts()
+                val parts = raw.split(",", limit = 2)
+                val onlineDevices = parts.getOrNull(0)?.toIntOrNull() ?: 0
+                val syncTargets = parts.getOrNull(1)?.toIntOrNull() ?: 0
+                Log.d(TAG, "在线设备统计：online=$onlineDevices targets=$syncTargets")
+                getSharedPreferences("clipcascade", Context.MODE_PRIVATE).edit()
+                    .putInt("OnlineDevices", onlineDevices)
+                    .putInt("SyncTargets", syncTargets)
+                    .putLong("DeviceCountsUpdatedAt", System.currentTimeMillis())
+                    .apply()
+                sendBroadcast(Intent(ACTION_STATUS_CHANGED).apply {
+                    setPackage(packageName)
+                    putExtra(EXTRA_STATUS, "connected")
+                    putExtra(EXTRA_DETAIL, "在线设备已刷新")
+                    putExtra(EXTRA_ONLINE_DEVICES, onlineDevices)
+                    putExtra(EXTRA_SYNC_TARGETS, syncTargets)
+                })
+            } catch (e: Exception) {
+                Log.d(TAG, "刷新在线设备数失败", e)
+            }
+        }.start()
     }
 
     private fun updateStatus(status: String, detail: String) {

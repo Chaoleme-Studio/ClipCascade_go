@@ -91,6 +91,7 @@ class MainActivity : Activity() {
                 return
             }
             refreshConnectionStatus()
+            refreshDeviceStatusFromPrefs()
         }
     }
 
@@ -140,7 +141,7 @@ class MainActivity : Activity() {
 
         val serverInput = EditText(this).apply {
             hint = "服务器地址，例如 http://192.168.1.8:8080"
-            setText(prefs.getString("ServerURL", "") ?: "")
+            setText(normalizeServerUrl(prefs.getString("ServerURL", "") ?: ""))
             setSingleLine(true)
             inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI
             setTextColor(color(R.color.cc_text_primary))
@@ -151,6 +152,11 @@ class MainActivity : Activity() {
             text = "发现"
             minWidth = dp(72)
             setOnClickListener { showDiscoveredServersMenu(this, serverInput) }
+            setOnLongClickListener {
+                restartServerDiscovery(serverInput, this)
+                Toast.makeText(this@MainActivity, "正在重新发现局域网服务", Toast.LENGTH_SHORT).show()
+                true
+            }
         }
         val serverRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
@@ -338,7 +344,7 @@ class MainActivity : Activity() {
 
         setContentView(root)
 
-        addDiscoveredServer(prefs.getString("ServerURL", "") ?: "", serverInput, discoverMenuBtn)
+        addDiscoveredServer(normalizeServerUrl(prefs.getString("ServerURL", "") ?: ""), serverInput, discoverMenuBtn)
         startServerDiscovery(serverInput, discoverMenuBtn)
         refreshConnectionStatus()
         refreshPermissionStatus()
@@ -454,6 +460,19 @@ class MainActivity : Activity() {
         Toast.makeText(this, "服务已启动，请检查通知栏", Toast.LENGTH_SHORT).show()
     }
 
+    private fun requestDeviceStatusRefresh() {
+        val intent = Intent(this, ClipCascadeBackgroundService::class.java).apply {
+            action = ClipCascadeBackgroundService.ACTION_REFRESH_DEVICE_COUNTS
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            startForegroundService(intent)
+        } else {
+            startService(intent)
+        }
+        uiHandler.postDelayed({ refreshDeviceStatusFromPrefs() }, 500L)
+        uiHandler.postDelayed({ refreshDeviceStatusFromPrefs() }, 1800L)
+    }
+
     private fun refreshConnectionStatus() {
         val prefs = getSharedPreferences("clipcascade", Context.MODE_PRIVATE)
         setStatusViews(
@@ -468,6 +487,7 @@ class MainActivity : Activity() {
             val direction = if (latest.direction == "received") "接收" else "发送"
             "最近事件：$direction ${formatTime(latest.timestamp)}"
         }
+        refreshDeviceStatusFromPrefs()
     }
 
     private fun setStatusViews(status: String, detail: String, timestamp: Long) {
@@ -496,34 +516,27 @@ class MainActivity : Activity() {
         if (deviceRefreshInFlight) {
             return
         }
-        val prefs = getSharedPreferences("clipcascade", Context.MODE_PRIVATE)
-        val serverURL = prefs.getString("ServerURL", "")?.trim().orEmpty()
-        val username = prefs.getString("Username", "")?.trim().orEmpty()
-        val password = prefs.getString("Password", "").orEmpty()
-        if (serverURL.isBlank() || username.isBlank() || password.isBlank()) {
-            if (::deviceCountText.isInitialized) {
-                deviceCountText.text = "在线设备：暂无"
-            }
+        refreshDeviceStatusFromPrefs()
+        requestDeviceStatusRefresh()
+        deviceRefreshInFlight = true
+        uiHandler.postDelayed({
+            deviceRefreshInFlight = false
+            refreshDeviceStatusFromPrefs()
+        }, 2200L)
+    }
+
+    private fun refreshDeviceStatusFromPrefs() {
+        if (!::deviceCountText.isInitialized) {
             return
         }
-
-        deviceRefreshInFlight = true
-        Thread {
-            try {
-                val cookie = loginForApi(serverURL, username, password)
-                val counts = fetchDeviceCounts(serverURL, cookie)
-                runOnUiThread {
-                    deviceCountText.text = "在线设备：${counts.onlineDevices} 台；本次复制会同步给 ${counts.syncTargets} 台"
-                }
-            } catch (e: Exception) {
-                Log.d(tag, "刷新在线设备数失败", e)
-                runOnUiThread {
-                    deviceCountText.text = "在线设备：获取失败"
-                }
-            } finally {
-                deviceRefreshInFlight = false
-            }
-        }.start()
+        val prefs = getSharedPreferences("clipcascade", Context.MODE_PRIVATE)
+        val updatedAt = prefs.getLong("DeviceCountsUpdatedAt", 0L)
+        if (updatedAt <= 0L) {
+            return
+        }
+        val onlineDevices = prefs.getInt("OnlineDevices", 0)
+        val syncTargets = prefs.getInt("SyncTargets", 0)
+        deviceCountText.text = "在线设备：$onlineDevices 台；本次复制会同步给 $syncTargets 台"
     }
 
     private fun readSharedImageAsBase64(uri: Uri): String? {
@@ -577,8 +590,10 @@ class MainActivity : Activity() {
         passInput: EditText,
         e2eeCheck: CheckBox
     ) {
+        val normalizedServerURL = normalizeServerUrl(serverInput.text?.toString() ?: "")
+        serverInput.setText(normalizedServerURL)
         prefs.edit()
-            .putString("ServerURL", serverInput.text?.toString()?.trim() ?: "")
+            .putString("ServerURL", normalizedServerURL)
             .putString("Username", userInput.text?.toString()?.trim() ?: "")
             .putString("Password", passInput.text?.toString() ?: "")
             .putBoolean("E2EE", e2eeCheck.isChecked)
@@ -760,6 +775,15 @@ class MainActivity : Activity() {
         }
     }
 
+    private fun restartServerDiscovery(serverInput: EditText, discoverMenuBtn: Button) {
+        synchronized(discoveredServers) {
+            discoveredServers.clear()
+        }
+        updateDiscoverButton(discoverMenuBtn)
+        addDiscoveredServer(serverInput.text?.toString()?.trim().orEmpty(), serverInput, discoverMenuBtn)
+        startServerDiscovery(serverInput, discoverMenuBtn)
+    }
+
     private fun stopServerDiscovery() {
         val manager = nsdManager ?: return
         val listener = discoveryListener ?: return
@@ -800,7 +824,8 @@ class MainActivity : Activity() {
     private fun showDiscoveredServersMenu(anchor: Button, serverInput: EditText) {
         val options = synchronized(discoveredServers) { discoveredServers.toList().sortedWith(discoveryUrlComparator) }
         if (options.isEmpty()) {
-            Toast.makeText(this, "暂未发现局域网服务", Toast.LENGTH_SHORT).show()
+            restartServerDiscovery(serverInput, anchor)
+            Toast.makeText(this, "正在发现局域网服务，请稍后再点", Toast.LENGTH_SHORT).show()
             return
         }
         val menu = PopupMenu(this, anchor)
@@ -908,7 +933,7 @@ class MainActivity : Activity() {
             return
         }
         val prefs = getSharedPreferences("clipcascade", Context.MODE_PRIVATE)
-        val serverURL = prefs.getString("ServerURL", "")?.trim().orEmpty()
+        val serverURL = normalizeServerUrl(prefs.getString("ServerURL", "") ?: "")
         val username = prefs.getString("Username", "")?.trim().orEmpty()
         val password = prefs.getString("Password", "").orEmpty()
         if (serverURL.isBlank() || username.isBlank() || password.isBlank()) {
@@ -933,8 +958,9 @@ class MainActivity : Activity() {
     }
 
     private fun loginForApi(serverURL: String, username: String, password: String): String {
+        val baseURL = normalizeServerUrl(serverURL)
         val body = "username=${urlEncode(username)}&password=${urlEncode(password)}"
-        val conn = (URL("${serverURL.trimEnd('/')}/login").openConnection() as HttpURLConnection).apply {
+        val conn = (URL("${baseURL.trimEnd('/')}/login").openConnection() as HttpURLConnection).apply {
             requestMethod = "POST"
             instanceFollowRedirects = false
             connectTimeout = 6000
@@ -958,7 +984,8 @@ class MainActivity : Activity() {
     }
 
     private fun fetchDeferredFiles(serverURL: String, cookie: String): List<DeferredFileItem> {
-        val conn = (URL("${serverURL.trimEnd('/')}/api/files/deferred").openConnection() as HttpURLConnection).apply {
+        val baseURL = normalizeServerUrl(serverURL)
+        val conn = (URL("${baseURL.trimEnd('/')}/api/files/deferred").openConnection() as HttpURLConnection).apply {
             requestMethod = "GET"
             connectTimeout = 6000
             readTimeout = 6000
@@ -978,7 +1005,8 @@ class MainActivity : Activity() {
     }
 
     private fun fetchDeviceCounts(serverURL: String, cookie: String): DeviceCounts {
-        val conn = (URL("${serverURL.trimEnd('/')}/api/devices/online").openConnection() as HttpURLConnection).apply {
+        val baseURL = normalizeServerUrl(serverURL)
+        val conn = (URL("${baseURL.trimEnd('/')}/api/devices/online").openConnection() as HttpURLConnection).apply {
             requestMethod = "GET"
             connectTimeout = 6000
             readTimeout = 6000
@@ -991,7 +1019,8 @@ class MainActivity : Activity() {
         val obj = JSONObject(raw)
         return DeviceCounts(
             onlineDevices = obj.optInt("online_devices", 0),
-            syncTargets = obj.optInt("sync_targets", 0)
+            syncTargets = obj.optInt("sync_targets", 0),
+            username = obj.optString("username").takeIf { it.isNotBlank() }
         )
     }
 
@@ -1011,7 +1040,7 @@ class MainActivity : Activity() {
 
     private fun handleDeferredFileClick(item: DeferredFileItem) {
         val prefs = getSharedPreferences("clipcascade", Context.MODE_PRIVATE)
-        val serverURL = prefs.getString("ServerURL", "")?.trim().orEmpty()
+        val serverURL = normalizeServerUrl(prefs.getString("ServerURL", "") ?: "")
         val username = prefs.getString("Username", "")?.trim().orEmpty()
         val password = prefs.getString("Password", "").orEmpty()
         if (serverURL.isBlank() || username.isBlank() || password.isBlank()) {
@@ -1061,7 +1090,8 @@ class MainActivity : Activity() {
     }
 
     private fun requestDeferredFile(serverURL: String, cookie: String, deferredID: String) {
-        val conn = (URL("${serverURL.trimEnd('/')}/api/files/deferred/$deferredID/request").openConnection() as HttpURLConnection).apply {
+        val baseURL = normalizeServerUrl(serverURL)
+        val conn = (URL("${baseURL.trimEnd('/')}/api/files/deferred/$deferredID/request").openConnection() as HttpURLConnection).apply {
             requestMethod = "POST"
             connectTimeout = 6000
             readTimeout = 6000
@@ -1076,10 +1106,11 @@ class MainActivity : Activity() {
     }
 
     private fun downloadDeferredFile(serverURL: String, cookie: String, item: DeferredFileItem): File {
+        val baseURL = normalizeServerUrl(serverURL)
         val url = if (item.downloadURL.startsWith("http")) {
             item.downloadURL
         } else {
-            "${serverURL.trimEnd('/')}/${item.downloadURL.trimStart('/')}"
+            "${baseURL.trimEnd('/')}/${item.downloadURL.trimStart('/')}"
         }
         val conn = (URL(url).openConnection() as HttpURLConnection).apply {
             requestMethod = "GET"
@@ -1450,6 +1481,14 @@ class MainActivity : Activity() {
         return URLEncoder.encode(value, "UTF-8")
     }
 
+    private fun normalizeServerUrl(raw: String): String {
+        val trimmed = raw.trim().trimEnd('/')
+        if (trimmed.isBlank()) {
+            return ""
+        }
+        return if (trimmed.contains("://")) trimmed else "http://$trimmed"
+    }
+
     private fun safeFileName(name: String): String {
         val cleaned = name.trim()
             .replace("/", "_")
@@ -1518,6 +1557,7 @@ class MainActivity : Activity() {
 
     private data class DeviceCounts(
         val onlineDevices: Int,
-        val syncTargets: Int
+        val syncTargets: Int,
+        val username: String?
     )
 }

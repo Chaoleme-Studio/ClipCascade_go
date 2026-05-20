@@ -55,7 +55,7 @@ type Engine struct {
 func NewEngine(serverURL, username, password string, e2eeEnabled bool) *Engine {
 	jar, _ := cookiejar.New(nil)
 	return &Engine{
-		serverURL: serverURL,
+		serverURL: normalizeServerURL(serverURL),
 		username:  username,
 		password:  password,
 		e2ee:      e2eeEnabled,
@@ -170,9 +170,31 @@ func (e *Engine) IsConnected() bool {
 	return e.connected
 }
 
+func (e *Engine) DeviceCounts() (onlineDevices int, syncTargets int, err error) {
+	serverURL := normalizeServerURL(e.serverURL)
+	resp, err := e.httpClient.Get(serverURL + "/api/devices/online")
+	if err != nil {
+		return 0, 0, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return 0, 0, fmt.Errorf("device status failed: %d %s", resp.StatusCode, http.StatusText(resp.StatusCode))
+	}
+	var body struct {
+		OnlineDevices int `json:"online_devices"`
+		SyncTargets   int `json:"sync_targets"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		return 0, 0, err
+	}
+	return body.OnlineDevices, body.SyncTargets, nil
+}
+
 // --- Internal methods ---
 
 func (e *Engine) login() error {
+	e.serverURL = normalizeServerURL(e.serverURL)
 	form := url.Values{
 		"username": {e.username},
 		"password": {e.password},
@@ -193,7 +215,8 @@ func (e *Engine) login() error {
 }
 
 func (e *Engine) deriveKey() error {
-	resp, err := e.httpClient.Get(e.serverURL + "/api/user-info")
+	serverURL := normalizeServerURL(e.serverURL)
+	resp, err := e.httpClient.Get(serverURL + "/api/user-info")
 	if err != nil {
 		return err
 	}
@@ -209,7 +232,8 @@ func (e *Engine) deriveKey() error {
 }
 
 func (e *Engine) connectWS() error {
-	u, _ := url.Parse(e.serverURL)
+	serverURL := normalizeServerURL(e.serverURL)
+	u, _ := url.Parse(serverURL)
 	scheme := "ws"
 	if u.Scheme == "https" {
 		scheme = "wss"
@@ -245,6 +269,24 @@ func (e *Engine) connectWS() error {
 		_ = old.Close()
 	}
 	return nil
+}
+
+func normalizeServerURL(raw string) string {
+	s := strings.TrimSpace(raw)
+	if s == "" {
+		return ""
+	}
+	if !strings.Contains(s, "://") {
+		s = "http://" + s
+	}
+	u, err := url.Parse(s)
+	if err != nil {
+		return strings.TrimRight(s, "/")
+	}
+	if u.Scheme == "" {
+		u.Scheme = "http"
+	}
+	return strings.TrimRight(u.String(), "/")
 }
 
 func (e *Engine) readLoop() {

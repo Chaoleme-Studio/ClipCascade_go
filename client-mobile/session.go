@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"log"
 	"sync"
 
@@ -18,6 +19,11 @@ type Session struct {
 	status         string
 	statusListener func(string)
 	textListener   func(string, string)
+}
+
+type DeviceCounts struct {
+	OnlineDevices int
+	SyncTargets   int
 }
 
 func NewSession(app fyne.App, w fyne.Window) *Session {
@@ -131,6 +137,22 @@ func (s *Session) SendText(text string) {
 			listener(text, "sent")
 		}
 	}
+}
+
+func (s *Session) DeviceCounts() (DeviceCounts, error) {
+	s.mu.RLock()
+	currentEngine := s.engine
+	state := s.status
+	s.mu.RUnlock()
+
+	if currentEngine == nil || (state != "connected" && state != "reconnecting") {
+		return DeviceCounts{}, fmt.Errorf("not connected")
+	}
+	online, targets, err := currentEngine.DeviceCounts()
+	if err != nil {
+		return DeviceCounts{}, err
+	}
+	return DeviceCounts{OnlineDevices: online, SyncTargets: targets}, nil
 }
 
 func (s *Session) OnMessage(payload string, payloadType string) {
