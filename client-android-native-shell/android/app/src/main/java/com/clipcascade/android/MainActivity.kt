@@ -79,19 +79,29 @@ class MainActivity : Activity() {
     private var historyItems: List<ClipboardHistoryItem> = emptyList()
     private var deferredFileItems: List<DeferredFileItem> = emptyList()
     private var activeHistoryTab: HistoryTab = HistoryTab.CLIPBOARD
-    private var historyRefreshTask: Runnable? = null
     private var deferredRefreshTask: Runnable? = null
+    private val apiSessionManager by lazy {
+        ApiSessionManager(
+            normalizeServerUrl = { normalizeServerUrl(it) },
+            login = { serverURL, username, password -> loginForApi(serverURL, username, password) }
+        )
+    }
     @Volatile
     private var deferredRefreshInFlight = false
     @Volatile
     private var deviceRefreshInFlight = false
     private val statusReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
-            if (intent?.action != ClipCascadeBackgroundService.ACTION_STATUS_CHANGED) {
-                return
+            when (intent?.action) {
+                ClipCascadeBackgroundService.ACTION_STATUS_CHANGED -> {
+                    refreshConnectionStatus()
+                    refreshDeviceStatusFromPrefs()
+                }
+                ClipCascadeBackgroundService.ACTION_HISTORY_CHANGED -> {
+                    refreshHistoryList()
+                    refreshConnectionStatus()
+                }
             }
-            refreshConnectionStatus()
-            refreshDeviceStatusFromPrefs()
         }
     }
 
@@ -196,11 +206,10 @@ class MainActivity : Activity() {
         }
 
         val btnStartSvc = MaterialButton(this).apply {
-            text = "启动同步服务"
+            text = "重连同步服务"
             setOnClickListener {
                 saveConfig(prefs, serverInput, userInput, passInput, e2eeCheck)
-                setStatusViews("connecting", "正在启动同步服务...", System.currentTimeMillis())
-                startCoreService()
+                restartCoreService()
             }
         }
 
@@ -373,22 +382,29 @@ class MainActivity : Activity() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             registerReceiver(
                 statusReceiver,
-                IntentFilter(ClipCascadeBackgroundService.ACTION_STATUS_CHANGED),
+                IntentFilter().apply {
+                    addAction(ClipCascadeBackgroundService.ACTION_STATUS_CHANGED)
+                    addAction(ClipCascadeBackgroundService.ACTION_HISTORY_CHANGED)
+                },
                 Context.RECEIVER_NOT_EXPORTED
             )
         } else {
             @Suppress("DEPRECATION")
-            registerReceiver(statusReceiver, IntentFilter(ClipCascadeBackgroundService.ACTION_STATUS_CHANGED))
+            registerReceiver(
+                statusReceiver,
+                IntentFilter().apply {
+                    addAction(ClipCascadeBackgroundService.ACTION_STATUS_CHANGED)
+                    addAction(ClipCascadeBackgroundService.ACTION_HISTORY_CHANGED)
+                }
+            )
         }
         refreshConnectionStatus()
         refreshPermissionStatus()
         refreshDeviceStatus()
-        startHistoryRefreshLoop()
         startDeferredRefreshLoop()
     }
 
     override fun onPause() {
-        stopHistoryRefreshLoop()
         stopDeferredRefreshLoop()
         try {
             unregisterReceiver(statusReceiver)
@@ -399,7 +415,6 @@ class MainActivity : Activity() {
 
     override fun onDestroy() {
         stopServerDiscovery()
-        stopHistoryRefreshLoop()
         stopDeferredRefreshLoop()
         super.onDestroy()
     }
@@ -442,7 +457,11 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun startCoreService(sharedText: String? = null, sharedImageBase64: String? = null) {
+    private fun startCoreService(
+        sharedText: String? = null,
+        sharedImageBase64: String? = null,
+        showToast: Boolean = true
+    ) {
         val intent = Intent(this, ClipCascadeBackgroundService::class.java).apply {
             if (!sharedText.isNullOrBlank()) {
                 action = ClipCascadeBackgroundService.ACTION_SEND_SHARED_TEXT
@@ -457,7 +476,18 @@ class MainActivity : Activity() {
         } else {
             startService(intent)
         }
-        Toast.makeText(this, "服务已启动，请检查通知栏", Toast.LENGTH_SHORT).show()
+        if (showToast) {
+            Toast.makeText(this, "服务已启动，请检查通知栏", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    private fun restartCoreService() {
+        setStatusViews("reconnecting", "正在重连同步服务...", System.currentTimeMillis())
+        stopService(Intent(this, ClipCascadeBackgroundService::class.java))
+        uiHandler.postDelayed({
+            startCoreService(showToast = false)
+            Toast.makeText(this, "同步服务已重连", Toast.LENGTH_SHORT).show()
+        }, 350L)
     }
 
     private fun requestDeviceStatusRefresh() {
@@ -943,8 +973,9 @@ class MainActivity : Activity() {
         deferredRefreshInFlight = true
         Thread {
             try {
-                val cookie = loginForApi(serverURL, username, password)
-                val items = fetchDeferredFiles(serverURL, cookie)
+                val items = apiSessionManager.withSession(serverURL, username, password) { cookie ->
+                    fetchDeferredFiles(serverURL, cookie)
+                }
                 runOnUiThread {
                     deferredFileItems = items
                     updateFileList()
@@ -991,6 +1022,9 @@ class MainActivity : Activity() {
             readTimeout = 6000
             setRequestProperty("Cookie", cookie)
         }
+        if (conn.responseCode == HttpURLConnection.HTTP_UNAUTHORIZED || conn.responseCode == HttpURLConnection.HTTP_FORBIDDEN) {
+            throw ApiUnauthorizedException("list deferred unauthorized: ${conn.responseCode}")
+        }
         if (conn.responseCode != HttpURLConnection.HTTP_OK) {
             throw IllegalStateException("list deferred failed: ${conn.responseCode}")
         }
@@ -1011,6 +1045,9 @@ class MainActivity : Activity() {
             connectTimeout = 6000
             readTimeout = 6000
             setRequestProperty("Cookie", cookie)
+        }
+        if (conn.responseCode == HttpURLConnection.HTTP_UNAUTHORIZED || conn.responseCode == HttpURLConnection.HTTP_FORBIDDEN) {
+            throw ApiUnauthorizedException("device status unauthorized: ${conn.responseCode}")
         }
         if (conn.responseCode != HttpURLConnection.HTTP_OK) {
             throw IllegalStateException("device status failed: ${conn.responseCode}")
@@ -1050,9 +1087,10 @@ class MainActivity : Activity() {
         Toast.makeText(this, "正在处理文件：${item.fileName}", Toast.LENGTH_SHORT).show()
         Thread {
             try {
-                val cookie = loginForApi(serverURL, username, password)
                 if (item.status == "ready" && item.downloadURL.isNotBlank()) {
-                    val file = downloadDeferredFile(serverURL, cookie, item)
+                    val file = apiSessionManager.withSession(serverURL, username, password) { cookie ->
+                        downloadDeferredFile(serverURL, cookie, item)
+                    }
                     markFileDownloaded(item, file)
                     runOnUiThread {
                         updateFileList()
@@ -1060,7 +1098,9 @@ class MainActivity : Activity() {
                         openDownloadedFile(file, item.mimeType)
                     }
                 } else {
-                    requestDeferredFile(serverURL, cookie, item.deferredID)
+                    apiSessionManager.withSession(serverURL, username, password) { cookie ->
+                        requestDeferredFile(serverURL, cookie, item.deferredID)
+                    }
                     runOnUiThread {
                         Toast.makeText(this, "已请求源设备上传，稍后刷新查看进度", Toast.LENGTH_LONG).show()
                         refreshDeferredFiles()
@@ -1100,6 +1140,9 @@ class MainActivity : Activity() {
             setRequestProperty("Content-Length", "0")
         }
         conn.outputStream.use { }
+        if (conn.responseCode == HttpURLConnection.HTTP_UNAUTHORIZED || conn.responseCode == HttpURLConnection.HTTP_FORBIDDEN) {
+            throw ApiUnauthorizedException("request unauthorized: ${conn.responseCode}")
+        }
         if (conn.responseCode != HttpURLConnection.HTTP_OK) {
             throw IllegalStateException("request failed: ${conn.responseCode}")
         }
@@ -1117,6 +1160,9 @@ class MainActivity : Activity() {
             connectTimeout = 6000
             readTimeout = 60000
             setRequestProperty("Cookie", cookie)
+        }
+        if (conn.responseCode == HttpURLConnection.HTTP_UNAUTHORIZED || conn.responseCode == HttpURLConnection.HTTP_FORBIDDEN) {
+            throw ApiUnauthorizedException("download unauthorized: ${conn.responseCode}")
         }
         if (conn.responseCode != HttpURLConnection.HTTP_OK) {
             throw IllegalStateException("download failed: ${conn.responseCode}")
@@ -1286,27 +1332,13 @@ class MainActivity : Activity() {
         button.strokeWidth = 0
     }
 
-    private fun startHistoryRefreshLoop() {
-        stopHistoryRefreshLoop()
-        historyRefreshTask = object : Runnable {
-            override fun run() {
-                refreshHistoryList()
-                uiHandler.postDelayed(this, 1500L)
-            }
-        }
-        uiHandler.post(historyRefreshTask!!)
-    }
-
-    private fun stopHistoryRefreshLoop() {
-        historyRefreshTask?.let { uiHandler.removeCallbacks(it) }
-        historyRefreshTask = null
-    }
-
     private fun startDeferredRefreshLoop() {
         stopDeferredRefreshLoop()
         deferredRefreshTask = object : Runnable {
             override fun run() {
-                refreshDeferredFiles()
+                if (activeHistoryTab == HistoryTab.FILES) {
+                    refreshDeferredFiles()
+                }
                 uiHandler.postDelayed(this, 8000L)
             }
         }
