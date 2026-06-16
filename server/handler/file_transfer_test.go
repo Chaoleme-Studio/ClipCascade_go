@@ -3,6 +3,7 @@ package handler
 import (
 	"bytes"
 	"encoding/json"
+	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -16,6 +17,118 @@ import (
 	"github.com/gofiber/fiber/v2"
 	"gorm.io/gorm"
 )
+
+func TestUploadRejectsOversizedFile(t *testing.T) {
+	db := newTestDB(t)
+	cfg := &config.Config{
+		FileRelayEnabled:    true,
+		FileRelayDir:        t.TempDir(),
+		FileRelayMaxBytes:   4,
+		FileRelayTTLSeconds: 3600,
+	}
+	h := NewFileTransferHandler(db, cfg, NewWSHub())
+
+	app := fiber.New(fiber.Config{StreamRequestBody: true})
+	app.Post("/api/files/upload", withUser("alice", h.Upload))
+
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	part, err := writer.CreateFormFile("file", "bad.apk")
+	if err != nil {
+		t.Fatalf("create multipart part failed: %v", err)
+	}
+	if _, err := part.Write([]byte("12345")); err != nil {
+		t.Fatalf("write multipart part failed: %v", err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("close multipart writer failed: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/files/upload", &body)
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	req.Header.Set("X-File-Size", "5")
+	resp, err := app.Test(req, -1)
+	if err != nil {
+		t.Fatalf("upload request should return an HTTP error response, got app error: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusRequestEntityTooLarge {
+		t.Fatalf("expected oversized upload to return 413, got %d", resp.StatusCode)
+	}
+
+	var count int64
+	if err := db.Model(&model.FileTransfer{}).Count(&count).Error; err != nil {
+		t.Fatalf("count file transfers failed: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("oversized upload should not create relay metadata, got %d records", count)
+	}
+}
+
+func TestUploadStoresRelayFile(t *testing.T) {
+	db := newTestDB(t)
+	tempDir := t.TempDir()
+	cfg := &config.Config{
+		FileRelayEnabled:    true,
+		FileRelayDir:        tempDir,
+		FileRelayMaxBytes:   constants.DefaultFileRelayMaxBytes,
+		FileRelayTTLSeconds: 3600,
+	}
+	h := NewFileTransferHandler(db, cfg, NewWSHub())
+
+	app := fiber.New()
+	app.Post("/api/files/upload", withUser("alice", h.Upload))
+
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	part, err := writer.CreateFormFile("file", "small.apk")
+	if err != nil {
+		t.Fatalf("create multipart part failed: %v", err)
+	}
+	content := []byte("apk payload")
+	if _, err := part.Write(content); err != nil {
+		t.Fatalf("write multipart part failed: %v", err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("close multipart writer failed: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/files/upload", &body)
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	req.Header.Set("X-File-Size", "11")
+	resp, err := app.Test(req, -1)
+	if err != nil {
+		t.Fatalf("upload request failed: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("unexpected upload status: %d", resp.StatusCode)
+	}
+
+	var payload map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		t.Fatalf("decode upload response failed: %v", err)
+	}
+	relayID, _ := payload["relay_id"].(string)
+	if relayID == "" {
+		t.Fatalf("expected relay_id in response")
+	}
+
+	var record model.FileTransfer
+	if err := db.Where("relay_id = ? AND owner_username = ?", relayID, "alice").First(&record).Error; err != nil {
+		t.Fatalf("expected relay metadata, got err=%v", err)
+	}
+	if record.FileName != "small.apk" || record.FileSize != int64(len(content)) {
+		t.Fatalf("unexpected relay metadata: name=%q size=%d", record.FileName, record.FileSize)
+	}
+	stored, err := os.ReadFile(record.StoragePath)
+	if err != nil {
+		t.Fatalf("read stored relay file failed: %v", err)
+	}
+	if !bytes.Equal(stored, content) {
+		t.Fatalf("stored relay content mismatch")
+	}
+}
 
 func TestRegisterDeferredFileAndList(t *testing.T) {
 	db := newTestDB(t)

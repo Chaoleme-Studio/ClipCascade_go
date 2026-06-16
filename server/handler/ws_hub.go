@@ -220,6 +220,9 @@ func (h *WSHub) HandleWebSocket(c *websocket.Conn) {
 				"类型", msgType,
 				"体积", msgSize,
 			)
+			if msgType == "e2ee_envelope" {
+				slog.Debug("WS：E2EE 已开启，剪贴板类型和真实内容大小需在客户端或文件上传日志中查看")
+			}
 
 			// 包装在 MESSAGE 帧中进行交付
 			msgFrame := protocol.MessageFrame(

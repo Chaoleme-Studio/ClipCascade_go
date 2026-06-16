@@ -4,14 +4,9 @@ package clipboard
 
 import (
 	"bytes"
-	"encoding/binary"
-	"image"
-	"image/color"
 	"image/png"
 	"log/slog"
-	"os/exec"
 	"runtime"
-	"strings"
 	"syscall"
 	"unsafe"
 
@@ -46,24 +41,7 @@ const (
 	CF_HDROP       = 15
 
 	gmemMoveable = 0x0002
-
-	biRGB       = 0
-	biBitfields = 3
 )
-
-type bitmapInfoHeader struct {
-	Size          uint32
-	Width         int32
-	Height        int32
-	Planes        uint16
-	BitCount      uint16
-	Compression   uint32
-	SizeImage     uint32
-	XPelsPerMeter int32
-	YPelsPerMeter int32
-	ClrUsed       uint32
-	ClrImportant  uint32
-}
 
 // getPlatformChangeCount 返回 Windows 剪贴板的序列号。
 func getPlatformChangeCount() int64 {
@@ -124,30 +102,38 @@ func getPlatformFilePaths() ([]string, error) {
 }
 
 func setPlatformFilePaths(paths []string) error {
-	if len(paths) == 0 {
+	payload := buildWindowsHDropPayload(paths)
+	if len(payload) == 0 {
 		return nil
 	}
-	slog.Info("剪贴板：通过 powershell 将文件路径写入 Windows 剪贴板...")
 
-	var psPaths []string
-	for _, p := range paths {
-		psPaths = append(psPaths, `'`+p+`'`)
-	}
-	pathList := strings.Join(psPaths, ",")
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
 
-	cmd := exec.Command("powershell", "-WindowStyle", "Hidden", "-NoProfile", "-Command", "Set-Clipboard", "-Path", pathList)
-	cmd.SysProcAttr = &syscall.SysProcAttr{
-		HideWindow:    true,
-		CreationFlags: 0x08000000, // CREATE_NO_WINDOW
+	hDrop, err := allocGlobalMem(payload)
+	if err != nil {
+		return err
 	}
 
-	err := cmd.Start()
-	if err == nil {
-		go cmd.Wait()
-	} else {
-		slog.Warn("剪贴板：通过 powershell 异步写入失败", "错误", err)
+	if err := openClipboardForWrite(); err != nil {
+		procGlobalFree.Call(hDrop)
+		return err
 	}
-	return err
+	defer procCloseClipboard.Call()
+
+	r, _, err := procEmptyClipboard.Call()
+	if r == 0 {
+		procGlobalFree.Call(hDrop)
+		return err
+	}
+
+	if r, _, err := procSetClipboardData.Call(CF_HDROP, hDrop); r == 0 {
+		procGlobalFree.Call(hDrop)
+		return err
+	}
+
+	slog.Info("剪贴板：Windows 已写入文件剪贴板", "文件数", len(paths))
+	return nil
 }
 
 func getPlatformImage() ([]byte, error) {
@@ -208,7 +194,7 @@ func setPlatformImage(data []byte) error {
 		return nil
 	}
 
-	dib, err := encodePNGToDIB(data)
+	formats, err := encodeWindowsImageClipboardFormats(data)
 	if err != nil {
 		return err
 	}
@@ -218,19 +204,26 @@ func setPlatformImage(data []byte) error {
 
 	// 先分配全部内存，再打开剪贴板。
 	// 这样即使分配失败，EmptyClipboard 也不会被调用，剪贴板原有内容得以保留。
-	hDib, err := allocGlobalMem(dib)
+	hDib, err := allocGlobalMem(formats.dib)
 	if err != nil {
+		return err
+	}
+
+	hDibV5, err := allocGlobalMem(formats.dibV5)
+	if err != nil {
+		procGlobalFree.Call(hDib)
 		return err
 	}
 
 	pngFormat := getRegisteredClipboardFormat("PNG")
 	var hPng uintptr
 	if pngFormat != 0 {
-		hPng, _ = allocGlobalMem(data) // PNG 是可选格式，忽略分配失败
+		hPng, _ = allocGlobalMem(formats.png) // PNG 是可选格式，忽略分配失败
 	}
 
 	if err := openClipboardForWrite(); err != nil {
 		procGlobalFree.Call(hDib)
+		procGlobalFree.Call(hDibV5)
 		if hPng != 0 {
 			procGlobalFree.Call(hPng)
 		}
@@ -241,6 +234,7 @@ func setPlatformImage(data []byte) error {
 	r, _, err := procEmptyClipboard.Call()
 	if r == 0 {
 		procGlobalFree.Call(hDib)
+		procGlobalFree.Call(hDibV5)
 		if hPng != 0 {
 			procGlobalFree.Call(hPng)
 		}
@@ -248,12 +242,18 @@ func setPlatformImage(data []byte) error {
 	}
 
 	// SetClipboardData 成功后，句柄所有权转移给系统，不能再 free。
-	if r, _, e := procSetClipboardData.Call(CF_DIBV5, hDib); r == 0 {
+	if r, _, e := procSetClipboardData.Call(CF_DIB, hDib); r == 0 {
 		procGlobalFree.Call(hDib)
+		procGlobalFree.Call(hDibV5)
 		if hPng != 0 {
 			procGlobalFree.Call(hPng)
 		}
 		return e
+	}
+
+	if r, _, _ := procSetClipboardData.Call(CF_DIBV5, hDibV5); r == 0 {
+		procGlobalFree.Call(hDibV5)
+		slog.Warn("剪贴板：Windows 写入 CF_DIBV5 失败")
 	}
 
 	if hPng != 0 {
@@ -369,121 +369,4 @@ func setClipboardDataBytes(format uintptr, data []byte) error {
 		return err
 	}
 	return nil
-}
-
-func decodeDIB(data []byte) (*image.NRGBA, error) {
-	if len(data) < 40 {
-		return nil, syscall.EINVAL
-	}
-
-	var hdr bitmapInfoHeader
-	hdr.Size = binary.LittleEndian.Uint32(data[0:4])
-	hdr.Width = int32(binary.LittleEndian.Uint32(data[4:8]))
-	hdr.Height = int32(binary.LittleEndian.Uint32(data[8:12]))
-	hdr.Planes = binary.LittleEndian.Uint16(data[12:14])
-	hdr.BitCount = binary.LittleEndian.Uint16(data[14:16])
-	hdr.Compression = binary.LittleEndian.Uint32(data[16:20])
-	hdr.SizeImage = binary.LittleEndian.Uint32(data[20:24])
-	hdr.ClrUsed = binary.LittleEndian.Uint32(data[32:36])
-
-	if hdr.Planes != 1 || hdr.Width == 0 || hdr.Height == 0 {
-		return nil, syscall.EINVAL
-	}
-
-	width := int(hdr.Width)
-	height := int(hdr.Height)
-	topDown := false
-	if height < 0 {
-		topDown = true
-		height = -height
-	}
-
-	offset := int(hdr.Size)
-	switch hdr.BitCount {
-	case 32:
-		if hdr.Compression == biBitfields {
-			offset += 12
-		}
-	case 24:
-		// no-op
-	default:
-		return nil, syscall.EINVAL
-	}
-
-	if offset >= len(data) {
-		return nil, syscall.EINVAL
-	}
-
-	rowStride := ((width*int(hdr.BitCount) + 31) / 32) * 4
-	required := offset + rowStride*height
-	if required > len(data) {
-		return nil, syscall.EINVAL
-	}
-
-	img := image.NewNRGBA(image.Rect(0, 0, width, height))
-	for y := 0; y < height; y++ {
-		srcY := y
-		if !topDown {
-			srcY = height - 1 - y
-		}
-		row := data[offset+srcY*rowStride : offset+(srcY+1)*rowStride]
-		for x := 0; x < width; x++ {
-			switch hdr.BitCount {
-			case 32:
-				i := x * 4
-				b, g, r, a := row[i], row[i+1], row[i+2], row[i+3]
-				if a == 0 {
-					a = 255
-				}
-				img.SetNRGBA(x, y, color.NRGBA{R: r, G: g, B: b, A: a})
-			case 24:
-				i := x * 3
-				b, g, r := row[i], row[i+1], row[i+2]
-				img.SetNRGBA(x, y, color.NRGBA{R: r, G: g, B: b, A: 255})
-			}
-		}
-	}
-
-	return img, nil
-}
-
-func encodePNGToDIB(data []byte) ([]byte, error) {
-	img, err := png.Decode(bytes.NewReader(data))
-	if err != nil {
-		return nil, err
-	}
-
-	width := img.Bounds().Dx()
-	height := img.Bounds().Dy()
-	headerSize := 124
-	out := make([]byte, headerSize+width*height*4)
-
-	binary.LittleEndian.PutUint32(out[0:4], uint32(headerSize))
-	binary.LittleEndian.PutUint32(out[4:8], uint32(width))
-	binary.LittleEndian.PutUint32(out[8:12], uint32(height))
-	binary.LittleEndian.PutUint16(out[12:14], 1)
-	binary.LittleEndian.PutUint16(out[14:16], 32)
-	binary.LittleEndian.PutUint32(out[16:20], biRGB)
-	binary.LittleEndian.PutUint32(out[20:24], uint32(width*height*4))
-	binary.LittleEndian.PutUint32(out[40:44], 0x00ff0000)
-	binary.LittleEndian.PutUint32(out[44:48], 0x0000ff00)
-	binary.LittleEndian.PutUint32(out[48:52], 0x000000ff)
-	binary.LittleEndian.PutUint32(out[52:56], 0xff000000)
-	binary.LittleEndian.PutUint32(out[56:60], 0x73524742) // sRGB
-	binary.LittleEndian.PutUint32(out[108:112], 4)        // LCS_GM_IMAGES
-
-	offset := headerSize
-	for y := 0; y < height; y++ {
-		srcY := height - 1 - y
-		for x := 0; x < width; x++ {
-			r, g, b, a := img.At(x, srcY).RGBA()
-			i := offset + (y*width+x)*4
-			out[i+0] = uint8(b >> 8)
-			out[i+1] = uint8(g >> 8)
-			out[i+2] = uint8(r >> 8)
-			out[i+3] = uint8(a >> 8)
-		}
-	}
-
-	return out, nil
 }

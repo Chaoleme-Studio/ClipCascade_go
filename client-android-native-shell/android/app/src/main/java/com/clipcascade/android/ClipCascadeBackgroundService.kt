@@ -34,6 +34,7 @@ class ClipCascadeBackgroundService : Service(), MessageCallback {
         const val ACTION_STATUS_CHANGED = "com.clipcascade.android.action.STATUS_CHANGED"
         const val ACTION_SEND_SHARED_TEXT = "com.clipcascade.android.action.SEND_SHARED_TEXT"
         const val ACTION_SEND_SHARED_IMAGE = "com.clipcascade.android.action.SEND_SHARED_IMAGE"
+        const val ACTION_SEND_SHARED_FILE_OFFER = "com.clipcascade.android.action.SEND_SHARED_FILE_OFFER"
         const val ACTION_SYNC_CLIPBOARD_NOW = "com.clipcascade.android.action.SYNC_CLIPBOARD_NOW"
         const val ACTION_REFRESH_DEVICE_COUNTS = "com.clipcascade.android.action.REFRESH_DEVICE_COUNTS"
         const val ACTION_HISTORY_CHANGED = "com.clipcascade.android.action.HISTORY_CHANGED"
@@ -41,6 +42,8 @@ class ClipCascadeBackgroundService : Service(), MessageCallback {
         const val EXTRA_DETAIL = "com.clipcascade.android.extra.DETAIL"
         const val EXTRA_SHARED_TEXT = "com.clipcascade.android.extra.SHARED_TEXT"
         const val EXTRA_SHARED_IMAGE = "com.clipcascade.android.extra.SHARED_IMAGE"
+        const val EXTRA_SHARED_IMAGE_PATH = "com.clipcascade.android.extra.SHARED_IMAGE_PATH"
+        const val EXTRA_SHARED_FILE_OFFER = "com.clipcascade.android.extra.SHARED_FILE_OFFER"
         const val EXTRA_ONLINE_DEVICES = "com.clipcascade.android.extra.ONLINE_DEVICES"
         const val EXTRA_SYNC_TARGETS = "com.clipcascade.android.extra.SYNC_TARGETS"
     }
@@ -92,9 +95,19 @@ class ClipCascadeBackgroundService : Service(), MessageCallback {
                 sendSharedPayloadWhenReady(sharedText, "text")
             }
         } else if (intent?.action == ACTION_SEND_SHARED_IMAGE) {
-            val sharedImage = intent.getStringExtra(EXTRA_SHARED_IMAGE)?.trim().orEmpty()
+            val imagePath = intent.getStringExtra(EXTRA_SHARED_IMAGE_PATH)?.trim().orEmpty()
+            val sharedImage = if (imagePath.isNotBlank()) {
+                readImagePayloadFromFile(imagePath)
+            } else {
+                intent.getStringExtra(EXTRA_SHARED_IMAGE)?.trim().orEmpty()
+            }
             if (sharedImage.isNotBlank()) {
-                sendSharedPayloadWhenReady(sharedImage, "image")
+                sendSharedPayloadWhenReady(sharedImage, "image", imagePath)
+            }
+        } else if (intent?.action == ACTION_SEND_SHARED_FILE_OFFER) {
+            val sharedFileOffer = intent.getStringExtra(EXTRA_SHARED_FILE_OFFER)?.trim().orEmpty()
+            if (sharedFileOffer.isNotBlank()) {
+                sendSharedPayloadWhenReady(sharedFileOffer, "file_offer")
             }
         }
         
@@ -141,6 +154,7 @@ class ClipCascadeBackgroundService : Service(), MessageCallback {
         when (payloadType) {
             "text" -> mainHandler.post { handleIncomingText(payload) }
             "image" -> Thread { handleIncomingImage(payload) }.start()
+            "file_offer" -> mainHandler.post { handleIncomingFileOffer(payload) }
         }
     }
 
@@ -188,6 +202,17 @@ class ClipCascadeBackgroundService : Service(), MessageCallback {
         }
     }
 
+    private fun handleIncomingFileOffer(payload: String) {
+        try {
+            val fileName = org.json.JSONObject(payload).optString("file_name").ifBlank { "文件" }
+            ClipboardHistoryStore.append(this, "文件：$fileName", "received")
+            notifyHistoryChanged()
+            Log.i(TAG, "✅ 已记录远端文件分享: $fileName")
+        } catch (e: Exception) {
+            Log.e(TAG, "处理远端文件分享失败", e)
+        }
+    }
+
     override fun onStatusChange(status: String) {
         mainHandler.post {
             Log.i(TAG, "网络状态变更: $status")
@@ -232,10 +257,10 @@ class ClipCascadeBackgroundService : Service(), MessageCallback {
         }
     }
 
-    private fun sendSharedPayloadWhenReady(payload: String, payloadType: String) {
+    private fun sendSharedPayloadWhenReady(payload: String, payloadType: String, localImagePath: String? = null) {
         Thread {
             val deadline = System.currentTimeMillis() + 8000L
-            while (engine == null && engineStarting && System.currentTimeMillis() < deadline) {
+            while ((engine == null || engine?.isConnected != true) && System.currentTimeMillis() < deadline) {
                 try {
                     Thread.sleep(120L)
                 } catch (_: InterruptedException) {
@@ -244,32 +269,56 @@ class ClipCascadeBackgroundService : Service(), MessageCallback {
             }
 
             val currentEngine = engine
-            if (currentEngine == null) {
+            if (currentEngine == null || !currentEngine.isConnected) {
                 updateStatus("error", "分享失败：请先配置并连接服务器")
                 Log.w(TAG, "分享失败：engine 尚未连接")
                 return@Thread
             }
 
             try {
+                currentEngine.sendClipboard(payload, payloadType)
                 if (payloadType == "text") {
                     lastWrittenText = payload
                     ClipboardHistoryStore.append(this, payload, "sent")
                     notifyHistoryChanged()
                 } else if (payloadType == "image") {
-                    val bytes = Base64.decode(payload, Base64.DEFAULT)
-                    saveHistoryImage(bytes, "sent")?.let {
-                        ClipboardHistoryStore.appendImage(this, it.absolutePath, "sent")
+                    val path = localImagePath?.takeIf { File(it).exists() }
+                    if (path != null) {
+                        ClipboardHistoryStore.appendImage(this, path, "sent")
                         notifyHistoryChanged()
+                    } else {
+                        val bytes = Base64.decode(payload, Base64.DEFAULT)
+                        saveHistoryImage(bytes, "sent")?.let {
+                            ClipboardHistoryStore.appendImage(this, it.absolutePath, "sent")
+                            notifyHistoryChanged()
+                        }
                     }
+                } else if (payloadType == "file_offer") {
+                    val fileName = org.json.JSONObject(payload).optString("file_name").ifBlank { "文件" }
+                    ClipboardHistoryStore.append(this, "文件：$fileName", "sent")
+                    notifyHistoryChanged()
                 }
-                currentEngine.sendClipboard(payload, payloadType)
-                updateStatus("connected", if (payloadType == "image") "已发送分享图片" else "已发送分享文本")
+                val label = when (payloadType) {
+                    "image" -> "图片"
+                    "file_offer" -> "文件"
+                    else -> "文本"
+                }
+                updateStatus("connected", "已发送分享$label")
                 Log.i(TAG, "✅ 分享内容已发送: $payloadType")
             } catch (e: Exception) {
                 updateStatus("error", "分享失败：${e.message}")
                 Log.e(TAG, "分享发送失败", e)
             }
         }.start()
+    }
+
+    private fun readImagePayloadFromFile(path: String): String {
+        return try {
+            Base64.encodeToString(File(path).readBytes(), Base64.NO_WRAP)
+        } catch (e: Exception) {
+            Log.e(TAG, "读取分享图片缓存失败", e)
+            ""
+        }
     }
 
     private fun startEngineIfNeeded() {
@@ -464,7 +513,8 @@ class ClipCascadeBackgroundService : Service(), MessageCallback {
     private fun saveHistoryImage(bytes: ByteArray, direction: String): File? {
         return try {
             val dir = File(cacheDir, "history-images").apply { mkdirs() }
-            val file = File(dir, "${System.currentTimeMillis()}-$direction-${UUID.randomUUID()}.bin")
+            val extension = AndroidSharePolicy.historyImageExtension(bytes)
+            val file = File(dir, "${System.currentTimeMillis()}-$direction-${UUID.randomUUID()}.$extension")
             FileOutputStream(file).use { it.write(bytes) }
             file
         } catch (e: Exception) {

@@ -84,9 +84,10 @@ This section only describes the technical solutions already implemented in the c
 #### Windows
 
 - Uses system clipboard sequence number to detect changes.
-- File paths read natively via `CF_HDROP`.
+- File paths are read and written natively via `CF_HDROP`. After receiving a remote file, the Windows client writes it to the system file clipboard so it can be pasted directly with `Ctrl+V`.
 - Text read natively via `CF_UNICODETEXT`.
-- Images read natively via `CF_DIB / CF_DIBV5` and converted to PNG before entering the unified `image` sync chain.
+- Images are read via `CF_DIB / CF_DIBV5` and converted to PNG before entering the unified `image` sync chain.
+- When writing images, remote PNG/JPEG/WebP/GIF payloads are normalized to Windows image clipboard formats (`CF_DIB`, `CF_DIBV5`, and the registered PNG format). Android shared images therefore paste as images, not as file paths.
 - This is designed to cover scenarios where "screenshots go directly to the clipboard but cannot be read by common libraries."
 
 #### Linux
@@ -248,11 +249,14 @@ Add users (no manual API calls needed):
 ### Text/Images
 
 - Synchronized in real-time on copy.
+- Screenshots, bitmap clipboard objects, and Android shared images are all treated as `image` and written back as image clipboard content, not as file paths.
 
 ### Files
 
-- Single file and size `<= 20 MiB`: `file_eager` direct transfer.
-- Multiple files or very large files: `file_stub` placeholder (metadata notification).
+- Single file and size `<= 8 MiB`: `file_eager` direct transfer.
+- Single file and size `> 8 MiB and <= 25 MiB`: automatic HTTP relay; the receiver downloads it in the background and writes the local file path to the system clipboard.
+- Single file and size `> 25 MiB and <= 2 GiB`: registered in the server deferred list only. It is not pushed into other devices' clipboards automatically; users can request/download it from the Web page.
+- Multiple files or files over the supported limit: `file_stub` placeholder (metadata notification).
 
 `file_eager` behavior on receiving end:
 
@@ -363,6 +367,11 @@ Ensure both ends are using the latest desktop binaries and check logs for:
 
 - `App: Preparing to send clipboard update Type=file_eager`
 - `Clipboard: Received and wrote file to temporary directory`
+- On Windows, also expect `Clipboard: Windows wrote file clipboard`. If this line is missing, the client did not successfully write `CF_HDROP`; update the Windows desktop binary.
+
+### 4) Android shared image received on Windows but cannot paste
+
+Ensure the Windows desktop binary includes image normalization on write. Android shared images are still synchronized as `image`; Windows should write image clipboard formats instead of falling back to file-path paste.
 
 ## 社区
 

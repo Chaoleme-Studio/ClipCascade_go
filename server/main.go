@@ -28,6 +28,7 @@ import (
 	"github.com/gofiber/fiber/v2/middleware/cors"
 	"github.com/gofiber/fiber/v2/middleware/filesystem"
 	"github.com/gofiber/fiber/v2/middleware/logger"
+	"github.com/gofiber/fiber/v2/middleware/recover"
 	"github.com/gofiber/fiber/v2/middleware/session"
 	"github.com/gofiber/template/html/v2"
 	"github.com/grandcat/zeroconf"
@@ -104,12 +105,12 @@ func main() {
 		}
 	}
 	app := fiber.New(fiber.Config{
-		Views:             engine,
-		BodyLimit:         bodyLimit,
-		StreamRequestBody: true,
+		Views:     engine,
+		BodyLimit: bodyLimit,
 	})
 
 	// 全局中间件
+	app.Use(recover.New())
 	app.Use(logger.New(logger.Config{
 		Format:     "${time} | ${status} | ${latency} | ${method} ${path}\n",
 		TimeFormat: "15:04:05",

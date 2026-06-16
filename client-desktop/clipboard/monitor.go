@@ -30,10 +30,11 @@ import (
 
 // Manager 处理剪贴板监听、更改检测和内容编码。
 type Manager struct {
-	mu       sync.Mutex
-	lastHash uint64
-	onCopy   func(payload string, payloadType string, filename string)
-	notifier func(title, message string)
+	mu                 sync.Mutex
+	lastHash           uint64
+	ignoreChangeCounts map[int64]struct{}
+	onCopy             func(payload string, payloadType string, filename string)
+	notifier           func(title, message string)
 }
 
 // fileStubPayload 是文件懒加载模式下的轻量元信息，不包含文件内容。
@@ -108,7 +109,7 @@ func (m *Manager) watchLegacyByChangeCount(ctx context.Context) {
 			}
 
 			// 只有在初始启动后的第一次变化才处理，或者计数器确实发生了位移
-			if lastCount != -1 {
+			if lastCount != -1 && !m.consumeIgnoredChangeCount(count) {
 				m.handleSystemChange()
 			}
 			lastCount = count
@@ -228,13 +229,18 @@ func (m *Manager) handleFileChange() bool {
 	if len(paths) > 0 {
 		// 单文件且大小可控时，使用 eager 直传保证跨端可粘贴。
 		if len(paths) == 1 {
-			if payload, name, ok := buildFileEagerPayload(paths[0]); ok {
+			if payload, name, ok := fileClipboardPayload(paths); ok {
 				return m.handleChange(payload, constants.TypeFileEager, name)
 			}
 		}
 		// 其余情况走懒加载占位符（多文件/超大文件）。
-		payload := buildFileStubPayload(paths)
-		meta := buildFileStubMeta(paths)
+		payload, meta, _ := fileClipboardPayload(paths)
+		if payload == "" {
+			return false
+		}
+		if meta == "" {
+			meta = buildFileStubMeta(paths)
+		}
 		return m.handleChange(payload, constants.TypeFileStub, meta)
 	}
 	return false
@@ -302,11 +308,20 @@ func (m *Manager) Paste(payload string, payloadType string, filename string) {
 			slog.Warn("剪贴板：无法解码图像", "错误", err)
 			return
 		}
-		if runtime.GOOS == "darwin" || runtime.GOOS == "windows" {
+		if runtime.GOOS == "darwin" {
 			if err := setPlatformImage(data); err != nil {
 				slog.Warn("剪贴板：无法写入图像到系统剪贴板", "错误", err)
 				return
 			}
+			m.ignoreCurrentChangeCount()
+			m.rememberCurrentImageHash()
+		} else if runtime.GOOS == "windows" {
+			if err := setPlatformImage(data); err != nil {
+				slog.Warn("剪贴板：无法写入图像到系统剪贴板", "错误", err)
+				return
+			}
+		} else if runtime.GOOS == "linux" {
+			clipboard.Write(clipboard.FmtImage, data)
 		} else {
 			clipboard.Write(clipboard.FmtImage, data)
 		}
@@ -355,6 +370,12 @@ func (m *Manager) Paste(payload string, payloadType string, filename string) {
 }
 
 func contentHash(payload string, payloadType string) uint64 {
+	if payloadType == constants.TypeFileStub {
+		if hash, ok := fileStubContentHash(payload); ok {
+			return hash
+		}
+		return pkgcrypto.XXHash64(payload)
+	}
 	if payloadType != constants.TypeImage {
 		return pkgcrypto.XXHash64(payload)
 	}
@@ -380,6 +401,39 @@ func contentHash(payload string, payloadType string) uint64 {
 	_, _ = hasher.Write(dims[:])
 	_, _ = hasher.Write(rgba.Pix)
 	return hasher.Sum64()
+}
+
+func fileStubContentHash(payload string) (uint64, bool) {
+	lines := strings.Split(payload, "\n")
+	paths := make([]string, 0, len(lines))
+	for _, line := range lines {
+		path := strings.TrimSpace(line)
+		if path != "" {
+			paths = append(paths, path)
+		}
+	}
+	if len(paths) != 1 {
+		return 0, false
+	}
+
+	path := filepath.Clean(paths[0])
+	info, err := os.Stat(path)
+	if err != nil || info.IsDir() {
+		return 0, false
+	}
+
+	hasher := pkgcrypto.NewXXHash64()
+	_, _ = fmt.Fprintf(hasher, "file:%d:", info.Size())
+	if info.Size() <= constants.DefaultFileAutoRelayMaxBytes {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return 0, false
+		}
+		_, _ = hasher.Write(data)
+		return hasher.Sum64(), true
+	}
+	_, _ = hasher.Write([]byte(path))
+	return hasher.Sum64(), true
 }
 
 func buildFileStubPayload(paths []string) string {
@@ -513,13 +567,69 @@ func (m *Manager) PasteLocalFile(path string) error {
 		return err
 	}
 	m.mu.Lock()
-	m.lastHash = pkgcrypto.XXHash64(path)
+	m.lastHash = fileClipboardHash([]string{path})
 	m.mu.Unlock()
 	if err := setPlatformFilePaths([]string{path}); err != nil {
 		return err
 	}
+	m.ignoreCurrentChangeCount()
 	if m.notifier != nil {
 		m.notifier("ClipCascade", fmt.Sprintf("收到文件并写入剪贴板 (%s)", filepath.Base(path)))
 	}
 	return nil
+}
+
+func fileClipboardHash(paths []string) uint64 {
+	payload, _, eager := fileClipboardPayload(paths)
+	if eager {
+		return contentHash(payload, constants.TypeFileEager)
+	}
+	return contentHash(payload, constants.TypeFileStub)
+}
+
+func fileClipboardPayload(paths []string) (payload string, filenameOrMeta string, eager bool) {
+	if len(paths) == 1 {
+		if payload, name, ok := buildFileEagerPayload(paths[0]); ok {
+			return payload, name, true
+		}
+	}
+	return buildFileStubPayload(paths), buildFileStubMeta(paths), false
+}
+
+func (m *Manager) rememberCurrentImageHash() {
+	data, err := getPlatformImage()
+	if err != nil || len(data) == 0 {
+		return
+	}
+	hash := contentHash(base64.StdEncoding.EncodeToString(data), constants.TypeImage)
+	m.mu.Lock()
+	m.lastHash = hash
+	m.mu.Unlock()
+}
+
+func (m *Manager) ignoreCurrentChangeCount() {
+	if runtime.GOOS != "darwin" {
+		return
+	}
+	count := getPlatformChangeCount()
+	if count <= 0 {
+		return
+	}
+	m.mu.Lock()
+	if m.ignoreChangeCounts == nil {
+		m.ignoreChangeCounts = make(map[int64]struct{})
+	}
+	m.ignoreChangeCounts[count] = struct{}{}
+	m.mu.Unlock()
+}
+
+func (m *Manager) consumeIgnoredChangeCount(count int64) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.ignoreChangeCounts[count]; !ok {
+		return false
+	}
+	delete(m.ignoreChangeCounts, count)
+	slog.Debug("剪贴板：忽略本进程写入触发的剪贴板 changeCount", "count", count)
+	return true
 }

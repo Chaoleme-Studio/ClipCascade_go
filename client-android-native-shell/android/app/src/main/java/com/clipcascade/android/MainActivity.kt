@@ -2,6 +2,7 @@ package com.clipcascade.android
 
 import android.Manifest
 import android.app.Activity
+import android.app.Dialog
 import android.content.BroadcastReceiver
 import android.content.ClipData
 import android.content.ClipboardManager
@@ -9,8 +10,10 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.PackageManager
+import android.graphics.Bitmap
 import android.graphics.Color
 import android.graphics.BitmapFactory
+import android.graphics.drawable.ColorDrawable
 import android.net.Uri
 import android.net.nsd.NsdManager
 import android.net.nsd.NsdServiceInfo
@@ -21,11 +24,11 @@ import android.os.Looper
 import android.os.PowerManager
 import android.provider.Settings
 import android.text.InputType
-import android.util.Base64
 import android.util.Log
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
+import android.view.Window
 import android.widget.Button
 import android.widget.CheckBox
 import android.widget.EditText
@@ -40,19 +43,8 @@ import androidx.core.content.ContextCompat
 import androidx.core.content.FileProvider
 import com.google.android.material.button.MaterialButton
 import com.google.android.material.card.MaterialCardView
-import org.json.JSONArray
-import org.json.JSONObject
-import java.io.ByteArrayOutputStream
 import java.io.File
-import java.io.FileOutputStream
-import java.util.UUID
-import java.net.HttpURLConnection
-import java.net.URL
-import java.net.URLEncoder
-import java.text.SimpleDateFormat
-import java.util.Date
 import java.util.LinkedHashSet
-import java.util.Locale
 
 class MainActivity : Activity() {
 
@@ -82,6 +74,7 @@ class MainActivity : Activity() {
     private var deferredRefreshTask: Runnable? = null
     private val apiSessionManager by lazy {
         ApiSessionManager(
+            context = applicationContext,
             normalizeServerUrl = { normalizeServerUrl(it) },
             login = { serverURL, username, password -> loginForApi(serverURL, username, password) }
         )
@@ -143,7 +136,7 @@ class MainActivity : Activity() {
             typeface = android.graphics.Typeface.DEFAULT_BOLD
         }
         val subtitleText = TextView(this).apply {
-            text = "跨设备剪贴板同步 · v${appVersionName()}"
+            text = "跨设备剪贴板同步 · v${appVersionName(this@MainActivity)}"
             textSize = 15f
             setTextColor(color(R.color.cc_text_secondary))
             setPadding(0, dp(4), 0, dp(18))
@@ -362,7 +355,6 @@ class MainActivity : Activity() {
         setHistoryTab(HistoryTab.CLIPBOARD)
 
         ensureNotificationPermissionIfNeeded()
-        handleShareIntent(intent)
         if ((prefs.getString("ServerURL", "") ?: "").isNotBlank()
             && (prefs.getString("Username", "") ?: "").isNotBlank()
             && (prefs.getString("Password", "") ?: "").isNotBlank()
@@ -374,7 +366,6 @@ class MainActivity : Activity() {
     override fun onNewIntent(intent: Intent?) {
         super.onNewIntent(intent)
         setIntent(intent)
-        handleShareIntent(intent)
     }
 
     override fun onResume() {
@@ -399,6 +390,7 @@ class MainActivity : Activity() {
             )
         }
         refreshConnectionStatus()
+        refreshHistoryList()
         refreshPermissionStatus()
         refreshDeviceStatus()
         startDeferredRefreshLoop()
@@ -419,47 +411,26 @@ class MainActivity : Activity() {
         super.onDestroy()
     }
 
-    private fun handleShareIntent(intent: Intent?) {
-        if (intent == null) {
-            return
-        }
-        val sharedText = when (intent.action) {
-            Intent.ACTION_SEND -> {
-                if (intent.type == "text/plain") intent.getCharSequenceExtra(Intent.EXTRA_TEXT)?.toString() else null
-            }
-            Intent.ACTION_PROCESS_TEXT -> intent.getCharSequenceExtra(Intent.EXTRA_PROCESS_TEXT)?.toString()
-            else -> null
-        }?.trim()
-
-        if (!sharedText.isNullOrBlank()) {
-            startCoreService(sharedText = sharedText)
-            Toast.makeText(this, "已接收分享文本，正在同步", Toast.LENGTH_SHORT).show()
-            intent.action = Intent.ACTION_MAIN
-            intent.removeExtra(Intent.EXTRA_TEXT)
-            intent.removeExtra(Intent.EXTRA_PROCESS_TEXT)
-            return
-        }
-
-        if (intent.action == Intent.ACTION_SEND && intent.type?.startsWith("image/") == true) {
-            val uri = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                intent.getParcelableExtra(Intent.EXTRA_STREAM, Uri::class.java)
-            } else {
-                @Suppress("DEPRECATION")
-                intent.getParcelableExtra(Intent.EXTRA_STREAM)
-            }
-            val encoded = uri?.let { readSharedImageAsBase64(it) }
-            if (!encoded.isNullOrBlank()) {
-                startCoreService(sharedImageBase64 = encoded)
-                Toast.makeText(this, "已接收分享图片，正在同步", Toast.LENGTH_SHORT).show()
-                intent.action = Intent.ACTION_MAIN
-                intent.removeExtra(Intent.EXTRA_STREAM)
-            }
-        }
+    private fun saveConfig(
+        prefs: android.content.SharedPreferences,
+        serverInput: EditText,
+        userInput: EditText,
+        passInput: EditText,
+        e2eeCheck: CheckBox
+    ) {
+        val normalizedServerURL = normalizeServerUrl(serverInput.text?.toString() ?: "")
+        serverInput.setText(normalizedServerURL)
+        prefs.edit()
+            .putString("ServerURL", normalizedServerURL)
+            .putString("Username", userInput.text?.toString()?.trim() ?: "")
+            .putString("Password", passInput.text?.toString() ?: "")
+            .putBoolean("E2EE", e2eeCheck.isChecked)
+            .apply()
     }
-
     private fun startCoreService(
         sharedText: String? = null,
         sharedImageBase64: String? = null,
+        sharedFileOffer: String? = null,
         showToast: Boolean = true
     ) {
         val intent = Intent(this, ClipCascadeBackgroundService::class.java).apply {
@@ -469,6 +440,9 @@ class MainActivity : Activity() {
             } else if (!sharedImageBase64.isNullOrBlank()) {
                 action = ClipCascadeBackgroundService.ACTION_SEND_SHARED_IMAGE
                 putExtra(ClipCascadeBackgroundService.EXTRA_SHARED_IMAGE, sharedImageBase64)
+            } else if (!sharedFileOffer.isNullOrBlank()) {
+                action = ClipCascadeBackgroundService.ACTION_SEND_SHARED_FILE_OFFER
+                putExtra(ClipCascadeBackgroundService.EXTRA_SHARED_FILE_OFFER, sharedFileOffer)
             }
         }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -567,67 +541,6 @@ class MainActivity : Activity() {
         val onlineDevices = prefs.getInt("OnlineDevices", 0)
         val syncTargets = prefs.getInt("SyncTargets", 0)
         deviceCountText.text = "在线设备：$onlineDevices 台；本次复制会同步给 $syncTargets 台"
-    }
-
-    private fun readSharedImageAsBase64(uri: Uri): String? {
-        return try {
-            contentResolver.openInputStream(uri)?.use { input ->
-                val out = ByteArrayOutputStream()
-                val buffer = ByteArray(16 * 1024)
-                var total = 0
-                while (true) {
-                    val read = input.read(buffer)
-                    if (read <= 0) {
-                        break
-                    }
-                    total += read
-                    if (total > MAX_DIRECT_IMAGE_BYTES) {
-                        Toast.makeText(this, "图片超过 8 MiB，当前 Android 端暂不直传", Toast.LENGTH_LONG).show()
-                        return null
-                    }
-                    out.write(buffer, 0, read)
-                }
-                val bytes = out.toByteArray()
-                saveHistoryImage(bytes, "sent")?.let {
-                    ClipboardHistoryStore.appendImage(this, it.absolutePath, "sent")
-                    refreshHistoryList()
-                }
-                Base64.encodeToString(bytes, Base64.NO_WRAP)
-            }
-        } catch (e: Exception) {
-            Log.e(tag, "读取分享图片失败", e)
-            Toast.makeText(this, "读取分享图片失败", Toast.LENGTH_SHORT).show()
-            null
-        }
-    }
-
-    private fun saveHistoryImage(bytes: ByteArray, direction: String): File? {
-        return try {
-            val dir = File(cacheDir, "history-images").apply { mkdirs() }
-            val file = File(dir, "${System.currentTimeMillis()}-$direction-${UUID.randomUUID()}.bin")
-            FileOutputStream(file).use { it.write(bytes) }
-            file
-        } catch (e: Exception) {
-            Log.w(tag, "保存图片历史失败", e)
-            null
-        }
-    }
-
-    private fun saveConfig(
-        prefs: android.content.SharedPreferences,
-        serverInput: EditText,
-        userInput: EditText,
-        passInput: EditText,
-        e2eeCheck: CheckBox
-    ) {
-        val normalizedServerURL = normalizeServerUrl(serverInput.text?.toString() ?: "")
-        serverInput.setText(normalizedServerURL)
-        prefs.edit()
-            .putString("ServerURL", normalizedServerURL)
-            .putString("Username", userInput.text?.toString()?.trim() ?: "")
-            .putString("Password", passInput.text?.toString() ?: "")
-            .putBoolean("E2EE", e2eeCheck.isChecked)
-            .apply()
     }
 
     private fun requestOverlayPermission() {
@@ -988,93 +901,6 @@ class MainActivity : Activity() {
         }.start()
     }
 
-    private fun loginForApi(serverURL: String, username: String, password: String): String {
-        val baseURL = normalizeServerUrl(serverURL)
-        val body = "username=${urlEncode(username)}&password=${urlEncode(password)}"
-        val conn = (URL("${baseURL.trimEnd('/')}/login").openConnection() as HttpURLConnection).apply {
-            requestMethod = "POST"
-            instanceFollowRedirects = false
-            connectTimeout = 6000
-            readTimeout = 6000
-            doOutput = true
-            setRequestProperty("Content-Type", "application/x-www-form-urlencoded")
-        }
-        conn.outputStream.use { it.write(body.toByteArray(Charsets.UTF_8)) }
-        val status = conn.responseCode
-        if (status !in 300..399 && status != HttpURLConnection.HTTP_OK) {
-            throw IllegalStateException("login failed: $status")
-        }
-        return conn.headerFields["Set-Cookie"]
-            ?.joinToString("; ") { it.substringBefore(";") }
-            .orEmpty()
-            .also {
-                if (it.isBlank()) {
-                    throw IllegalStateException("login did not return session cookie")
-                }
-            }
-    }
-
-    private fun fetchDeferredFiles(serverURL: String, cookie: String): List<DeferredFileItem> {
-        val baseURL = normalizeServerUrl(serverURL)
-        val conn = (URL("${baseURL.trimEnd('/')}/api/files/deferred").openConnection() as HttpURLConnection).apply {
-            requestMethod = "GET"
-            connectTimeout = 6000
-            readTimeout = 6000
-            setRequestProperty("Cookie", cookie)
-        }
-        if (conn.responseCode == HttpURLConnection.HTTP_UNAUTHORIZED || conn.responseCode == HttpURLConnection.HTTP_FORBIDDEN) {
-            throw ApiUnauthorizedException("list deferred unauthorized: ${conn.responseCode}")
-        }
-        if (conn.responseCode != HttpURLConnection.HTTP_OK) {
-            throw IllegalStateException("list deferred failed: ${conn.responseCode}")
-        }
-        val raw = conn.inputStream.bufferedReader().use { it.readText() }
-        val arr = JSONArray(raw)
-        val out = mutableListOf<DeferredFileItem>()
-        for (i in 0 until arr.length()) {
-            val obj = arr.optJSONObject(i) ?: continue
-            out.add(parseDeferredFile(obj))
-        }
-        return out
-    }
-
-    private fun fetchDeviceCounts(serverURL: String, cookie: String): DeviceCounts {
-        val baseURL = normalizeServerUrl(serverURL)
-        val conn = (URL("${baseURL.trimEnd('/')}/api/devices/online").openConnection() as HttpURLConnection).apply {
-            requestMethod = "GET"
-            connectTimeout = 6000
-            readTimeout = 6000
-            setRequestProperty("Cookie", cookie)
-        }
-        if (conn.responseCode == HttpURLConnection.HTTP_UNAUTHORIZED || conn.responseCode == HttpURLConnection.HTTP_FORBIDDEN) {
-            throw ApiUnauthorizedException("device status unauthorized: ${conn.responseCode}")
-        }
-        if (conn.responseCode != HttpURLConnection.HTTP_OK) {
-            throw IllegalStateException("device status failed: ${conn.responseCode}")
-        }
-        val raw = conn.inputStream.bufferedReader().use { it.readText() }
-        val obj = JSONObject(raw)
-        return DeviceCounts(
-            onlineDevices = obj.optInt("online_devices", 0),
-            syncTargets = obj.optInt("sync_targets", 0),
-            username = obj.optString("username").takeIf { it.isNotBlank() }
-        )
-    }
-
-    private fun parseDeferredFile(obj: JSONObject): DeferredFileItem {
-        return DeferredFileItem(
-            deferredID = obj.optString("deferred_id"),
-            fileName = obj.optString("file_name"),
-            fileSizeHuman = obj.optString("file_size_human"),
-            mimeType = obj.optString("mime_type", "application/octet-stream"),
-            status = obj.optString("status"),
-            statusDetail = obj.optString("status_detail"),
-            downloadURL = obj.optString("download_url"),
-            uploadPercent = obj.optInt("upload_percent", 0),
-            relayID = obj.optString("relay_id")
-        )
-    }
-
     private fun handleDeferredFileClick(item: DeferredFileItem) {
         val prefs = getSharedPreferences("clipcascade", Context.MODE_PRIVATE)
         val serverURL = normalizeServerUrl(prefs.getString("ServerURL", "") ?: "")
@@ -1089,7 +915,7 @@ class MainActivity : Activity() {
             try {
                 if (item.status == "ready" && item.downloadURL.isNotBlank()) {
                     val file = apiSessionManager.withSession(serverURL, username, password) { cookie ->
-                        downloadDeferredFile(serverURL, cookie, item)
+                        downloadDeferredFile(serverURL, cookie, item, File(cacheDir, "downloads"))
                     }
                     markFileDownloaded(item, file)
                     runOnUiThread {
@@ -1126,55 +952,52 @@ class MainActivity : Activity() {
             Toast.makeText(this, "图片文件已被系统清理", Toast.LENGTH_SHORT).show()
             return
         }
-        openDownloadedFile(file, "image/*")
+        showImagePreview(file)
     }
 
-    private fun requestDeferredFile(serverURL: String, cookie: String, deferredID: String) {
-        val baseURL = normalizeServerUrl(serverURL)
-        val conn = (URL("${baseURL.trimEnd('/')}/api/files/deferred/$deferredID/request").openConnection() as HttpURLConnection).apply {
-            requestMethod = "POST"
-            connectTimeout = 6000
-            readTimeout = 6000
-            doOutput = true
-            setRequestProperty("Cookie", cookie)
-            setRequestProperty("Content-Length", "0")
+    private fun showImagePreview(file: File) {
+        val bitmap = decodePreviewBitmap(file)
+        if (bitmap == null) {
+            Toast.makeText(this, "图片无法预览", Toast.LENGTH_SHORT).show()
+            return
         }
-        conn.outputStream.use { }
-        if (conn.responseCode == HttpURLConnection.HTTP_UNAUTHORIZED || conn.responseCode == HttpURLConnection.HTTP_FORBIDDEN) {
-            throw ApiUnauthorizedException("request unauthorized: ${conn.responseCode}")
+
+        val imageView = ImageView(this).apply {
+            setImageBitmap(bitmap)
+            adjustViewBounds = true
+            scaleType = ImageView.ScaleType.FIT_CENTER
+            setBackgroundColor(Color.BLACK)
+            setPadding(dp(12), dp(12), dp(12), dp(12))
         }
-        if (conn.responseCode != HttpURLConnection.HTTP_OK) {
-            throw IllegalStateException("request failed: ${conn.responseCode}")
+        Dialog(this).apply {
+            requestWindowFeature(Window.FEATURE_NO_TITLE)
+            setContentView(imageView)
+            window?.setBackgroundDrawable(ColorDrawable(Color.BLACK))
+            window?.setLayout(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
+            imageView.setOnClickListener { dismiss() }
+            show()
+            window?.setLayout(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
         }
     }
 
-    private fun downloadDeferredFile(serverURL: String, cookie: String, item: DeferredFileItem): File {
-        val baseURL = normalizeServerUrl(serverURL)
-        val url = if (item.downloadURL.startsWith("http")) {
-            item.downloadURL
-        } else {
-            "${baseURL.trimEnd('/')}/${item.downloadURL.trimStart('/')}"
+    private fun decodePreviewBitmap(file: File): Bitmap? {
+        val metrics = resources.displayMetrics
+        val maxWidth = maxOf(metrics.widthPixels, 1)
+        val maxHeight = maxOf(metrics.heightPixels, 1)
+        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        BitmapFactory.decodeFile(file.absolutePath, bounds)
+        if (bounds.outWidth <= 0 || bounds.outHeight <= 0) {
+            return null
         }
-        val conn = (URL(url).openConnection() as HttpURLConnection).apply {
-            requestMethod = "GET"
-            connectTimeout = 6000
-            readTimeout = 60000
-            setRequestProperty("Cookie", cookie)
+
+        var sampleSize = 1
+        while (bounds.outWidth / sampleSize > maxWidth * 2 || bounds.outHeight / sampleSize > maxHeight * 2) {
+            sampleSize *= 2
         }
-        if (conn.responseCode == HttpURLConnection.HTTP_UNAUTHORIZED || conn.responseCode == HttpURLConnection.HTTP_FORBIDDEN) {
-            throw ApiUnauthorizedException("download unauthorized: ${conn.responseCode}")
-        }
-        if (conn.responseCode != HttpURLConnection.HTTP_OK) {
-            throw IllegalStateException("download failed: ${conn.responseCode}")
-        }
-        val dir = File(cacheDir, "downloads").apply { mkdirs() }
-        val file = File(dir, safeFileName(item.fileName))
-        conn.inputStream.use { input ->
-            file.outputStream().use { output ->
-                input.copyTo(output)
-            }
-        }
-        return file
+        return BitmapFactory.decodeFile(
+            file.absolutePath,
+            BitmapFactory.Options().apply { inSampleSize = sampleSize }
+        )
     }
 
     private fun openDownloadedFile(file: File, mimeType: String) {
@@ -1505,45 +1328,7 @@ class MainActivity : Activity() {
         return ContextCompat.getColor(this, resId)
     }
 
-    private fun formatTime(timestamp: Long): String {
-        return SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date(timestamp))
-    }
-
-    private fun urlEncode(value: String): String {
-        return URLEncoder.encode(value, "UTF-8")
-    }
-
-    private fun normalizeServerUrl(raw: String): String {
-        val trimmed = raw.trim().trimEnd('/')
-        if (trimmed.isBlank()) {
-            return ""
-        }
-        return if (trimmed.contains("://")) trimmed else "http://$trimmed"
-    }
-
-    private fun safeFileName(name: String): String {
-        val cleaned = name.trim()
-            .replace("/", "_")
-            .replace("\\", "_")
-            .replace("\u0000", "")
-        return cleaned.ifBlank { "clipcascade-file" }
-    }
-
-    private fun appVersionName(): String {
-        return try {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                packageManager.getPackageInfo(packageName, PackageManager.PackageInfoFlags.of(0)).versionName
-            } else {
-                @Suppress("DEPRECATION")
-                packageManager.getPackageInfo(packageName, 0).versionName
-            } ?: "unknown"
-        } catch (_: Exception) {
-            "unknown"
-        }
-    }
-
     companion object {
-        private const val MAX_DIRECT_IMAGE_BYTES = 8 * 1024 * 1024
         private val discoveryUrlComparator = Comparator<String> { left, right ->
             discoveryRank(left).compareTo(discoveryRank(right))
         }
@@ -1575,21 +1360,4 @@ class MainActivity : Activity() {
         FILES
     }
 
-    private data class DeferredFileItem(
-        val deferredID: String,
-        val fileName: String,
-        val fileSizeHuman: String,
-        val mimeType: String,
-        val status: String,
-        val statusDetail: String,
-        val downloadURL: String,
-        val uploadPercent: Int,
-        val relayID: String
-    )
-
-    private data class DeviceCounts(
-        val onlineDevices: Int,
-        val syncTargets: Int,
-        val username: String?
-    )
 }

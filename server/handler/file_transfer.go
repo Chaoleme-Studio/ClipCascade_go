@@ -7,8 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"mime"
-	"mime/multipart"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -83,7 +82,14 @@ func NewFileTransferHandler(db *gorm.DB, cfg *config.Config, hub *WSHub) *FileTr
 	return &FileTransferHandler{DB: db, Config: cfg, Hub: hub}
 }
 
-func (h *FileTransferHandler) Upload(c *fiber.Ctx) error {
+func (h *FileTransferHandler) Upload(c *fiber.Ctx) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			slog.Warn("文件上传 multipart 解析失败", "error", r)
+			err = c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "failed to parse multipart"})
+		}
+	}()
+
 	if !h.Config.FileRelayEnabled {
 		return c.Status(fiber.StatusNotImplemented).JSON(fiber.Map{"error": "file relay disabled"})
 	}
@@ -98,41 +104,24 @@ func (h *FileTransferHandler) Upload(c *fiber.Ctx) error {
 		}
 	}
 
-	// Parse multipart boundary from Content-Type without buffering the body.
-	_, params, err := mime.ParseMediaType(string(c.Request().Header.ContentType()))
-	if err != nil || params["boundary"] == "" {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid content type"})
-	}
-
-	mr := multipart.NewReader(c.Request().BodyStream(), params["boundary"])
-	var filePart *multipart.Part
-	var mimeType string
-	for {
-		p, err := mr.NextPart()
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "failed to parse multipart"})
-		}
-		if p.FormName() == "file" {
-			filePart = p
-			mimeType = p.Header.Get("Content-Type")
-			break
-		}
-		_ = p.Close()
-	}
-	if filePart == nil {
+	fileHeader, err := c.FormFile("file")
+	if err != nil || fileHeader == nil {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "missing file"})
 	}
-	defer filePart.Close()
 
-	name := sanitizeUploadFilename(filePart.FileName())
+	name := sanitizeUploadFilename(fileHeader.Filename)
 	if name == "" {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid filename"})
 	}
+	mimeType := fileHeader.Header.Get("Content-Type")
 	if strings.TrimSpace(mimeType) == "" {
 		mimeType = "application/octet-stream"
+	}
+	if fileHeader.Size <= 0 {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid file size"})
+	}
+	if h.Config.FileRelayMaxBytes > 0 && fileHeader.Size > h.Config.FileRelayMaxBytes {
+		return c.Status(fiber.StatusRequestEntityTooLarge).JSON(fiber.Map{"error": "file too large", "max_bytes": h.Config.FileRelayMaxBytes})
 	}
 
 	if err := os.MkdirAll(h.Config.FileRelayDir, 0o755); err != nil {
@@ -149,27 +138,13 @@ func (h *FileTransferHandler) Upload(c *fiber.Ctx) error {
 	finalPath := filepath.Join(h.Config.FileRelayDir, relayID+filepath.Ext(name))
 	defer os.Remove(tempPath)
 
-	out, err := os.Create(tempPath)
-	if err != nil {
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to create relay file"})
-	}
-
-	// Stream directly to disk — no full-body buffering.
-	var src io.Reader = filePart
-	if h.Config.FileRelayMaxBytes > 0 {
-		src = io.LimitReader(filePart, h.Config.FileRelayMaxBytes+1)
-	}
-	hasher := sha256.New()
-	written, copyErr := copyWithHash(out, src, hasher)
-	closeErr := out.Close()
-	if copyErr != nil || closeErr != nil {
+	if err := c.SaveFile(fileHeader, tempPath); err != nil {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to store file"})
 	}
-	if written == 0 {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid file size"})
-	}
-	if h.Config.FileRelayMaxBytes > 0 && written > h.Config.FileRelayMaxBytes {
-		return c.Status(fiber.StatusRequestEntityTooLarge).JSON(fiber.Map{"error": "file too large", "max_bytes": h.Config.FileRelayMaxBytes})
+	written := fileHeader.Size
+	hasher, err := hashFile(tempPath)
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to hash file"})
 	}
 
 	if err := os.Rename(tempPath, finalPath); err != nil {
@@ -181,7 +156,7 @@ func (h *FileTransferHandler) Upload(c *fiber.Ctx) error {
 		OwnerUsername: username,
 		FileName:      name,
 		FileSize:      written,
-		SHA256:        hex.EncodeToString(hasher.Sum(nil)),
+		SHA256:        hasher,
 		MimeType:      mimeType,
 		StoragePath:   finalPath,
 		ExpiresAt:     time.Now().Add(time.Duration(h.Config.FileRelayTTLSeconds) * time.Second),
@@ -190,6 +165,13 @@ func (h *FileTransferHandler) Upload(c *fiber.Ctx) error {
 		_ = os.Remove(finalPath)
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to persist relay metadata"})
 	}
+	slog.Info("文件上传完成",
+		"用户名", username,
+		"relay_id", record.RelayID,
+		"文件名", record.FileName,
+		"大小", sizefmt.FormatBytes(record.FileSize),
+		"字节数", record.FileSize,
+	)
 
 	return c.JSON(fiber.Map{
 		"relay_id":  record.RelayID,
@@ -838,11 +820,16 @@ func randomID(n int) (string, error) {
 	return hex.EncodeToString(buf), nil
 }
 
-func copyWithHash(dst *os.File, src io.Reader, hasher hashWriter) (int64, error) {
-	return io.CopyBuffer(io.MultiWriter(dst, hasher), src, make([]byte, 256*1024))
-}
+func hashFile(path string) (string, error) {
+	in, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer in.Close()
 
-type hashWriter interface {
-	Write(p []byte) (n int, err error)
-	Sum(b []byte) []byte
+	hasher := sha256.New()
+	if _, err := io.CopyBuffer(hasher, in, make([]byte, 256*1024)); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(hasher.Sum(nil)), nil
 }

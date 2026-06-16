@@ -15,6 +15,10 @@ import (
 	"github.com/clipcascade/desktop/config"
 )
 
+// Version 由构建脚本通过 -ldflags "-X main.Version=..." 注入；
+// 若直接 go run 则为默认值。
+var Version = "1.14"
+
 func main() {
 	// 为初始设置解析命令行参数 (flags)
 	serverURL := flag.String("server", "", "Server URL (e.g. http://localhost:8080)")

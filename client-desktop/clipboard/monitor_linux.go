@@ -4,6 +4,7 @@ package clipboard
 
 import (
 	"bytes"
+	"fmt"
 	"log/slog"
 	"net/url"
 	"os"
@@ -23,10 +24,9 @@ func getPlatformChangeCount() int64 {
 	return int64(pkgcrypto.XXHash64(string(out)))
 }
 
-// getPlatformFilePaths 尝试使用 xclip 从剪贴板获取文件 URI。
+// getPlatformFilePaths 尝试从 Wayland/X11 剪贴板获取文件 URI。
 func getPlatformFilePaths() ([]string, error) {
-	cmd := exec.Command("xclip", "-selection", "clipboard", "-o", "-t", "text/uri-list")
-	out, err := cmd.Output()
+	out, err := readURIListClipboard()
 	if err != nil {
 		return nil, nil
 	}
@@ -53,28 +53,57 @@ func getPlatformFilePaths() ([]string, error) {
 	return validPaths, nil
 }
 
-// setPlatformFilePaths 使用 xclip 写入文件路径。
+// setPlatformFilePaths 使用 wl-copy/xclip 写入文件路径。
 func setPlatformFilePaths(paths []string) error {
 	if len(paths) == 0 {
 		return nil
 	}
-	slog.Info("剪贴板：通过 xclip 将文件路径写入 Linux 剪贴板...")
+	payload := buildURIList(paths)
+	if payload == "" {
+		return nil
+	}
+	if _, err := exec.LookPath("wl-copy"); err == nil && os.Getenv("WAYLAND_DISPLAY") != "" {
+		slog.Info("剪贴板：通过 wl-copy 将文件路径写入 Linux 剪贴板...")
+		cmd := exec.Command("wl-copy", "--type", "text/uri-list")
+		cmd.Stdin = strings.NewReader(payload)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			return fmt.Errorf("wl-copy failed: %w: %s", err, strings.TrimSpace(string(out)))
+		}
+		return nil
+	}
+	if _, err := exec.LookPath("xclip"); err == nil {
+		slog.Info("剪贴板：通过 xclip 将文件路径写入 Linux 剪贴板...")
+		cmd := exec.Command("xclip", "-selection", "clipboard", "-t", "text/uri-list")
+		cmd.Stdin = strings.NewReader(payload)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			return fmt.Errorf("xclip failed: %w: %s", err, strings.TrimSpace(string(out)))
+		}
+		return nil
+	}
+	return fmt.Errorf("missing wl-copy or xclip for Linux file clipboard")
+}
 
-	var uriList []string
+func readURIListClipboard() ([]byte, error) {
+	if _, err := exec.LookPath("wl-paste"); err == nil && os.Getenv("WAYLAND_DISPLAY") != "" {
+		return exec.Command("wl-paste", "--no-newline", "--type", "text/uri-list").Output()
+	}
+	if _, err := exec.LookPath("xclip"); err == nil {
+		return exec.Command("xclip", "-selection", "clipboard", "-o", "-t", "text/uri-list").Output()
+	}
+	return nil, fmt.Errorf("missing wl-paste or xclip")
+}
+
+func buildURIList(paths []string) string {
+	uriList := make([]string, 0, len(paths))
 	for _, p := range paths {
-		uriList = append(uriList, "file://"+p)
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		uri := url.URL{Scheme: "file", Path: p}
+		uriList = append(uriList, uri.String())
 	}
-	payload := strings.Join(uriList, "\n")
-
-	cmd := exec.Command("xclip", "-selection", "clipboard", "-t", "text/uri-list")
-	cmd.Stdin = strings.NewReader(payload)
-	err := cmd.Start()
-	if err == nil {
-		go cmd.Wait()
-	} else {
-		slog.Warn("剪贴板：通过 xclip 异步写入失败", "错误", err)
-	}
-	return err
+	return strings.Join(uriList, "\n")
 }
 
 func getPlatformImage() ([]byte, error) {

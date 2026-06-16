@@ -84,9 +84,10 @@ ClipCascade 的定位是：以剪贴板为中心，做一个可自部署、可�
 #### Windows
 
 - 使用系统剪贴板序列号检测变化。
-- 文件路径通过 `CF_HDROP` 原生读取。
+- 文件路径通过 `CF_HDROP` 原生读写；接收远端文件后会写入系统文件剪贴板，支持在资源管理器、聊天窗口等位置直接 `Ctrl+V` 粘贴。
 - 文本通过 `CF_UNICODETEXT` 原生读取。
-- 图片通过 `CF_DIB / CF_DIBV5` 原生读取，并转换为 PNG 后进入统一的 `image` 同步链路。
+- 图片读取通过 `CF_DIB / CF_DIBV5`，并转换为 PNG 后进入统一的 `image` 同步链路。
+- 图片写入会把 PNG/JPEG/WebP/GIF 等远端图片载荷规范化为 Windows 图片剪贴板格式（`CF_DIB`、`CF_DIBV5`、PNG 注册格式），保证 Android 分享图片到 Windows 后仍按图片粘贴，而不是降级成文件路径。
 - 这部分是为了补齐“截图直接进入剪贴板但通用库读不到”的场景。
 
 #### Linux
@@ -249,6 +250,7 @@ ClipCascade 的定位是：以剪贴板为中心，做一个可自部署、可�
 ### 文本/图片
 
 - 复制后实时同步。
+- 截图、系统位图、Android 分享图片都归为 `image`，接收端写入图片剪贴板；不会为了兼容性改成文件路径粘贴。
 
 ### 文件
 
@@ -366,6 +368,11 @@ open -a OrbStack
 
 - `应用：准备发送剪贴板更新 类型=file_eager`
 - `剪贴板：已接收并写入文件到临时目录`
+- Windows 端还应出现 `剪贴板：Windows 已写入文件剪贴板`。如果没有，说明接收端没有成功写入 `CF_HDROP`，请更新 Windows desktop 二进制。
+
+### 4) Android 分享图片到 Windows 后不能粘贴
+
+请确认 Windows desktop 已更新到包含图片规范化写入的版本。Android 分享图片仍按 `image` 同步，Windows 端应写入图片剪贴板格式，而不是把图片保存为文件路径。
 
 
 ## 社区
