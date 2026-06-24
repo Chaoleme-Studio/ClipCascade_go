@@ -28,9 +28,16 @@ import (
 	"github.com/clipcascade/desktop/config"
 	"github.com/clipcascade/desktop/transfer"
 	"github.com/clipcascade/desktop/transport"
-	"github.com/clipcascade/desktop/ui"
 	"github.com/grandcat/zeroconf"
 )
+
+type trayController interface {
+	OnConnect(func())
+	OnDisconnect(func())
+	OnQuit(func())
+	Run()
+	SetStatus(string)
+}
 
 // Application 是主要的 desktop client 控制器。
 type Application struct {
@@ -40,13 +47,16 @@ type Application struct {
 	stomp          *transport.StompClient
 	p2p            *transport.P2PClient
 	clip           *clipboard.Manager
-	tray           *ui.Tray
+	tray           trayController
 	transferMgr    *transfer.Manager
+	historyStore   *historyStore
+	state          appState
 	ctx            context.Context
 	cancel         context.CancelFunc
 	encKey         []byte // 从 password 派生的 AES-256-GCM 密钥
 	reconnecting   bool
 	connecting     bool // 防止用户重复点击连接产生并发泄漏
+	started        bool
 	connMu         sync.Mutex
 
 	lastRecvMu   sync.Mutex
@@ -59,13 +69,29 @@ type Application struct {
 
 // New 创建一个新的 Application 实例。
 func New(cfg *config.Config) *Application {
+	return newApplication(cfg, true)
+}
+
+// NewWindowApplication 创建一个不接管 systray 的 Application，供 Fyne 桌面窗口使用。
+func NewWindowApplication(cfg *config.Config) *Application {
+	return newApplication(cfg, false)
+}
+
+func newApplication(cfg *config.Config, withTray bool) *Application {
 	ctx, cancel := context.WithCancel(context.Background())
 	jar, _ := cookiejar.New(nil)
+	store := newHistoryStore()
+	var tray trayController
+	if withTray {
+		tray = newTrayController()
+	}
 
 	app := &Application{
 		cfg:           cfg,
 		clip:          clipboard.NewManager(),
-		tray:          ui.NewTray(),
+		tray:          tray,
+		historyStore:  store,
+		state:         newAppState(store.Load()),
 		ctx:           ctx,
 		cancel:        cancel,
 		deferredFiles: make(map[string]string),
@@ -85,25 +111,22 @@ func New(cfg *config.Config) *Application {
 			return http.ErrUseLastResponse
 		},
 	}
-	app.transferMgr = transfer.NewManager(app.tray.SetStatus, ui.Notify)
-	app.clip.SetNotifier(ui.Notify)
+	app.transferMgr = transfer.NewManager(app.setStatus, notify)
+	app.clip.SetNotifier(notify)
 	return app
 }
 
 // Run 启动 application。在 macOS 上必须从 main goroutine 调用。
 func (a *Application) Run() {
-	// 启动即清理 24 小时前的接收临时文件，避免长期累积。
-	a.clip.CleanupExpiredTempFiles()
-
-	if err := a.clip.Init(); err != nil {
-		slog.Error("clipboard init failed", "error", err)
-		a.tray.SetStatus("Clipboard Error")
+	if err := a.Start(true); err != nil {
+		slog.Error("application start failed", "error", err)
+		a.setStatus("Clipboard Error")
 		return
 	}
-	a.clip.OnCopy(a.onCopy)
-	a.clip.Watch(a.ctx)
 
-	go a.monitorConnection()
+	if a.tray == nil {
+		return
+	}
 
 	// 设置 tray 回调
 	a.tray.OnConnect(func() {
@@ -116,13 +139,36 @@ func (a *Application) Run() {
 		a.shutdown()
 	})
 
-	// 如果配置了凭据，则自动连接
-	if a.cfg.Username != "" && a.cfg.Password != "" {
-		go a.connect()
-	}
-
 	// Run tray (blocks until quit)
 	a.tray.Run()
+}
+
+func (a *Application) Start(autoConnect bool) error {
+	a.connMu.Lock()
+	if a.started {
+		a.connMu.Unlock()
+		return nil
+	}
+	a.started = true
+	a.connMu.Unlock()
+
+	// 启动即清理 24 小时前的接收临时文件，避免长期累积。
+	a.clip.CleanupExpiredTempFiles()
+
+	if err := a.clip.Init(); err != nil {
+		a.setStatus("Clipboard Error")
+		return fmt.Errorf("clipboard init failed: %w", err)
+	}
+	a.clip.OnCopy(a.onCopy)
+	a.clip.Watch(a.ctx)
+
+	go a.monitorConnection()
+
+	// 如果配置了凭据，则自动连接
+	if autoConnect && a.cfg.Username != "" && a.cfg.Password != "" {
+		go a.connect()
+	}
+	return nil
 }
 
 // discoverServer 尝试在局域网中发现所有可用的 ClipCascade 服务器。
@@ -172,6 +218,36 @@ func (a *Application) discoverServer() ([]string, error) {
 	}
 }
 
+func (a *Application) DiscoverServers() ([]string, error) {
+	return a.discoverServer()
+}
+
+func (a *Application) SaveConfig(serverURL, username, password string, e2eeEnabled, p2pEnabled, autoReconnect bool, stunURL string) error {
+	a.cfg.ServerURL = config.NormalizeServerURL(serverURL)
+	a.cfg.Username = strings.TrimSpace(username)
+	a.cfg.Password = password
+	a.cfg.E2EEEnabled = e2eeEnabled
+	a.cfg.P2PEnabled = p2pEnabled
+	a.cfg.AutoReconnect = autoReconnect
+	a.cfg.StunURL = strings.TrimSpace(stunURL)
+	if a.cfg.StunURL == "" {
+		a.cfg.StunURL = constants.DefaultStunURL
+	}
+	return a.cfg.Save()
+}
+
+func (a *Application) Connect() {
+	a.connect()
+}
+
+func (a *Application) Disconnect() {
+	a.disconnect()
+}
+
+func (a *Application) Shutdown() {
+	a.shutdown()
+}
+
 // connect 执行 login → 获取加密密钥 → 启动 WebSocket → 开始剪贴板监控。
 func (a *Application) connect() {
 	a.connMu.Lock()
@@ -189,7 +265,7 @@ func (a *Application) connect() {
 		a.connMu.Unlock()
 	}()
 
-	a.tray.SetStatus("Connecting...")
+	a.setStatus("Connecting...")
 
 	// 确定待尝试的服务器列表
 	var urlsToTry []string
@@ -258,8 +334,8 @@ func (a *Application) connect() {
 
 	if successfulURL == "" {
 		slog.Error("登录完全失败，请检查服务器状态或配置", "错误", lastErr)
-		a.tray.SetStatus("Login Failed")
-		ui.Notify("ClipCascade", "Failed to connect to any server")
+		a.setStatus("Login Failed")
+		notify("ClipCascade", "Failed to connect to any server")
 		return
 	}
 
@@ -274,7 +350,7 @@ func (a *Application) connect() {
 	if a.cfg.E2EEEnabled {
 		if err := a.deriveEncryptionKey(); err != nil {
 			slog.Error("密钥派生失败", "错误", err)
-			a.tray.SetStatus("Key Error")
+			a.setStatus("Key Error")
 			return
 		}
 	}
@@ -285,8 +361,8 @@ func (a *Application) connect() {
 
 	if err := a.stomp.Connect(); err != nil {
 		slog.Error("WebSocket 连接失败", "错误", err)
-		a.tray.SetStatus("WS Failed")
-		ui.Notify("ClipCascade", "WebSocket connection failed")
+		a.setStatus("WS Failed")
+		notify("ClipCascade", "WebSocket connection failed")
 		go a.reconnectLoop()
 		return
 	}
@@ -304,9 +380,12 @@ func (a *Application) connect() {
 		}
 	}
 
-	a.tray.SetStatus("Connected ✓")
-	ui.Notify("ClipCascade", "Connected to server as "+a.cfg.Username)
+	a.setStatus("Connected ✓")
+	notify("ClipCascade", "Connected to server as "+a.cfg.Username)
 	slog.Info("应用：已连接并开始监控剪贴板")
+	go func() {
+		_, _ = a.RefreshDeviceCounts()
+	}()
 }
 
 // login 执行基于 HTTP 表单的 login 并返回 session cookies。
@@ -401,6 +480,7 @@ func (a *Application) onCopy(payload string, payloadType string, filename string
 		slog.Error("发送失败", "错误", err)
 		return
 	}
+	a.appendHistory(payload, payloadType, filename, "sent")
 }
 
 func (a *Application) sendEncodedBody(body string) error {
@@ -465,6 +545,7 @@ func (a *Application) onReceive(body string) {
 	// Paste to local clipboard
 	slog.Info("应用：收到剪贴板更新", "类型", clipData.Type, "大小", sizefmt.HumanSizeFromPayload(clipData.Type, clipData.Payload))
 	if clipData.Type == constants.TypeFileOffer {
+		a.appendHistory(clipData.Payload, clipData.Type, clipData.FileName, "received")
 		go a.handleFileOffer(clipData)
 		return
 	}
@@ -473,6 +554,7 @@ func (a *Application) onReceive(body string) {
 		return
 	}
 	a.clip.Paste(clipData.Payload, clipData.Type, clipData.FileName)
+	a.appendHistory(clipData.Payload, clipData.Type, clipData.FileName, "received")
 	slog.Debug("应用：已接收并粘贴", "类型", clipData.Type, "大小", len(clipData.Payload))
 }
 
@@ -589,12 +671,13 @@ func (a *Application) registerDeferredFile(path string, fileSize int64) {
 	})
 	if err != nil {
 		slog.Error("大文件登记失败", "path", path, "error", err)
-		ui.Notify("ClipCascade", fmt.Sprintf("大文件登记失败: %s", filepath.Base(path)))
+		notify("ClipCascade", fmt.Sprintf("大文件登记失败: %s", filepath.Base(path)))
 		return
 	}
 	a.rememberDeferredFile(record.DeferredID, path)
-	a.tray.SetStatus("Deferred File Ready")
-	ui.Notify("ClipCascade", fmt.Sprintf("大文件已登记到 Web: %s", record.FileName))
+	a.setStatus("Deferred File Ready")
+	a.appendHistory(path, constants.TypeFileStub, record.FileName, "sent")
+	notify("ClipCascade", fmt.Sprintf("大文件已登记到 Web: %s", record.FileName))
 	slog.Info("应用：大文件已登记到 Web 下载列表", "deferred_id", record.DeferredID, "文件名", record.FileName, "大小", fileSize)
 }
 
@@ -692,7 +775,7 @@ func (a *Application) handleFileRequest(clipData *protocol.ClipboardData) {
 		return
 	}
 	a.transferMgr.MarkCompleted(transferID)
-	ui.Notify("ClipCascade", fmt.Sprintf("网页下载已准备: %s", result.FileName))
+	notify("ClipCascade", fmt.Sprintf("网页下载已准备: %s", result.FileName))
 }
 
 func sanitizeOfferName(name string) string {
@@ -766,7 +849,7 @@ func (a *Application) reconnectLoop() {
 	}
 	defer a.endReconnect()
 
-	a.tray.SetStatus("Reconnecting...")
+	a.setStatus("Reconnecting...")
 
 	delay := time.Duration(a.cfg.ReconnectDelay) * time.Second
 	if delay == 0 {
@@ -825,8 +908,8 @@ func (a *Application) isReconnecting() bool {
 // disconnect disconnects from the server.
 func (a *Application) disconnect() {
 	a.closeTransports()
-	a.tray.SetStatus("Disconnected")
-	ui.Notify("ClipCascade", "Disconnected from server")
+	a.setStatus("Disconnected")
+	notify("ClipCascade", "Disconnected from server")
 	slog.Info("应用：已断开连接")
 }
 

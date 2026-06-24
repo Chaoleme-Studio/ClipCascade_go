@@ -190,10 +190,12 @@ ClipCascade 的定位是：以剪贴板为中心，做一个可自部署、可�
 - server 全平台
 - desktop 全平台
 - desktop-ui（当前平台）
-- desktop-ui-cross（依赖 Docker）
+- desktop-ui-cross（macOS UI 本机双架构；Windows/Linux UI 依赖 Docker）
 
 说明：
 - Linux desktop 交叉编译依赖 Docker daemon（未启动会被跳过并告警）。
+- 在 macOS 主机上，即使 Docker 未启动，`desktop-ui-cross` 也会尝试产出 `clipcascade-desktop-ui-darwin-amd64` 和 `clipcascade-desktop-ui-darwin-arm64`。
+- Windows/Linux 的 Fyne UI 交叉编译依赖 Docker + `fyne-cross`，Docker 未启动时会跳过并告警。
 - iOS 打包需要 Apple 开发者证书（无证书会告警）。
 
 ### 2) 启动服务端
@@ -311,6 +313,7 @@ export ANDROID_NDK_HOME="/opt/homebrew/Caskroom/android-ndk/<version>/AndroidNDK
 ./build-scripts/build.sh desktop
 ./build-scripts/build.sh cross
 ./build-scripts/build.sh desktop-ui
+./build-scripts/build.sh desktop-ui-cross
 ./build-scripts/build.sh mobile-android-native
 ```
 

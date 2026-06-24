@@ -90,6 +90,20 @@ func (m *Manager) MarkFailed(id string, err error) {
 	}
 }
 
+func (m *Manager) Snapshot() []Task {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	out := make([]Task, 0, len(m.tasks))
+	for _, task := range m.tasks {
+		if task == nil {
+			continue
+		}
+		out = append(out, *task)
+	}
+	return out
+}
+
 func (m *Manager) writeStatusLocked(id string) {
 	if m.statusWriter == nil {
 		return

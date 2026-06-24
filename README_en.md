@@ -189,10 +189,12 @@ Artifacts: `build/clipcascade-web-{os}-{arch}`
 - server (all platforms)
 - desktop (all platforms)
 - desktop-ui (current platform)
-- desktop-ui-cross (requires Docker)
+- desktop-ui-cross (macOS UI uses native dual-arch builds; Windows/Linux UI requires Docker)
 
 Notes:
 - Linux desktop cross-compilation requires Docker daemon (will be skipped and warned if not started).
+- On macOS hosts, `desktop-ui-cross` still tries to produce `clipcascade-desktop-ui-darwin-amd64` and `clipcascade-desktop-ui-darwin-arm64` even when Docker is not running.
+- Windows/Linux Fyne UI cross-compilation requires Docker + `fyne-cross`; it is skipped with a warning when Docker is not running.
 - iOS packaging requires Apple developer certificate (warning issued if missing).
 
 ### 2) Start Server
@@ -310,6 +312,7 @@ Notes:
 ./build-scripts/build.sh desktop
 ./build-scripts/build.sh cross
 ./build-scripts/build.sh desktop-ui
+./build-scripts/build.sh desktop-ui-cross
 ./build-scripts/build.sh mobile-android-native
 ```
 

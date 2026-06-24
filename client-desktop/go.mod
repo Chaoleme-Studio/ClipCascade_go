@@ -16,6 +16,7 @@ require (
 )
 
 require (
+	fyne.io/fyne/v2 v2.7.3 // indirect
 	git.sr.ht/~jackmordaunt/go-toast v1.1.2 // indirect
 	github.com/cenkalti/backoff v2.2.1+incompatible // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect

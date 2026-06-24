@@ -9,6 +9,27 @@ import (
 	"strings"
 )
 
+func ListDeferredFiles(client *http.Client, serverURL string) ([]DeferredFileRecord, error) {
+	req, err := http.NewRequest(http.MethodGet, strings.TrimRight(serverURL, "/")+"/api/files/deferred", nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		data, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("list deferred files failed: %s", string(data))
+	}
+	var records []DeferredFileRecord
+	if err := json.NewDecoder(resp.Body).Decode(&records); err != nil {
+		return nil, err
+	}
+	return records, nil
+}
+
 func RegisterDeferredFile(client *http.Client, serverURL string, reqBody *DeferredRegisterRequest) (*DeferredFileRecord, error) {
 	if reqBody == nil {
 		return nil, fmt.Errorf("register request is nil")
@@ -36,6 +57,36 @@ func RegisterDeferredFile(client *http.Client, serverURL string, reqBody *Deferr
 		return nil, err
 	}
 	return &record, nil
+}
+
+func RequestDeferredFile(client *http.Client, serverURL string, deferredID string) (*DeferredFileRecord, int, error) {
+	url := strings.TrimRight(serverURL, "/") + "/api/files/deferred/" + strings.TrimSpace(deferredID) + "/request"
+	req, err := http.NewRequest(http.MethodPost, url, nil)
+	if err != nil {
+		return nil, 0, err
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		data, _ := io.ReadAll(resp.Body)
+		return nil, 0, fmt.Errorf("request deferred file failed: %s", string(data))
+	}
+	var body struct {
+		Item          DeferredFileRecord `json:"item"`
+		ActiveClients int                `json:"active_clients"`
+		DeferredFileRecord
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		return nil, 0, err
+	}
+	record := body.Item
+	if record.DeferredID == "" {
+		record = body.DeferredFileRecord
+	}
+	return &record, body.ActiveClients, nil
 }
 
 func MarkDeferredFileReady(client *http.Client, serverURL string, deferredID string, relayID string) (*DeferredFileRecord, error) {
