@@ -1,0 +1,66 @@
+{
+  // publisher 和 name 共同组成插件唯一 ID，例如 your-publisher.example-wasi-plugin。
+  "publisher": "your-publisher",
+  "name": "example-wasi-plugin",
+  // displayName 用于网页插件页展示。
+  "displayName": "Example WASI Plugin",
+  "description": "A template ClipCascade WASI plugin.",
+  "version": "0.1.0",
+  "license": "MIT",
+  // categories 和 keywords 用于搜索、筛选和后续插件市场展示。
+  "categories": [
+    "Automation"
+  ],
+  "keywords": [
+    "clipcascade",
+    "wasi",
+    "template"
+  ],
+  // engines 声明运行时兼容范围。
+  "engines": {
+    "clipcascade": ">=2.0.0",
+    "wasi": "wasip1"
+  },
+  // activationEvents 只做能力声明，当前不自动注册规则。
+  "activationEvents": [
+    "onClipboard:text",
+    "onCapability:content_redact"
+  ],
+  // repository 可选；私有插件可以删除这一块。
+  "repository": {
+    "type": "git",
+    "url": "https://example.com/your/plugin.git"
+  },
+  "author": {
+    "name": "Your Name"
+  },
+  // contributes 预留插件贡献点，当前只展示和记录，不绕过服务端白名单。
+  "contributes": {
+    "automation": {
+      "capabilities": [
+        "content_redact"
+      ],
+      "rules": [],
+      "commands": []
+    }
+  },
+  // clipcascade 块是本项目专属字段，所有执行入口和资源限制都必须放在这里。
+  "clipcascade": {
+    "schemaVersion": 1,
+    "enabled": true,
+    // 第一阶段只支持 WASI，运行时按需加载，降低常驻内存占用。
+    "entrypoint": {
+      "type": "wasi",
+      "path": "./plugin.wasm"
+    },
+    // 模板默认演示内容脱敏占位能力。
+    "capabilities": [
+      "content_redact"
+    ],
+    // runtime 块控制单次插件调用的超时和输出上限。
+    "runtime": {
+      "timeout_seconds": 5,
+      "max_output_bytes": 65536
+    }
+  }
+}

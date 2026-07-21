@@ -1,6 +1,7 @@
 package transfer
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -22,23 +23,31 @@ func UploadFile(client *http.Client, serverURL string, path string, onProgress f
 		return nil, err
 	}
 
+	bodyPrefix, bodySuffix, contentType, err := multipartEnvelope(filepath.Base(path))
+	if err != nil {
+		_ = file.Close()
+		return nil, err
+	}
+
 	pr, pw := io.Pipe()
-	writer := multipart.NewWriter(pw)
 	errCh := make(chan error, 1)
 	go func() {
 		defer close(errCh)
 		defer file.Close()
 		defer pw.Close()
-		defer writer.Close()
 
-		part, err := writer.CreateFormFile("file", filepath.Base(path))
-		if err != nil {
+		if _, err := pw.Write(bodyPrefix); err != nil {
 			errCh <- err
 			_ = pw.CloseWithError(err)
 			return
 		}
 		reader := &progressReader{reader: file, total: info.Size(), onProgress: onProgress}
-		if _, err := io.Copy(part, reader); err != nil {
+		if _, err := io.Copy(pw, reader); err != nil {
+			errCh <- err
+			_ = pw.CloseWithError(err)
+			return
+		}
+		if _, err := pw.Write(bodySuffix); err != nil {
 			errCh <- err
 			_ = pw.CloseWithError(err)
 			return
@@ -50,7 +59,8 @@ func UploadFile(client *http.Client, serverURL string, path string, onProgress f
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("Content-Type", writer.FormDataContentType())
+	req.ContentLength = int64(len(bodyPrefix)) + info.Size() + int64(len(bodySuffix))
+	req.Header.Set("Content-Type", contentType)
 	req.Header.Set("X-File-Size", strconv.FormatInt(info.Size(), 10))
 	resp, err := client.Do(req)
 	if err != nil {
@@ -69,6 +79,29 @@ func UploadFile(client *http.Client, serverURL string, path string, onProgress f
 		return nil, err
 	}
 	return &result, nil
+}
+
+func multipartEnvelope(fileName string) ([]byte, []byte, string, error) {
+	var header bytes.Buffer
+	writer := multipart.NewWriter(&header)
+	if _, err := writer.CreateFormFile("file", fileName); err != nil {
+		return nil, nil, "", err
+	}
+	contentType := writer.FormDataContentType()
+	if err := writer.Close(); err != nil {
+		return nil, nil, "", err
+	}
+
+	full := header.Bytes()
+	boundaryMarker := []byte("\r\n--" + writer.Boundary() + "--\r\n")
+	idx := bytes.LastIndex(full, boundaryMarker)
+	if idx < 0 {
+		return nil, nil, "", fmt.Errorf("failed to build multipart envelope")
+	}
+
+	prefix := append([]byte(nil), full[:idx]...)
+	suffix := append([]byte(nil), full[idx:]...)
+	return prefix, suffix, contentType, nil
 }
 
 type progressReader struct {

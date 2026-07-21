@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"context"
 	"encoding/json"
 	"log/slog"
 	"sync"
@@ -8,8 +9,10 @@ import (
 
 	"github.com/gofiber/contrib/websocket"
 
+	"github.com/clipcascade/pkg/constants"
 	"github.com/clipcascade/pkg/protocol"
 	"github.com/clipcascade/pkg/sizefmt"
+	"github.com/clipcascade/server/automation"
 )
 
 // WSHub 管理所有活动的 WebSocket 连接并在 users 之间路由 STOMP 消息。
@@ -27,6 +30,7 @@ type WSHub struct {
 	totalConnections  atomic.Int64 // 累计总量
 	totalInboundMsgs  atomic.Int64
 	totalOutboundMsgs atomic.Int64
+	automation        *automation.Engine
 }
 
 // NewWSHub 创建一个新的 WebSocket 连接 hub。
@@ -35,6 +39,10 @@ func NewWSHub() *WSHub {
 		connections: make(map[string]map[*websocket.Conn]bool),
 		writeLocks:  make(map[*websocket.Conn]*sync.Mutex),
 	}
+}
+
+func (h *WSHub) SetAutomationEngine(engine *automation.Engine) {
+	h.automation = engine
 }
 
 // Register 为给定的 username 添加一个连接。
@@ -224,6 +232,18 @@ func (h *WSHub) HandleWebSocket(c *websocket.Conn) {
 				slog.Debug("WS：E2EE 已开启，剪贴板类型和真实内容大小需在客户端或文件上传日志中查看")
 			}
 
+			if h.automation != nil {
+				event := automation.NewClipboardEvent(username, c.RemoteAddr().String(), clipData, msgType == "e2ee_envelope", frame.Body)
+				decision := h.automation.Evaluate(context.Background(), event)
+				for _, notice := range decision.Notices {
+					h.sendNotice(c, subscriptionID, frame.Get("destination"), notice)
+				}
+				if decision.Outcome == automation.OutcomeBlock {
+					slog.Info("WS：自动化规则阻断剪贴板广播", "用户名", username, "event_id", event.EventID)
+					continue
+				}
+			}
+
 			// 包装在 MESSAGE 帧中进行交付
 			msgFrame := protocol.MessageFrame(
 				frame.Get("destination"),
@@ -240,6 +260,40 @@ func (h *WSHub) HandleWebSocket(c *websocket.Conn) {
 			slog.Debug("WS：未知命令", "命令", frame.Command)
 		}
 	}
+}
+
+func (h *WSHub) sendNotice(conn *websocket.Conn, subscriptionID string, destination string, notice automation.SystemNotice) {
+	if conn == nil {
+		return
+	}
+	payload, err := json.Marshal(notice)
+	if err != nil {
+		return
+	}
+	clipData := protocol.ClipboardData{
+		Type:    constants.TypeSystemNotice,
+		Payload: string(payload),
+	}
+	body, err := clipData.Encode()
+	if err != nil {
+		return
+	}
+	msgFrame := protocol.MessageFrame(destination, subscriptionID, "", string(body))
+
+	h.mu.RLock()
+	lock := h.writeLocks[conn]
+	h.mu.RUnlock()
+	if lock == nil {
+		return
+	}
+	lock.Lock()
+	err = conn.WriteMessage(websocket.TextMessage, msgFrame.Encode())
+	lock.Unlock()
+	if err != nil {
+		slog.Warn("WS：自动化通知写入错误", "错误", err)
+		return
+	}
+	h.totalOutboundMsgs.Add(1)
 }
 
 // Stats 返回当前 hub 统计信息。

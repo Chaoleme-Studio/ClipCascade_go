@@ -26,6 +26,7 @@ ClipCascade is positioned as a clipboard-centric, self-deployable, extensible, a
 - **File Sync**: Supports a tiered strategy of direct transfer for small files and placeholder notifications for large files.
 - **Transfer Channels**: Supports STOMP (server-relayed) + P2P (peer-to-peer) dual channels.
 - **Security**: Supports E2EE (End-to-End Encryption) toggle.
+- **Server Automation**: Supports rule-triggered audit/tasks and WASI plugin placeholders.
 - **Auto-Discovery**: Automatic discovery of service addresses via mDNS in local networks.
 - **Multi-User Management**: Administrators can add users directly from the Web page.
 - **Android Native Persistence**: Foreground services + accessibility triggers + permission guidance.
@@ -52,6 +53,7 @@ This section only describes the technical solutions already implemented in the c
 - Database storage uses GORM + SQLite.
 - Local network auto-discovery uses mDNS / Zeroconf.
 - Supports user management directly via administrator Web page.
+- Automation is disabled by default. When enabled, it can match clipboard events and call Go actions, allowlisted local commands, or WASI plugins.
 
 ### Desktop Transfer Layer
 
@@ -246,6 +248,89 @@ Add users (no manual API calls needed):
 2. Click `+ Add User`.
 3. Enter username and password to create.
 
+## Server Automation and Plugins
+
+Automation is disabled by default and does not affect the existing sync path. With E2EE disabled, the server can inspect plaintext text, URLs, and image metadata. With E2EE enabled, the server only sees envelope metadata.
+
+Plugins use a directory package format. Official lightweight plugins use WASI first, so the same `.wasm` file can run on Linux, macOS, and Windows. Heavy local capabilities should continue to use the `run_command` local command allowlist.
+
+```text
+plugins/
+  content-redact/
+    clipcascade.plugin.jsonc
+    README.md
+    content-redact.wasm
+```
+
+`clipcascade.plugin.jsonc` example:
+
+```jsonc
+{
+  // publisher 和 name 共同组成插件唯一 ID: example.content-redact
+  "publisher": "example",
+  "name": "content-redact",
+  // displayName 用于网页插件页展示。
+  "displayName": "Content Redaction",
+  "description": "Detects and redacts sensitive clipboard text.",
+  "version": "0.1.0",
+  "license": "MIT",
+  // categories 和 keywords 用于搜索、筛选和后续插件市场展示。
+  "categories": ["Automation", "Security"],
+  "keywords": ["clipboard", "redact", "privacy"],
+  // engines 声明运行时兼容范围。
+  "engines": {
+    "clipcascade": ">=2.0.0",
+    "wasi": "wasip1"
+  },
+  // activationEvents 只做能力声明，当前不自动注册规则。
+  "activationEvents": [
+    "onClipboard:text",
+    "onCapability:content_redact"
+  ],
+  // repository 可选；私有插件可以删除这一块。
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/example/content-redact"
+  },
+  "author": {
+    "name": "Example"
+  },
+  // contributes 预留插件贡献点，当前只展示和记录。
+  "contributes": {
+    "automation": {
+      "capabilities": ["content_redact"],
+      "rules": [],
+      "commands": []
+    }
+  },
+  // clipcascade 块是本项目专属字段，所有执行入口和资源限制都必须放在这里。
+  "clipcascade": {
+    "schemaVersion": 1,
+    "enabled": true,
+    // 第一阶段只支持 WASI，运行时按需加载。
+    "entrypoint": { "type": "wasi", "path": "./content-redact.wasm" },
+    "capabilities": ["content_redact"],
+    // runtime 块控制单次插件调用的超时和输出上限。
+    "runtime": { "timeout_seconds": 30, "max_output_bytes": 65536 }
+  }
+}
+```
+
+Notes:
+
+- `README.md` is required and is used by the Web plugin page.
+- Plugin IDs follow the VS Code style: `publisher.name`. Top-level `id` is no longer allowed in manifest files.
+- `repository` is optional; private plugins do not need a repository URL.
+- The `clipcascade` block stores platform-specific runtime fields. Top-level `entrypoint`, `capabilities`, `runtime`, and `enabled` are rejected.
+- `plugins/clipcascade.plugin.schema.jsonc` provides a manifest JSONC Schema for editor validation.
+- The first official plugin runtime supports WASI only, using stdin/stdout machine payloads.
+- URL download, sensitive image detection, OCR, content redaction, and result relay are placeholders for now.
+- Current official plugins include `url-platform-candidate` and `secret-detector`; `url-platform-candidate` currently prioritizes Douyin and Kuaishou platform URLs and can be expanded to more platforms later.
+- Official plugin behavior, trigger rules, and execution boundaries are documented in [ClipCascade Official Plugins](_docs/official-plugins.md).
+- Administrators can open `/plugins` from the dashboard footer.
+- Build all official plugins with `./build-scripts/build.sh plugins`; output goes to `build/plugins/`.
+- Release packages should place `clipcascade-server` and `plugins/` at the same level. The default `CC_AUTOMATION_PLUGINS_DIR=./plugins` is resolved relative to the server binary directory.
+
 ## Sync Strategy (Current Design)
 
 ### Text/Images
@@ -329,17 +414,80 @@ Notes:
 CLIPCASCADE_WINDOWS_GUI=1 ./build-scripts/build.sh cross
 ```
 
-## Critical Environment Variables (Server)
+## Environment Variables
 
-```bash
-CC_PORT=8080
-CC_SIGNUP_ENABLED=false
-CC_P2P_ENABLED=false
-CC_P2P_STUN_URL=stun:stun.l.google.com:19302
-CC_MAX_MESSAGE_SIZE_IN_MiB=20
-CC_ALLOWED_ORIGINS=*
-CC_DATABASE_PATH=./database/clipcascade.db
-```
+### Server Runtime
+
+Relative paths are resolved from the server binary directory. The recommended release layout is to place `database/`, `uploads/`, and `plugins/` beside `clipcascade-server`.
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `CC_PORT` | `8080` | Server listen port |
+| `CC_MAX_MESSAGE_SIZE_IN_MiB` | `20` | WebSocket single-message limit in MiB |
+| `CC_MAX_MESSAGE_SIZE_IN_BYTES` | `0` | WebSocket single-message limit in bytes; takes priority when greater than 0 |
+| `CC_P2P_ENABLED` | `false` | Enables P2P signaling and P2P sync mode |
+| `CC_P2P_STUN_URL` | `stun:stun.l.google.com:19302` | WebRTC STUN server |
+| `CC_ALLOWED_ORIGINS` | `*` | CORS allowed origins, comma-separated |
+| `CC_SIGNUP_ENABLED` | `false` | Enables public signup |
+| `CC_MAX_USER_ACCOUNTS` | `-1` | Maximum user count; `-1` means unlimited |
+| `CC_ACCOUNT_PURGE_TIMEOUT_SECONDS` | `-1` | Account purge timeout; `-1` disables it |
+| `CC_SESSION_TIMEOUT` | `525960` | Login session lifetime in minutes |
+| `CC_MAX_UNIQUE_IP_ATTEMPTS` | `15` | Brute-force protection unique IP threshold |
+| `CC_MAX_ATTEMPTS_PER_IP` | `30` | Brute-force protection per-IP threshold |
+| `CC_LOCK_TIMEOUT_SECONDS` | `60` | Initial lock duration after protection triggers |
+| `CC_LOCK_TIMEOUT_SCALING_FACTOR` | `2` | Lock duration multiplier after repeated triggers |
+| `CC_BFA_CACHE_ENABLED` | `true` | Enables brute-force protection cache |
+| `CC_DATABASE_PATH` | `./database/clipcascade.db` | SQLite database path |
+| `CC_FILE_RELAY_ENABLED` | `true` | Enables HTTP file relay |
+| `CC_FILE_RELAY_DIR` | `./uploads` | HTTP file relay storage directory |
+| `CC_FILE_RELAY_MAX_BYTES` | `2147483648` | Maximum relay file size, 2 GiB by default |
+| `CC_FILE_RELAY_TTL_SECONDS` | `86400` | Relay file retention time |
+| `CC_EXTERNAL_BROKER_ENABLED` | `false` | Enables external STOMP broker |
+| `CC_BROKER_HOST` | `localhost` | External broker host |
+| `CC_BROKER_PORT` | `61613` | External broker port |
+| `CC_AUTOMATION_ENABLED` | `false` | Enables server automation engine |
+| `CC_AUTOMATION_MODE` | `observe` | Automation mode: `observe` only records, `enforce` can block |
+| `CC_AUTOMATION_RULES_PATH` | empty | Automation rule JSONC file path |
+| `CC_AUTOMATION_COMMANDS_PATH` | empty | Local command whitelist JSONC file path |
+| `CC_AUTOMATION_PLUGINS_DIR` | `./plugins` | Plugin directory; relative paths resolve from the server binary directory |
+| `CC_AUTOMATION_COMMAND_TIMEOUT_SECONDS` | `30` | Local command timeout per run |
+| `CC_AUTOMATION_COMMAND_MAX_OUTPUT_BYTES` | `65536` | Maximum stdout bytes read from local commands |
+| `CC_AUTOMATION_PLUGIN_TIMEOUT_SECONDS` | `30` | WASI plugin timeout per run |
+| `CC_AUTOMATION_PLUGIN_MAX_OUTPUT_BYTES` | `65536` | Maximum stdout bytes read from WASI plugins |
+| `CC_AUTOMATION_TRUSTED_COPY_ENABLED` | `false` | Enables `/api/automation/copy` trusted-copy endpoint |
+| `CC_AUTOMATION_COPY_MAX_BYTES` | `262144` | Request body size limit for trusted-copy endpoint |
+
+### Web Clipboard Runtime
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `WEBCLIP_PORT` | `8090` | Web clipboard port; auto-increments when occupied |
+| `WEBCLIP_DB_PATH` | binary dir `data.db` | Web clipboard database path |
+| `WEBCLIP_UPLOAD_DIR` | binary dir `uploads/` | Web clipboard upload directory |
+
+### Desktop Runtime
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `CLIPCASCADE_PASSWORD` | empty | Desktop password override; skips reading password from local config |
+| `XDG_CONFIG_HOME` | system default | Linux config directory standard variable |
+| `APPDATA` | system default | Windows config directory standard variable |
+| `WAYLAND_DISPLAY` | system default | Used on Linux to prefer Wayland clipboard tools when available |
+
+### Build Scripts
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `VERSION` | `git describe --tags --always` or `dev` | Injected binary version |
+| `CLIPCASCADE_WINDOWS_GUI` | `0` | `1` hides the console window for Windows desktop builds |
+| `ANDROID_HOME` | auto-detected Homebrew Android SDK | Android SDK path used by native Android builds |
+| `ANDROID_SDK_ROOT` | follows `ANDROID_HOME` | Standard Android SDK path variable; filled from `ANDROID_HOME` when empty |
+| `ANDROID_NDK_HOME` | auto-detected | Android NDK path used by native Android builds |
+| `CC_ANDROID_API` | `26` | Android API level for native Android builds |
+| `GRADLE_USER_HOME` | root `.gradle-user-home/` | Android Gradle cache directory; defaults to a repo-local directory |
+| `JAVA_HOME` | system default | JDK path used by Gradle Wrapper; JDK 17 is recommended |
+| `SDKROOT` | auto-detected Xcode SDK | macOS CGO SDK; invalid values are cleared by the build script |
+| `PATH` | system default | Must contain build tools such as `go`, `gomobile`, `fyne`, `fyne-cross`, and `docker` |
 
 ## FAQ
 

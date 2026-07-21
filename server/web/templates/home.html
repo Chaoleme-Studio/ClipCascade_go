@@ -5,6 +5,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>ClipCascade - Home</title>
+    <link rel="stylesheet" href="/assets/style.css">
     <style>
         * {
             margin: 0;
@@ -308,6 +309,11 @@
             {{if .is_admin}}<a href="/advance" class="btn">⚙️ Admin</a>{{end}}
             <a href="/logout" class="btn btn-danger">🚪 Logout</a>
         </div>
+        <div class="footer-links">
+            ClipCascade
+            {{if .is_admin}}<a href="/plugins">Automation Plugins</a>{{end}}
+            <a href="/logout">Logout</a>
+        </div>
     </div>
 
     <script>
@@ -410,7 +416,7 @@
             }
         }
 
-        function scheduleDeferredPolling(delay = 2000) {
+        function scheduleDeferredPolling(delay = 1000) {
             if (document.hidden) {
                 clearDeferredPolling();
                 return;

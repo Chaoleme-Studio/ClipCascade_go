@@ -1,0 +1,316 @@
+{
+  // 本文件使用 JSONC，方便给插件作者保留中文注释。
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://clipcascade.dev/schemas/clipcascade.plugin.schema.jsonc",
+  "title": "ClipCascade 插件清单",
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["publisher", "name", "description", "version", "engines", "clipcascade"],
+  "properties": {
+    // publisher 和 name 共同组成规范 ID: publisher.name。
+    "publisher": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9-_.]*$",
+      "description": "插件发布者标识，必须小写且不能包含空格。"
+    },
+    "name": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9-_.]*$",
+      "description": "插件机器名，必须小写且不能包含空格。"
+    },
+    "displayName": {
+      "type": "string",
+      "description": "插件展示名，用于 Web 插件页。"
+    },
+    "description": {
+      "type": "string",
+      "description": "插件简介。"
+    },
+    "version": {
+      "type": "string",
+      "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+([-+][0-9A-Za-z.-]+)?$",
+      "description": "插件版本，要求兼容 SemVer。"
+    },
+    "license": {
+      "type": "string",
+      "description": "插件许可证。"
+    },
+    "homepage": {
+      "type": "string",
+      "description": "插件主页。"
+    },
+    "icon": {
+      "type": "string",
+      "description": "插件图标路径。"
+    },
+    "markdown": {
+      "type": "string",
+      "description": "README 渲染模式。"
+    },
+    "preview": {
+      "type": "boolean",
+      "description": "是否为预览版本。"
+    },
+    "categories": {
+      "type": "array",
+      "items": { "type": "string" },
+      "uniqueItems": true,
+      "description": "插件分类，用于搜索和展示。"
+    },
+    "keywords": {
+      "type": "array",
+      "items": { "type": "string" },
+      "uniqueItems": true,
+      "description": "插件关键词，用于搜索和展示。"
+    },
+    "activationEvents": {
+      "type": "array",
+      "items": { "type": "string" },
+      "uniqueItems": true,
+      "description": "能力声明，当前只展示和记录，不自动注册规则。"
+    },
+    "extensionDependencies": {
+      "type": "array",
+      "items": { "type": "string" },
+      "uniqueItems": true,
+      "description": "预留扩展依赖声明。"
+    },
+    "extensionPack": {
+      "type": "array",
+      "items": { "type": "string" },
+      "uniqueItems": true,
+      "description": "预留扩展合集声明。"
+    },
+    "extensionKind": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "enum": ["workspace", "web", "ui"]
+      },
+      "uniqueItems": true,
+      "description": "插件运行位置声明。"
+    },
+    "badges": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/badge" },
+      "description": "插件徽章。"
+    },
+    "galleryBanner": {
+      "$ref": "#/$defs/galleryBanner"
+    },
+    "sponsor": {
+      "$ref": "#/$defs/sponsor"
+    },
+    "bugs": {
+      "$ref": "#/$defs/bugs"
+    },
+    "repository": {
+      "oneOf": [
+        { "type": "string" },
+        { "$ref": "#/$defs/repository" }
+      ],
+      "description": "插件仓库，可选。"
+    },
+    "author": {
+      "oneOf": [
+        { "type": "string" },
+        { "$ref": "#/$defs/author" }
+      ],
+      "description": "插件作者。"
+    },
+    "engines": {
+      "$ref": "#/$defs/engines"
+    },
+    "scripts": {
+      "type": "object",
+      "additionalProperties": { "type": "string" },
+      "description": "预留脚本声明，服务端不会直接执行。"
+    },
+    "metadata": {
+      "type": "object",
+      "description": "插件自定义元数据。"
+    },
+    "main": {
+      "type": "string",
+      "description": "预留元数据字段，ClipCascade 不执行该字段。"
+    },
+    "browser": {
+      "type": "string",
+      "description": "预留元数据字段，ClipCascade 不执行该字段。"
+    },
+    "contributes": {
+      "$ref": "#/$defs/contributes"
+    },
+    "clipcascade": {
+      "$ref": "#/$defs/clipcascade"
+    }
+  },
+  "$defs": {
+    "repository": {
+      "type": "object",
+      "properties": {
+        "type": { "type": "string" },
+        "url": { "type": "string" },
+        "directory": { "type": "string" }
+      },
+      "required": ["url"],
+      "additionalProperties": true
+    },
+    "author": {
+      "type": "object",
+      "properties": {
+        "name": { "type": "string" },
+        "email": { "type": "string" },
+        "url": { "type": "string" }
+      },
+      "required": ["name"],
+      "additionalProperties": true
+    },
+    "bugs": {
+      "type": "object",
+      "properties": {
+        "url": { "type": "string" },
+        "email": { "type": "string" }
+      },
+      "additionalProperties": true
+    },
+    "sponsor": {
+      "type": "object",
+      "properties": {
+        "url": { "type": "string" }
+      },
+      "required": ["url"],
+      "additionalProperties": true
+    },
+    "badge": {
+      "type": "object",
+      "properties": {
+        "url": { "type": "string" },
+        "href": { "type": "string" },
+        "description": { "type": "string" }
+      },
+      "required": ["url", "href", "description"],
+      "additionalProperties": true
+    },
+    "galleryBanner": {
+      "type": "object",
+      "properties": {
+        "color": { "type": "string" },
+        "theme": {
+          "type": "string",
+          "enum": ["dark", "light"]
+        }
+      },
+      "additionalProperties": true
+    },
+    "engines": {
+      "type": "object",
+      "properties": {
+        "clipcascade": {
+          "type": "string",
+          "description": "支持的 ClipCascade 版本范围。"
+        },
+        "wasi": {
+          "type": "string",
+          "description": "支持的 WASI 目标，例如 wasip1。"
+        },
+        "vscode": {
+          "type": "string",
+          "description": "预留 VS Code 兼容元数据。"
+        }
+      },
+      "required": ["clipcascade"],
+      "additionalProperties": true
+    },
+    "contributes": {
+      "type": "object",
+      "properties": {
+        "automation": {
+          "type": "object",
+          "properties": {
+            "capabilities": { "$ref": "#/$defs/capabilities" },
+            "rules": {
+              "type": "array",
+              "items": { "type": "object" }
+            },
+            "commands": {
+              "type": "array",
+              "items": { "type": "object" }
+            }
+          },
+          "additionalProperties": true
+        }
+      },
+      "additionalProperties": true
+    },
+    "clipcascade": {
+      "type": "object",
+      "required": ["schemaVersion", "entrypoint", "capabilities"],
+      "properties": {
+        "schemaVersion": {
+          "type": "integer",
+          "const": 1
+        },
+        "enabled": {
+          "type": "boolean",
+          "default": true
+        },
+        "entrypoint": {
+          "$ref": "#/$defs/entrypoint"
+        },
+        "capabilities": {
+          "$ref": "#/$defs/capabilities"
+        },
+        "runtime": {
+          "$ref": "#/$defs/runtime"
+        }
+      },
+      "additionalProperties": true
+    },
+    "entrypoint": {
+      "type": "object",
+      "required": ["type", "path"],
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": ["wasi"]
+        },
+        "path": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "capabilities": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "string",
+        "enum": [
+          "url_download_candidate",
+          "image_sensitive_scan",
+          "ocr_scan",
+          "content_redact",
+          "secret_detect",
+          "result_to_clipboard",
+          "result_to_file_relay"
+        ]
+      },
+      "uniqueItems": true
+    },
+    "runtime": {
+      "type": "object",
+      "properties": {
+        "timeout_seconds": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "max_output_bytes": {
+          "type": "integer",
+          "minimum": 1024
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

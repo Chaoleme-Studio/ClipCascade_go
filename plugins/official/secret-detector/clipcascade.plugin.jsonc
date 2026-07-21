@@ -1,0 +1,72 @@
+{
+  // publisher 和 name 共同组成插件唯一 ID: clipcascade.secret-detector
+  "publisher": "clipcascade",
+  "name": "secret-detector",
+  // displayName 用于网页插件页展示。
+  "displayName": "Secret Detector",
+  "description": "Detects common secret and credential candidates in clipboard text previews.",
+  "version": "0.1.0",
+  "license": "Apache-2.0",
+  // categories 和 keywords 用于搜索、筛选和后续插件市场展示。
+  "categories": [
+    "Automation",
+    "Security"
+  ],
+  "keywords": [
+    "secret",
+    "token",
+    "credential",
+    "security",
+    "clipboard"
+  ],
+  // engines 声明运行时兼容范围。
+  "engines": {
+    "clipcascade": ">=2.0.0",
+    "wasi": "wasip1"
+  },
+  // activationEvents 只做能力声明，当前不自动注册规则。
+  "activationEvents": [
+    "onClipboard:text",
+    "onCapability:secret_detect"
+  ],
+  "extensionKind": [
+    "workspace"
+  ],
+  // contributes 预留插件贡献点，当前只展示和记录，不绕过服务端白名单。
+  "contributes": {
+    "automation": {
+      "capabilities": [
+        "secret_detect"
+      ],
+      "rules": [],
+      "commands": []
+    }
+  },
+  // repository 可选；没有公开仓库的私有插件可以不填。
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/clipcascade/clipcascade"
+  },
+  "author": {
+    "name": "ClipCascade"
+  },
+  // clipcascade 块是本项目专属字段，所有执行入口和资源限制都必须放在这里。
+  "clipcascade": {
+    "schemaVersion": 1,
+    "enabled": true,
+    // 第一阶段只支持 WASI，运行时按需加载，降低常驻内存占用。
+    "entrypoint": {
+      "type": "wasi",
+      "path": "./secret-detector.wasm"
+    },
+    // 当前只做敏感凭证候选检测，不阻断、不回填、不上传。
+    "capabilities": [
+      "secret_detect"
+    ],
+    // runtime 块控制单次插件调用的超时和输出上限。
+    "runtime": {
+      "timeout_seconds": 5,
+      "max_output_bytes": 65536
+    }
+  }
+}

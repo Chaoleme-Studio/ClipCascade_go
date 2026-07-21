@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/clipcascade/pkg/netutil"
+	"github.com/clipcascade/server/automation"
 	"github.com/clipcascade/server/config"
 	"github.com/clipcascade/server/handler"
 	"github.com/clipcascade/server/middleware"
@@ -57,6 +58,8 @@ func main() {
 		"max_msg_mib", cfg.MaxMessageSizeMiB,
 		"file_relay", cfg.FileRelayEnabled,
 		"file_relay_max_bytes", cfg.FileRelayMaxBytes,
+		"automation", cfg.AutomationEnabled,
+		"automation_mode", cfg.AutomationMode,
 	)
 
 	// 初始化界面数据库
@@ -105,8 +108,10 @@ func main() {
 		}
 	}
 	app := fiber.New(fiber.Config{
-		Views:     engine,
-		BodyLimit: bodyLimit,
+		Views:                        engine,
+		BodyLimit:                    bodyLimit,
+		StreamRequestBody:            true,
+		DisablePreParseMultipartForm: true,
 	})
 
 	// 全局中间件
@@ -119,6 +124,19 @@ func main() {
 		AllowOrigins:     cfg.AllowedOrigins,
 		AllowCredentials: cfg.AllowedOrigins != "*",
 	}))
+	app.Use(func(c *fiber.Ctx) error {
+		if c.Path() == "/api/files/upload" {
+			return c.Next()
+		}
+		contentLength := c.Request().Header.ContentLength()
+		if contentLength < 0 && c.Method() != http.MethodGet && c.Method() != http.MethodHead {
+			return c.Status(fiber.StatusLengthRequired).JSON(fiber.Map{"error": "request body length required"})
+		}
+		if maxBytes := cfg.EffectiveMaxMessageBytes(); maxBytes > 0 && int64(contentLength) > maxBytes {
+			return c.Status(fiber.StatusRequestEntityTooLarge).JSON(fiber.Map{"error": "request body too large", "max_bytes": maxBytes})
+		}
+		return c.Next()
+	})
 
 	// 提供嵌入的静态文件服务
 	app.Use("/assets", filesystem.New(filesystem.Config{
@@ -128,12 +146,32 @@ func main() {
 
 	// 创建 handlers 和中间件
 	wsHub := handler.NewWSHub()
+	var automationEngine *automation.Engine
+	if cfg.AutomationEnabled {
+		var err error
+		automationEngine, err = automation.NewEngine(db, cfg)
+		if err != nil {
+			slog.Error("自动化引擎加载失败，已禁用自动化能力", "error", err)
+		} else {
+			wsHub.SetAutomationEngine(automationEngine)
+			pluginCatalog := automationEngine.PluginCatalog()
+			slog.Info("自动化引擎已启用",
+				"mode", cfg.AutomationMode,
+				"rules_path", cfg.AutomationRulesPath,
+				"commands_path", cfg.AutomationCommandsPath,
+				"plugins_dir", pluginCatalog.Root,
+				"plugins_total", pluginCatalog.Stats.Total,
+				"plugins_enabled", pluginCatalog.Stats.Enabled,
+			)
+		}
+	}
 	bfa := middleware.NewBruteForceProtection(cfg)
 	go bfa.Cleanup() // 启动后台清理任务
 
 	authHandler := handler.NewAuthHandler(db, cfg, bfa)
 	statusHandler := handler.NewStatusHandler(cfg)
 	fileTransferHandler := handler.NewFileTransferHandler(db, cfg, wsHub)
+	automationHandler := handler.NewAutomationHandler(db, cfg, automationEngine)
 	fileRelayStop := make(chan struct{})
 	if cfg.FileRelayEnabled {
 		go fileTransferHandler.RunCleanupLoop(10*time.Minute, fileRelayStop)
@@ -228,6 +266,8 @@ func main() {
 	app.Post("/api/files/deferred/:deferredID/fail", fileTransferHandler.FailDeferred)
 	app.Post("/api/files/upload", fileTransferHandler.Upload)
 	app.Get("/api/files/:relayID", fileTransferHandler.Download)
+	app.Get("/api/automation/tasks", automationHandler.ListMyTasks)
+	app.Post("/api/automation/copy", automationHandler.TrustedCopy)
 	app.Get("/api/user-info", func(c *fiber.Ctx) error {
 		userID, _ := c.Locals("user_id").(uint)
 		var info model.UserInfo
@@ -273,7 +313,12 @@ func main() {
 	admin.Get("/stats", adminHandler.ServerStats)
 	admin.Get("/server-version", adminHandler.ServerVersion)
 	admin.Get("/server-time", adminHandler.ServerTime)
+	admin.Get("/automation/tasks", automationHandler.ListAdminTasks)
+	admin.Get("/automation/audits", automationHandler.ListAdminAudits)
+	admin.Get("/automation/plugins", automationHandler.ListAdminPlugins)
+	admin.Put("/automation/plugins/:id/enabled", automationHandler.SetAdminPluginEnabled)
 	app.Get("/advance", handler.AdminOnly, adminHandler.AdvancePage)
+	app.Get("/plugins", handler.AdminOnly, automationHandler.PluginsPage)
 
 	// 自助端点 (任何经过身份验证的 user)
 	app.Put("/api/update-password", handler.UpdatePasswordSelf(db))

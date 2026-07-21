@@ -48,16 +48,17 @@ const (
 
 	AppName = "ClipCascade"
 	// AppVersion 是当前应用的版本号。
-	AppVersion = "1.15"
+	AppVersion = "2.0"
 
 	// --- 剪贴板内容类型 ---
 
-	TypeText        = "text"
-	TypeImage       = "image"
-	TypeFileStub    = "file_stub"
-	TypeFileEager   = "file_eager"
-	TypeFileOffer   = "file_offer"
-	TypeFileRequest = "file_request"
+	TypeText         = "text"
+	TypeImage        = "image"
+	TypeFileStub     = "file_stub"
+	TypeFileEager    = "file_eager"
+	TypeFileOffer    = "file_offer"
+	TypeFileRequest  = "file_request"
+	TypeSystemNotice = "system_notice"
 	// TypeFiles 保留兼容旧代码，建议使用 TypeFileStub。
 	TypeFiles = "files"
 

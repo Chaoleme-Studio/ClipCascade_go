@@ -332,5 +332,5 @@ jobs:
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
-          body_path: CHANGELOG-1.15.md
+          body_path: CHANGELOG-2.0.md
           files: artifacts/*

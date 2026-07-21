@@ -2,8 +2,13 @@ package handler
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
+	"fmt"
+	"io"
 	"mime/multipart"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -120,6 +125,108 @@ func TestUploadStoresRelayFile(t *testing.T) {
 	}
 	if record.FileName != "small.apk" || record.FileSize != int64(len(content)) {
 		t.Fatalf("unexpected relay metadata: name=%q size=%d", record.FileName, record.FileSize)
+	}
+	expectedSHA := sha256Hex(content)
+	if record.SHA256 != expectedSHA {
+		t.Fatalf("unexpected sha256: %s", record.SHA256)
+	}
+	stored, err := os.ReadFile(record.StoragePath)
+	if err != nil {
+		t.Fatalf("read stored relay file failed: %v", err)
+	}
+	if !bytes.Equal(stored, content) {
+		t.Fatalf("stored relay content mismatch")
+	}
+}
+
+func TestUploadStoresChunkedStreamRelayFile(t *testing.T) {
+	db := newTestDB(t)
+	tempDir := t.TempDir()
+	cfg := &config.Config{
+		FileRelayEnabled:    true,
+		FileRelayDir:        tempDir,
+		FileRelayMaxBytes:   constants.DefaultFileRelayMaxBytes,
+		FileRelayTTLSeconds: 3600,
+	}
+	h := NewFileTransferHandler(db, cfg, NewWSHub())
+
+	app := fiber.New(fiber.Config{
+		StreamRequestBody:            true,
+		DisablePreParseMultipartForm: true,
+		DisableStartupMessage:        true,
+	})
+	app.Post("/api/files/upload", withUser("alice", h.Upload))
+
+	content := bytes.Repeat([]byte("chunked-stream-payload-"), 1024)
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen failed: %v", err)
+	}
+	serveErrCh := make(chan error, 1)
+	go func() {
+		serveErrCh <- app.Listener(ln)
+	}()
+	t.Cleanup(func() {
+		_ = app.Shutdown()
+		if err := <-serveErrCh; err != nil {
+			t.Errorf("listener failed: %v", err)
+		}
+	})
+
+	pr, pw := io.Pipe()
+	writer := multipart.NewWriter(pw)
+	errCh := make(chan error, 1)
+	go func() {
+		defer close(errCh)
+		part, err := writer.CreateFormFile("file", "stream.bin")
+		if err == nil {
+			_, err = part.Write(content)
+		}
+		if closeErr := writer.Close(); err == nil {
+			err = closeErr
+		}
+		if closeErr := pw.Close(); err == nil {
+			err = closeErr
+		}
+		errCh <- err
+	}()
+
+	req, err := http.NewRequest(http.MethodPost, "http://"+ln.Addr().String()+"/api/files/upload", pr)
+	if err != nil {
+		t.Fatalf("create upload request failed: %v", err)
+	}
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	req.Header.Set("X-File-Size", fmt.Sprintf("%d", len(content)))
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("upload request failed: %v", err)
+	}
+	defer resp.Body.Close()
+	if writeErr := <-errCh; writeErr != nil {
+		t.Fatalf("write multipart stream failed: %v", writeErr)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("unexpected upload status: %d", resp.StatusCode)
+	}
+
+	var payload map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		t.Fatalf("decode upload response failed: %v", err)
+	}
+	relayID, _ := payload["relay_id"].(string)
+	if relayID == "" {
+		t.Fatalf("expected relay_id in response")
+	}
+
+	var record model.FileTransfer
+	if err := db.Where("relay_id = ? AND owner_username = ?", relayID, "alice").First(&record).Error; err != nil {
+		t.Fatalf("expected relay metadata, got err=%v", err)
+	}
+	if record.FileName != "stream.bin" || record.FileSize != int64(len(content)) {
+		t.Fatalf("unexpected relay metadata: name=%q size=%d", record.FileName, record.FileSize)
+	}
+	if record.SHA256 != sha256Hex(content) {
+		t.Fatalf("unexpected sha256: %s", record.SHA256)
 	}
 	stored, err := os.ReadFile(record.StoragePath)
 	if err != nil {
@@ -474,4 +581,9 @@ func withUser(username string, next fiber.Handler) fiber.Handler {
 		c.Locals("username", username)
 		return next(c)
 	}
+}
+
+func sha256Hex(data []byte) string {
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:])
 }

@@ -26,6 +26,7 @@ ClipCascade 的定位是：以剪贴板为中心，做一个可自部署、可�
 - 文件同步：支持小文件直传、中等文件 HTTP 自动中转、大文件 Web 延迟下载的分层策略。
 - 传输通道：支持 STOMP（服务端中转）+ P2P（点对点）双通道。
 - 安全能力：支持 E2EE 开关。
+- 服务端自动化：支持规则触发、审计任务和 WASI 插件占位能力。
 - 自动发现：局域网 mDNS 自动发现服务地址。
 - 多用户管理：支持管理员在 Web 页面直接新增用户。
 - Android 原生保活：前台服务 + 无障碍触发 + 权限引导。
@@ -52,6 +53,7 @@ ClipCascade 的定位是：以剪贴板为中心，做一个可自部署、可�
 - 数据库存储使用 GORM + SQLite。
 - 局域网自动发现使用 mDNS / Zeroconf。
 - 支持管理员 Web 页面直接管理用户。
+- 自动化框架默认关闭；开启后可通过规则匹配剪贴板事件，并调用 Go action、白名单命令或 WASI 插件。
 
 ### 桌面端传输层
 
@@ -247,6 +249,89 @@ ClipCascade 的定位是：以剪贴板为中心，做一个可自部署、可�
 2. 点击 `+ Add User`。
 3. 输入用户名和密码即可创建。
 
+## 服务端自动化与插件
+
+自动化默认关闭，不影响现有同步链路。关闭 E2EE 时，服务端可以解析明文文本、URL 和图片元信息；开启 E2EE 时，服务端只能处理 envelope 元数据。
+
+插件采用目录包格式。官方轻量插件优先使用 WASI，因此同一个 `.wasm` 文件可跨 Linux、macOS、Windows 运行；重型本地能力继续通过 `run_command` 白名单调用外部程序。
+
+```text
+plugins/
+  content-redact/
+    clipcascade.plugin.jsonc
+    README.md
+    content-redact.wasm
+```
+
+`clipcascade.plugin.jsonc` 示例：
+
+```jsonc
+{
+  // publisher 和 name 共同组成插件唯一 ID: example.content-redact
+  "publisher": "example",
+  "name": "content-redact",
+  // displayName 用于网页插件页展示。
+  "displayName": "Content Redaction",
+  "description": "Detects and redacts sensitive clipboard text.",
+  "version": "0.1.0",
+  "license": "MIT",
+  // categories 和 keywords 用于搜索、筛选和后续插件市场展示。
+  "categories": ["Automation", "Security"],
+  "keywords": ["clipboard", "redact", "privacy"],
+  // engines 声明运行时兼容范围。
+  "engines": {
+    "clipcascade": ">=2.0.0",
+    "wasi": "wasip1"
+  },
+  // activationEvents 只做能力声明，当前不自动注册规则。
+  "activationEvents": [
+    "onClipboard:text",
+    "onCapability:content_redact"
+  ],
+  // repository 可选；私有插件可以删除这一块。
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/example/content-redact"
+  },
+  "author": {
+    "name": "Example"
+  },
+  // contributes 预留插件贡献点，当前只展示和记录。
+  "contributes": {
+    "automation": {
+      "capabilities": ["content_redact"],
+      "rules": [],
+      "commands": []
+    }
+  },
+  // clipcascade 块是本项目专属字段，所有执行入口和资源限制都必须放在这里。
+  "clipcascade": {
+    "schemaVersion": 1,
+    "enabled": true,
+    // 第一阶段只支持 WASI，运行时按需加载。
+    "entrypoint": { "type": "wasi", "path": "./content-redact.wasm" },
+    "capabilities": ["content_redact"],
+    // runtime 块控制单次插件调用的超时和输出上限。
+    "runtime": { "timeout_seconds": 30, "max_output_bytes": 65536 }
+  }
+}
+```
+
+说明：
+
+- `README.md` 必须存在，用于 Web 插件页展示说明摘要。
+- 插件唯一 ID 遵循 VS Code 风格，由 `publisher.name` 组成；manifest 文件中不再允许顶层 `id`。
+- `repository` 可选；私有插件可以不提供仓库地址。
+- `clipcascade` 块保存平台专属字段；顶层 `entrypoint`、`capabilities`、`runtime`、`enabled` 会被拒绝。
+- `plugins/clipcascade.plugin.schema.jsonc` 提供 manifest JSONC Schema，可用于编辑器校验。
+- 第一版官方插件只支持 WASI，通过 stdin/stdout 交换机器载荷。
+- URL 下载、图片敏感检测、OCR、内容脱敏、结果回填目前只保留插件能力入口和任务结果记录，不内置具体实现。
+- 当前官方插件包含 `url-platform-candidate` 和 `secret-detector`；`url-platform-candidate` 当前优先识别抖音、快手平台 URL，后续可扩展更多平台。
+- 官方插件功能、触发规则和执行边界见：[ClipCascade 官方插件说明](_docs/official-plugins.md)。
+- 管理员登录后可从首页底部进入 `/plugins` 查看当前插件。
+- 构建全部官方插件：`./build-scripts/build.sh plugins`，产物在 `build/plugins/`。
+- 发布包推荐把 `clipcascade-server` 和 `plugins/` 放在同一级目录；默认 `CC_AUTOMATION_PLUGINS_DIR=./plugins` 按服务端二进制所在目录解析。
+
 ## 同步策略（当前设计）
 
 ### 文本/图片
@@ -330,17 +415,80 @@ export ANDROID_NDK_HOME="/opt/homebrew/Caskroom/android-ndk/<version>/AndroidNDK
 CLIPCASCADE_WINDOWS_GUI=1 ./build-scripts/build.sh cross
 ```
 
-## 关键环境变量（Server）
+## 环境变量
 
-```bash
-CC_PORT=8080
-CC_SIGNUP_ENABLED=false
-CC_P2P_ENABLED=false
-CC_P2P_STUN_URL=stun:stun.l.google.com:19302
-CC_MAX_MESSAGE_SIZE_IN_MiB=20
-CC_ALLOWED_ORIGINS=*
-CC_DATABASE_PATH=./database/clipcascade.db
-```
+### Server 运行时
+
+相对路径默认按服务端二进制所在目录解析，推荐发布包结构为 `clipcascade-server` 同级放 `database/`、`uploads/`、`plugins/`。
+
+| 环境变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `CC_PORT` | `8080` | 服务端监听端口 |
+| `CC_MAX_MESSAGE_SIZE_IN_MiB` | `20` | WebSocket 单消息大小上限，单位 MiB |
+| `CC_MAX_MESSAGE_SIZE_IN_BYTES` | `0` | WebSocket 单消息大小上限，单位字节；大于 0 时优先生效 |
+| `CC_P2P_ENABLED` | `false` | 是否启用 P2P 信令与 P2P 同步模式 |
+| `CC_P2P_STUN_URL` | `stun:stun.l.google.com:19302` | WebRTC STUN 地址 |
+| `CC_ALLOWED_ORIGINS` | `*` | CORS 允许来源，多个来源用逗号分隔 |
+| `CC_SIGNUP_ENABLED` | `false` | 是否开放自助注册 |
+| `CC_MAX_USER_ACCOUNTS` | `-1` | 最大用户数量；`-1` 表示不限制 |
+| `CC_ACCOUNT_PURGE_TIMEOUT_SECONDS` | `-1` | 账号清理超时；`-1` 表示关闭 |
+| `CC_SESSION_TIMEOUT` | `525960` | 登录会话有效期，单位分钟 |
+| `CC_MAX_UNIQUE_IP_ATTEMPTS` | `15` | 暴力破解防护：唯一 IP 尝试阈值 |
+| `CC_MAX_ATTEMPTS_PER_IP` | `30` | 暴力破解防护：单 IP 尝试阈值 |
+| `CC_LOCK_TIMEOUT_SECONDS` | `60` | 触发锁定后的初始锁定时间 |
+| `CC_LOCK_TIMEOUT_SCALING_FACTOR` | `2` | 连续触发锁定后的时间放大倍数 |
+| `CC_BFA_CACHE_ENABLED` | `true` | 是否启用暴力破解防护缓存 |
+| `CC_DATABASE_PATH` | `./database/clipcascade.db` | SQLite 数据库路径 |
+| `CC_FILE_RELAY_ENABLED` | `true` | 是否启用 HTTP 文件中转 |
+| `CC_FILE_RELAY_DIR` | `./uploads` | HTTP 文件中转存储目录 |
+| `CC_FILE_RELAY_MAX_BYTES` | `2147483648` | HTTP 文件中转单文件最大大小，默认 2 GiB |
+| `CC_FILE_RELAY_TTL_SECONDS` | `86400` | HTTP 文件中转文件保留时间 |
+| `CC_EXTERNAL_BROKER_ENABLED` | `false` | 是否启用外部 STOMP broker |
+| `CC_BROKER_HOST` | `localhost` | 外部 broker 主机 |
+| `CC_BROKER_PORT` | `61613` | 外部 broker 端口 |
+| `CC_AUTOMATION_ENABLED` | `false` | 是否启用服务端自动化引擎 |
+| `CC_AUTOMATION_MODE` | `observe` | 自动化模式：`observe` 只观察，`enforce` 执行阻断 |
+| `CC_AUTOMATION_RULES_PATH` | 空 | 自动化规则 JSONC 文件路径 |
+| `CC_AUTOMATION_COMMANDS_PATH` | 空 | 本地命令白名单 JSONC 文件路径 |
+| `CC_AUTOMATION_PLUGINS_DIR` | `./plugins` | 插件目录；相对路径按服务端二进制所在目录解析 |
+| `CC_AUTOMATION_COMMAND_TIMEOUT_SECONDS` | `30` | 本地命令单次执行超时 |
+| `CC_AUTOMATION_COMMAND_MAX_OUTPUT_BYTES` | `65536` | 本地命令 stdout 最大读取字节数 |
+| `CC_AUTOMATION_PLUGIN_TIMEOUT_SECONDS` | `30` | WASI 插件单次执行超时 |
+| `CC_AUTOMATION_PLUGIN_MAX_OUTPUT_BYTES` | `65536` | WASI 插件 stdout 最大读取字节数 |
+| `CC_AUTOMATION_TRUSTED_COPY_ENABLED` | `false` | 是否启用 `/api/automation/copy` 可信复制入口 |
+| `CC_AUTOMATION_COPY_MAX_BYTES` | `262144` | 可信复制入口请求体大小上限 |
+
+### Web 剪贴板运行时
+
+| 环境变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `WEBCLIP_PORT` | `8090` | Web 剪贴板端口，占用时自动加 1 |
+| `WEBCLIP_DB_PATH` | 二进制目录 `data.db` | Web 剪贴板数据库路径 |
+| `WEBCLIP_UPLOAD_DIR` | 二进制目录 `uploads/` | Web 剪贴板上传目录 |
+
+### 桌面端运行时
+
+| 环境变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `CLIPCASCADE_PASSWORD` | 空 | 桌面端密码覆盖；设置后不从本地配置读取密码 |
+| `XDG_CONFIG_HOME` | 系统默认 | Linux 配置目录标准变量 |
+| `APPDATA` | 系统默认 | Windows 配置目录标准变量 |
+| `WAYLAND_DISPLAY` | 系统默认 | Linux 下用于判断是否优先使用 Wayland 剪贴板工具 |
+
+### 构建脚本
+
+| 环境变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `VERSION` | `git describe --tags --always` 或 `dev` | 注入二进制版本号 |
+| `CLIPCASCADE_WINDOWS_GUI` | `0` | `1` 表示构建 Windows 桌面端时隐藏控制台窗口 |
+| `ANDROID_HOME` | 自动探测 Homebrew Android SDK | Android SDK 路径；Android 原生端构建会读取 |
+| `ANDROID_SDK_ROOT` | 跟随 `ANDROID_HOME` | Android SDK 标准路径变量；未设置时脚本会用 `ANDROID_HOME` 填充 |
+| `ANDROID_NDK_HOME` | 自动探测 | Android 原生端构建使用的 NDK 路径 |
+| `CC_ANDROID_API` | `26` | Android 原生端构建 API level |
+| `GRADLE_USER_HOME` | 根目录 `.gradle-user-home/` | Android Gradle 缓存目录；默认使用项目内目录避免污染全局缓存 |
+| `JAVA_HOME` | 系统默认 | Gradle Wrapper 使用的 JDK 路径；建议 JDK 17 |
+| `SDKROOT` | Xcode SDK 自动探测 | macOS CGO 构建 SDK；无效时脚本会清理 |
+| `PATH` | 系统默认 | 需要包含 `go`、`gomobile`、`fyne`、`fyne-cross`、`docker` 等构建工具 |
 
 ## 常见问题
 

@@ -120,6 +120,47 @@ build_web_clip_cross() {
     info "✅ Web 剪贴板交叉编译完成"
 }
 
+build_plugins() {
+    info "正在构建官方 WASI 插件..."
+    local plugins_build_dir="$BUILD_DIR/plugins"
+    rm -rf "$plugins_build_dir"
+    mkdir -p "$plugins_build_dir"
+
+    local official_dir="$ROOT_DIR/plugins/official"
+    if [[ ! -d "$official_dir" ]]; then
+        warn "    ⚠ 未找到官方插件目录: $official_dir"
+        return 0
+    fi
+
+    local built=0
+    local src_dir plugin_id out_dir
+    for src_dir in "$official_dir"/*; do
+        [[ -d "$src_dir" ]] || continue
+        plugin_id="$(basename "$src_dir")"
+        if [[ ! -d "$src_dir/cmd/$plugin_id" ]]; then
+            warn "    ⚠ 跳过插件 $plugin_id：缺少 cmd/$plugin_id"
+            continue
+        fi
+        if [[ ! -f "$src_dir/clipcascade.plugin.jsonc" || ! -f "$src_dir/README.md" ]]; then
+            warn "    ⚠ 跳过插件 $plugin_id：缺少 clipcascade.plugin.jsonc 或 README.md"
+            continue
+        fi
+
+        out_dir="$plugins_build_dir/$plugin_id"
+        rm -rf "$out_dir"
+        mkdir -p "$out_dir"
+        cp "$src_dir/clipcascade.plugin.jsonc" "$out_dir/"
+        cp "$src_dir/README.md" "$out_dir/"
+
+        info "  → 编译中: $plugin_id (wasip1/wasm)"
+        cd "$src_dir"
+        GOWORK=off GOOS=wasip1 GOARCH=wasm go build -trimpath -ldflags="-s -w" -o "$out_dir/$plugin_id.wasm" ./cmd/$plugin_id
+        built=$((built + 1))
+    done
+    info "✅ 官方插件构建完成，共 $built 个 → $plugins_build_dir"
+    cd "$ROOT_DIR"
+}
+
 build_desktop() {
     info "正在构建桌面客户端 (本地平台)..."
     cd "$ROOT_DIR/client-desktop"
@@ -312,7 +353,7 @@ clean() {
 
 show_help() {
     echo "ClipCascade 全能构建脚本 (无 CGO 依赖重制版 & Fyne UI 合并版)"
-    echo "用法: $0 {server|server-cross|desktop|desktop-ui|desktop-ui-cross|cross|mobile-android-native|docker|all|tidy|clean}"
+    echo "用法: $0 {server|server-cross|plugins|desktop|desktop-ui|desktop-ui-cross|cross|mobile-android-native|docker|all|tidy|clean}"
     echo
     echo "命令:"
     echo "  desktop          构建当前系统原生隐形式 Desktop 托盘端 (无界面纯后台)"
@@ -322,6 +363,7 @@ show_help() {
     echo "  mobile-android-native 使用 gomobile + Kotlin 构建 Android 原生保活版 (.apk)"
     echo "  server           构建本地 Server 二进制文件"
     echo "  server-cross     交叉编译所有平台 Server 架构"
+    echo "  plugins          构建官方 WASI 插件到 build/plugins"
     echo "  docker           将 Server 构建为 Docker 镜像"
     echo "  all              一键满配全平台编译: 隐形式桌面端 + UI式桌面端 + Android + iOS + Server"
     echo "  tidy             对所有模块运行 'go mod tidy'"
@@ -344,6 +386,7 @@ for target in "$@"; do
     case "$target" in
         server)           build_server ;;
         server-cross)     build_server_cross ;;
+        plugins)          build_plugins ;;
         desktop)          build_desktop ;;
         desktop-ui)       build_desktop_ui ;;
         desktop-ui-cross) build_desktop_ui_cross ;;
@@ -353,6 +396,7 @@ for target in "$@"; do
         mobile-android-native) build_mobile_android_native ;;
         docker)           build_docker ;;
         all)              build_server_cross || warn "server-cross 构建失败";
+                          build_plugins || warn "plugins 构建失败";
                           build_desktop_cross || warn "desktop-cross 构建失败";
                           build_desktop_ui || warn "desktop-ui 构建失败";
                           build_desktop_ui_cross || warn "desktop-ui-cross 构建失败";

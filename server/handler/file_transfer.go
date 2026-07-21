@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"bytes"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
@@ -8,6 +9,8 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"mime"
+	"mime/multipart"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -78,6 +81,22 @@ type deferredFileResponse struct {
 	ExpiresAt        time.Time  `json:"expires_at"`
 }
 
+type storedUpload struct {
+	name     string
+	size     int64
+	sha256   string
+	mimeType string
+}
+
+type uploadError struct {
+	status  int
+	message string
+}
+
+func (e *uploadError) Error() string {
+	return e.message
+}
+
 func NewFileTransferHandler(db *gorm.DB, cfg *config.Config, hub *WSHub) *FileTransferHandler {
 	return &FileTransferHandler{DB: db, Config: cfg, Hub: hub}
 }
@@ -94,34 +113,16 @@ func (h *FileTransferHandler) Upload(c *fiber.Ctx) (err error) {
 		return c.Status(fiber.StatusNotImplemented).JSON(fiber.Map{"error": "file relay disabled"})
 	}
 
+	var sizeHint int64
 	// Early size rejection using optional hint header sent by the client.
-	if sizeHint, err := strconv.ParseInt(string(c.Request().Header.Peek("X-File-Size")), 10, 64); err == nil {
+	if parsedSize, err := strconv.ParseInt(string(c.Request().Header.Peek("X-File-Size")), 10, 64); err == nil {
+		sizeHint = parsedSize
 		if sizeHint <= 0 {
 			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid file size"})
 		}
 		if h.Config.FileRelayMaxBytes > 0 && sizeHint > h.Config.FileRelayMaxBytes {
 			return c.Status(fiber.StatusRequestEntityTooLarge).JSON(fiber.Map{"error": "file too large", "max_bytes": h.Config.FileRelayMaxBytes})
 		}
-	}
-
-	fileHeader, err := c.FormFile("file")
-	if err != nil || fileHeader == nil {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "missing file"})
-	}
-
-	name := sanitizeUploadFilename(fileHeader.Filename)
-	if name == "" {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid filename"})
-	}
-	mimeType := fileHeader.Header.Get("Content-Type")
-	if strings.TrimSpace(mimeType) == "" {
-		mimeType = "application/octet-stream"
-	}
-	if fileHeader.Size <= 0 {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid file size"})
-	}
-	if h.Config.FileRelayMaxBytes > 0 && fileHeader.Size > h.Config.FileRelayMaxBytes {
-		return c.Status(fiber.StatusRequestEntityTooLarge).JSON(fiber.Map{"error": "file too large", "max_bytes": h.Config.FileRelayMaxBytes})
 	}
 
 	if err := os.MkdirAll(h.Config.FileRelayDir, 0o755); err != nil {
@@ -135,18 +136,14 @@ func (h *FileTransferHandler) Upload(c *fiber.Ctx) (err error) {
 	}
 
 	tempPath := filepath.Join(h.Config.FileRelayDir, relayID+".part")
-	finalPath := filepath.Join(h.Config.FileRelayDir, relayID+filepath.Ext(name))
 	defer os.Remove(tempPath)
 
-	if err := c.SaveFile(fileHeader, tempPath); err != nil {
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to store file"})
-	}
-	written := fileHeader.Size
-	hasher, err := hashFile(tempPath)
+	stored, err := h.storeUploadedFile(c, tempPath, sizeHint)
 	if err != nil {
-		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to hash file"})
+		return uploadErrorResponse(c, err, h.Config.FileRelayMaxBytes)
 	}
 
+	finalPath := filepath.Join(h.Config.FileRelayDir, relayID+filepath.Ext(stored.name))
 	if err := os.Rename(tempPath, finalPath); err != nil {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to finalize upload"})
 	}
@@ -154,10 +151,10 @@ func (h *FileTransferHandler) Upload(c *fiber.Ctx) (err error) {
 	record := &model.FileTransfer{
 		RelayID:       relayID,
 		OwnerUsername: username,
-		FileName:      name,
-		FileSize:      written,
-		SHA256:        hasher,
-		MimeType:      mimeType,
+		FileName:      stored.name,
+		FileSize:      stored.size,
+		SHA256:        stored.sha256,
+		MimeType:      stored.mimeType,
 		StoragePath:   finalPath,
 		ExpiresAt:     time.Now().Add(time.Duration(h.Config.FileRelayTTLSeconds) * time.Second),
 	}
@@ -180,6 +177,107 @@ func (h *FileTransferHandler) Upload(c *fiber.Ctx) (err error) {
 		"sha256":    record.SHA256,
 		"mime_type": record.MimeType,
 	})
+}
+
+func (h *FileTransferHandler) storeUploadedFile(c *fiber.Ctx, destPath string, sizeHint int64) (*storedUpload, error) {
+	contentType := string(c.Request().Header.ContentType())
+	mediaType, params, err := mime.ParseMediaType(contentType)
+	if err != nil || !strings.EqualFold(mediaType, "multipart/form-data") || strings.TrimSpace(params["boundary"]) == "" {
+		return nil, &uploadError{status: fiber.StatusBadRequest, message: "invalid multipart request"}
+	}
+
+	body := c.Context().RequestBodyStream()
+	if body == nil {
+		body = bytes.NewReader(c.BodyRaw())
+	}
+
+	reader := multipart.NewReader(body, params["boundary"])
+	for {
+		part, err := reader.NextPart()
+		if err == io.EOF {
+			return nil, &uploadError{status: fiber.StatusBadRequest, message: "missing file"}
+		}
+		if err != nil {
+			return nil, &uploadError{status: fiber.StatusBadRequest, message: "failed to parse multipart"}
+		}
+		if part.FormName() != "file" {
+			_ = part.Close()
+			continue
+		}
+		defer part.Close()
+
+		name := sanitizeUploadFilename(part.FileName())
+		if name == "" {
+			return nil, &uploadError{status: fiber.StatusBadRequest, message: "invalid filename"}
+		}
+		mimeType := part.Header.Get("Content-Type")
+		if strings.TrimSpace(mimeType) == "" {
+			mimeType = "application/octet-stream"
+		}
+
+		out, err := os.Create(destPath)
+		if err != nil {
+			return nil, &uploadError{status: fiber.StatusInternalServerError, message: "failed to store file"}
+		}
+		hasher := sha256.New()
+		limit := h.Config.FileRelayMaxBytes
+		written, copyErr := copyUploadedPart(io.MultiWriter(out, hasher), part, limit)
+		closeErr := out.Close()
+		if copyErr != nil {
+			return nil, copyErr
+		}
+		if closeErr != nil {
+			return nil, &uploadError{status: fiber.StatusInternalServerError, message: "failed to store file"}
+		}
+		if written <= 0 {
+			return nil, &uploadError{status: fiber.StatusBadRequest, message: "invalid file size"}
+		}
+		if sizeHint > 0 && written != sizeHint {
+			return nil, &uploadError{status: fiber.StatusBadRequest, message: "file size mismatch"}
+		}
+
+		return &storedUpload{
+			name:     name,
+			size:     written,
+			sha256:   hex.EncodeToString(hasher.Sum(nil)),
+			mimeType: mimeType,
+		}, nil
+	}
+}
+
+func copyUploadedPart(dst io.Writer, src io.Reader, maxBytes int64) (int64, error) {
+	buf := make([]byte, 256*1024)
+	var written int64
+	for {
+		n, readErr := src.Read(buf)
+		if n > 0 {
+			next := written + int64(n)
+			if maxBytes > 0 && next > maxBytes {
+				return written, &uploadError{status: fiber.StatusRequestEntityTooLarge, message: "file too large"}
+			}
+			if _, err := dst.Write(buf[:n]); err != nil {
+				return written, &uploadError{status: fiber.StatusInternalServerError, message: "failed to store file"}
+			}
+			written = next
+		}
+		if readErr == io.EOF {
+			return written, nil
+		}
+		if readErr != nil {
+			return written, &uploadError{status: fiber.StatusBadRequest, message: "failed to read upload"}
+		}
+	}
+}
+
+func uploadErrorResponse(c *fiber.Ctx, err error, maxBytes int64) error {
+	if typed, ok := err.(*uploadError); ok {
+		payload := fiber.Map{"error": typed.message}
+		if typed.status == fiber.StatusRequestEntityTooLarge && maxBytes > 0 {
+			payload["max_bytes"] = maxBytes
+		}
+		return c.Status(typed.status).JSON(payload)
+	}
+	return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to store file"})
 }
 
 func (h *FileTransferHandler) Download(c *fiber.Ctx) error {
@@ -818,18 +916,4 @@ func randomID(n int) (string, error) {
 		return "", err
 	}
 	return hex.EncodeToString(buf), nil
-}
-
-func hashFile(path string) (string, error) {
-	in, err := os.Open(path)
-	if err != nil {
-		return "", err
-	}
-	defer in.Close()
-
-	hasher := sha256.New()
-	if _, err := io.CopyBuffer(hasher, in, make([]byte, 256*1024)); err != nil {
-		return "", err
-	}
-	return hex.EncodeToString(hasher.Sum(nil)), nil
 }
