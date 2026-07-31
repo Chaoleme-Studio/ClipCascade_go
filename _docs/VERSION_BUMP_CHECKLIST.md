@@ -1,46 +1,43 @@
 # ClipCascade 版本升级检查清单
 
-> 目标：将项目内所有版本相关硬编码、构建配置、文档统一更新到 v1.14。
+本清单用于每次正式版本发布，当前记录的发布目标为 `v2.1`。
 
-## 已确认已更新（无需再动）
+## 版本入口
 
-| 文件 | 状态 |
+| 文件 | v2.1 状态 |
 |------|------|
-| `CHANGELOG-1.14.md` | 已存在，标题为 `ClipCascade v1.14 ...` |
-| `client-android-native-shell/android/app/build.gradle.kts` | `versionCode = 14`, `versionName = "1.14"` |
-| `.github/workflows/build.yml` release job | `body_path: CHANGELOG-1.14.md` |
+| `core/constants/constants.go` | `AppVersion = "2.1"` |
+| `client-desktop/main.go` | `Version = "2.1"` |
+| `client-desktop/cmd/desktop-ui/main.go` | `Version = "2.1"` |
+| `client-android-native-shell/android/app/build.gradle.kts` | `versionCode = 21`, `versionName = "2.1"` |
+| `Makefile` | `VERSION ?= 2.1` |
+| `_docs/STATUS.md` | `版本：v2.1` |
+| `.github/workflows/build.yml` | Release 正文使用 `CHANGELOG-2.1.md` |
+| `CHANGELOG-2.1.md` | 已记录本次功能、兼容性和验证结果 |
 
-## 本次需要更新的项
+## 发布前验证
 
-### 1. 服务端硬编码版本（必须）
-- **文件**：`core/constants/constants.go:51`
-- **当前**：`AppVersion = "0.1.0"`
-- **改为**：`AppVersion = "1.14"`
-- **说明**：该常量通过 `/server-version` 接口返回，是服务端对外暴露的版本号。
+```bash
+go test ./...
+git diff --check
+bash build-scripts/build_android.sh
+cd client-android-native-shell/android
+./gradlew --no-daemon testDebugUnitTest lintDebug
+```
 
-### 2. PC 桌面端增加版本变量（必须）
-- **文件**：`client-desktop/main.go`
-- **当前**：无 `Version` 变量
-- **改为**：在 `package main` 下添加 `var Version = "1.14"`
-- **说明**：`build-scripts/build.sh` 和 `Makefile` 都通过 `-X main.Version=...` 注入版本，但 desktop 的 `main` 包原本没有该变量，注入无效。
+确认 Android APK：
 
-### 3. Makefile 默认版本（必须）
-- **文件**：`Makefile:7`
-- **当前**：`VERSION ?= 0.1.0`
-- **改为**：`VERSION ?= 1.14`
+```bash
+aapt dump badging build/ClipCascade-Android-Installable.apk | head
+apksigner verify --verbose build/ClipCascade-Android-Installable.apk
+```
 
-### 4. 项目状态文档版本（建议）
-- **文件**：`STATUS.md:3`
-- **当前**：`版本：v1.3`
-- **改为**：`版本：v1.14`
+## GitHub 发布顺序
 
-### 5. Fyne 桌面 UI / client-mobile 版本（可选）
-- **文件**：`client-mobile/main.go`
-- **当前**：无版本号
-- **建议**：如需在 Fyne UI 显示版本，添加 `var Version = "1.14"` 并在界面或日志中引用。如果本次发布不涉及 UI 版，可跳过。
+1. 提交 `CHANGELOG-2.1.md`、README、状态文档和构建配置。
+2. 推送 `main`。
+3. 创建并推送 `v2.1` Tag。
+4. 等待 `.github/workflows/build.yml` 的 Tag 工作流完成。
+5. 确认 Release 附件包含服务端、桌面端、Web Clip 和 Android APK。
 
-## 验证方式
-
-1. 构建服务端后访问 `/server-version`，确认返回 `{"version":"1.14"}`。
-2. 构建桌面端后检查二进制中是否包含 `1.14`（`strings clipcascade-desktop | grep 1.14`）。
-3. 使用 `make server VERSION=1.14` 或 `./build-scripts/build.sh server` 构建，确认产物版本正确。
+插件兼容声明 `>=2.0.0` 属于插件 API 最低兼容版本，不随应用显示版本自动改成 `>=2.1.0`。

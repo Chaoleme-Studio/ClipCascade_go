@@ -102,6 +102,9 @@ This section only describes the technical solutions already implemented in the c
 
 - Text and standard images are "sync on copy" by default.
 - Files are not forced to be fully transferred directly; instead, a distinction is made between small file direct transfer and large/multi-file placeholder notifications.
+- File handling uses three shared protocol bands: `<= 8 MiB` `file_eager`, `> 8 MiB and <= 25 MiB` HTTP relay, and `> 25 MiB and <= 2 GiB` deferred registration.
+- Android cannot reliably write files into the system clipboard. Received `file_eager` data therefore keeps only the newest temporary copy, while `file_offer` keeps download metadata; both are saved to the public `Download` directory only when the user taps save.
+- Android received images can be previewed in the app and saved to the public `Download` directory. Temporary caching is event-driven and does not acquire an extra wake lock.
 - For screenshot-like content, the current strategy is still to sync as images directly, rather than requiring users to "paste and then copy."
 - If a platform's screenshot tool places content in a non-standard private format, further platform adaptation may be needed (this is a clipboard reading layer issue, not a new protocol-level type).
 
@@ -345,6 +348,15 @@ Notes:
 - Single file and size `> 25 MiB and <= 2 GiB`: registered in the server deferred list only. It is not pushed into other devices' clipboards automatically; users can request/download it from the Web page.
 - Multiple files or files over the supported limit: `file_stub` placeholder (metadata notification).
 
+Android native receiving behavior:
+
+- `file_eager`: decoded into app cache, with only the newest temporary copy retained; it is not written to the Android system clipboard, and the history save action writes it to `Download/`.
+- `file_offer`: history stores the file name, size, and relay ID only. The content is downloaded to `Download/` only after the user taps it.
+- Files above `25 MiB`: shown in the deferred files view and downloaded on demand, up to `2 GiB`.
+- Images: previewed in the app and saved to `Download/` on demand.
+
+Because Android share sources are exposed as `content://` URIs, the Android sending path continues to use HTTP relay for files up to `25 MiB`. This is a platform-specific source-handling path; it does not change the three-band protocol understood by PC receivers or pre-upload large files.
+
 `file_eager` behavior on receiving end:
 
 - Saved to temporary directory:
@@ -355,6 +367,7 @@ Notes:
 Temp file cleanup:
 
 - Automatically cleans up old temporary files older than `24 hours` when receiving files.
+- Android eager-file cache keeps only the newest file. LAN discovery runs only while the main screen is in the foreground and restarts when the network/IP changes.
 
 ## Build and Environment
 

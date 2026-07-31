@@ -1,6 +1,14 @@
 # ClipCascade Go — 项目状态文档
 
-> 最后更新：2026-06-24  版本：v2.0
+> 最后更新：2026-08-01  版本：v2.1
+
+## v2.1 发布重点
+
+- Android 原生端完整识别 PC 发来的 `file_eager`、`file_offer` 和 deferred 文件消息。
+- PC 小文件在 Android 端只保留最近一个临时副本，用户点击后保存到公共 `Download` 目录。
+- Android 接收图片和中继文件支持保存到公共 `Download` 目录，不再依赖应用私有路径。
+- 文件传输上限统一记录为 `8 MiB / 25 MiB / 2 GiB` 三档；Android 的 `content://` 分享发送仍使用专用 HTTP 中继路径。
+- Android 局域网发现支持真正重扫、网络/IP 变化重启发现，以及前后台生命周期管理。
 
 ## 目录结构
 
