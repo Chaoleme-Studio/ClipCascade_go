@@ -88,8 +88,21 @@ class ShareActivity : Activity() {
                     finish()
                 }
             }
+            ShareDecision.DeferredFile -> {
+                if (sharedUri != null && sharedSize != null) {
+                    prepareDeferredFile(sharedUri, intent.type, sharedSize)
+                } else {
+                    Toast.makeText(this, "无法读取大文件信息", Toast.LENGTH_LONG).show()
+                }
+                finish()
+            }
             ShareDecision.TooLarge -> {
-                Toast.makeText(this, "文件超过 25 MiB，Android 端不自动发送", Toast.LENGTH_LONG).show()
+                val message = if (intent.type?.startsWith("image/") == true) {
+                    "图片超过 25 MiB，Android 端不自动发送"
+                } else {
+                    "文件超过 2 GiB，暂不支持"
+                }
+                Toast.makeText(this, message, Toast.LENGTH_LONG).show()
                 finish()
             }
             ShareDecision.UnsupportedFile -> {
@@ -157,6 +170,26 @@ class ShareActivity : Activity() {
         return safeFileName(uri.lastPathSegment ?: "clipcascade-file")
     }
 
+    private fun prepareDeferredFile(uri: Uri, mimeType: String?, fileSize: Long) {
+        val prefs = getSharedPreferences("clipcascade", Context.MODE_PRIVATE)
+        val serverURL = normalizeServerUrl(prefs.getString("ServerURL", "") ?: "")
+        val username = prefs.getString("Username", "")?.trim().orEmpty()
+        val password = prefs.getString("Password", "").orEmpty()
+        if (serverURL.isBlank() || username.isBlank() || password.isBlank()) {
+            Toast.makeText(this, "请先保存服务器账号", Toast.LENGTH_SHORT).show()
+            return
+        }
+        startCoreService(showToast = false)
+        DeferredFileTransferService.startPreparing(
+            context = this,
+            uri = uri,
+            fileName = queryContentName(uri),
+            fileSize = fileSize,
+            mimeType = mimeType?.takeIf { it.isNotBlank() } ?: "application/octet-stream"
+        )
+        Toast.makeText(this, "正在保存并登记大文件，下载请求到来时再上传", Toast.LENGTH_LONG).show()
+    }
+
     private fun uploadSharedFileAndSendOffer(uri: Uri, mimeType: String?, sizeHint: Long?) {
         val prefs = getSharedPreferences("clipcascade", Context.MODE_PRIVATE)
         val serverURL = normalizeServerUrl(prefs.getString("ServerURL", "") ?: "")
@@ -167,7 +200,7 @@ class ShareActivity : Activity() {
             finish()
             return
         }
-        if (sizeHint != null && sizeHint > AndroidSharePolicy.MAX_DIRECT_BYTES) {
+        if (sizeHint != null && sizeHint > AndroidSharePolicy.MAX_AUTO_RELAY_BYTES) {
             Toast.makeText(this, "文件超过 25 MiB，Android 端不自动发送", Toast.LENGTH_LONG).show()
             finish()
             return
@@ -193,7 +226,14 @@ class ShareActivity : Activity() {
                     .toString()
                 startCoreService(sharedFileOffer = offer, showToast = false)
                 runOnUiThread {
-                    ClipboardHistoryStore.append(this, "文件：${result.fileName}", "sent")
+                    ClipboardHistoryStore.appendFile(
+                        context = this,
+                        relayID = result.relayID,
+                        fileName = result.fileName,
+                        fileSize = result.fileSize,
+                        mimeType = result.mimeType,
+                        direction = "sent"
+                    )
                     notifyHistoryChanged()
                     Toast.makeText(this, "文件已上传并同步：${result.fileName}", Toast.LENGTH_LONG).show()
                     finish()
@@ -274,7 +314,7 @@ class ShareActivity : Activity() {
                             break
                         }
                         total += read.toLong()
-                        if (total > AndroidSharePolicy.MAX_DIRECT_BYTES) {
+                        if (total > AndroidSharePolicy.MAX_AUTO_RELAY_BYTES) {
                             throw ShareFileTooLargeException()
                         }
                         output.write(buffer, 0, read)
@@ -316,7 +356,7 @@ class ShareActivity : Activity() {
                         break
                     }
                     total += read.toLong()
-                    if (total > AndroidSharePolicy.MAX_DIRECT_BYTES) {
+                    if (total > AndroidSharePolicy.MAX_AUTO_RELAY_BYTES) {
                         Toast.makeText(this, "图片超过 25 MiB，Android 端不自动发送", Toast.LENGTH_LONG).show()
                         return null
                     }

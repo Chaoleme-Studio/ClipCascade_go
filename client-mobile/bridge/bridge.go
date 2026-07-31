@@ -8,7 +8,7 @@ import (
 
 // MessageCallback is the mobile callback interface exposed to gomobile bindings.
 type MessageCallback interface {
-	OnMessage(payload string, payloadType string)
+	OnMessage(payload string, payloadType string, fileName string)
 	OnStatusChange(status string)
 }
 
@@ -16,9 +16,9 @@ type callbackAdapter struct {
 	cb MessageCallback
 }
 
-func (a *callbackAdapter) OnMessage(payload string, payloadType string) {
+func (a *callbackAdapter) OnMessage(payload string, payloadType string, fileName string) {
 	if a.cb != nil {
-		a.cb.OnMessage(payload, payloadType)
+		a.cb.OnMessage(payload, payloadType, fileName)
 	}
 }
 
@@ -60,6 +60,11 @@ func (e *Engine) Stop() {
 // SendClipboard sends clipboard payload.
 func (e *Engine) SendClipboard(payload string, payloadType string) error {
 	return e.inner.SendClipboard(payload, payloadType)
+}
+
+// SendClipboardWithFileName sends a clipboard payload with its original file name.
+func (e *Engine) SendClipboardWithFileName(payload string, payloadType string, fileName string) error {
+	return e.inner.SendClipboardWithFileName(payload, payloadType, fileName)
 }
 
 // IsConnected returns connection state.

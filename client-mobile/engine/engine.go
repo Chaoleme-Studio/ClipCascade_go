@@ -27,8 +27,8 @@ import (
 // 用于从 Go engine 接收剪贴板数据。
 type MessageCallback interface {
 	// 当从其他 device 接收到剪贴板数据时调用 OnMessage。
-	// payloadType 为 "text"、"image" 或 "files"。
-	OnMessage(payload string, payloadType string)
+	// fileName 仅在文件消息中有值。
+	OnMessage(payload string, payloadType string, fileName string)
 
 	// 当连接状态改变时调用 OnStatusChange。
 	// status: "connected"、"disconnected"、"reconnecting"、"error"
@@ -130,6 +130,11 @@ func (e *Engine) Stop() {
 
 // SendClipboard 向 server 发送剪贴板数据。
 func (e *Engine) SendClipboard(payload string, payloadType string) error {
+	return e.SendClipboardWithFileName(payload, payloadType, "")
+}
+
+// SendClipboardWithFileName 向 server 发送带原始文件名的剪贴板数据。
+func (e *Engine) SendClipboardWithFileName(payload string, payloadType string, fileName string) error {
 	e.mu.Lock()
 	conn := e.wsConn
 	encKey := e.encKey
@@ -140,7 +145,7 @@ func (e *Engine) SendClipboard(payload string, payloadType string) error {
 		return fmt.Errorf("not connected")
 	}
 
-	clipData := &protocol.ClipboardData{Payload: payload, Type: payloadType}
+	clipData := &protocol.ClipboardData{Payload: payload, Type: payloadType, FileName: fileName}
 	var body string
 
 	if e2ee && encKey != nil {
@@ -410,7 +415,7 @@ func (e *Engine) isStopped() bool {
 func (e *Engine) handleIncomingData(body string) {
 	var clipData *protocol.ClipboardData
 
-	if e.e2ee && e.encKey != nil {
+	if e.e2ee && e.encKey != nil && looksLikeEncryptedEnvelope(body) {
 		encrypted, err := pkgcrypto.DecodeFromJSONString(body)
 		if err != nil {
 			return
@@ -425,6 +430,17 @@ func (e *Engine) handleIncomingData(body string) {
 	}
 
 	if clipData != nil && e.callback != nil {
-		e.callback.OnMessage(clipData.Payload, clipData.Type)
+		e.callback.OnMessage(clipData.Payload, clipData.Type, clipData.FileName)
 	}
+}
+
+func looksLikeEncryptedEnvelope(body string) bool {
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(body), &raw); err != nil {
+		return false
+	}
+	_, hasNonce := raw["nonce"]
+	_, hasCiphertext := raw["ciphertext"]
+	_, hasTag := raw["tag"]
+	return hasNonce && hasCiphertext && hasTag
 }

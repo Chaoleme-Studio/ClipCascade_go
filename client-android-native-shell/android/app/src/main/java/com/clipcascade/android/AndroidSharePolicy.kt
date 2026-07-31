@@ -1,7 +1,9 @@
 package com.clipcascade.android
 
 object AndroidSharePolicy {
-    const val MAX_DIRECT_BYTES: Long = 25L * 1024L * 1024L
+    const val MAX_EAGER_BYTES: Long = 8L * 1024L * 1024L
+    const val MAX_AUTO_RELAY_BYTES: Long = 25L * 1024L * 1024L
+    const val MAX_RELAY_BYTES: Long = 2L * 1024L * 1024L * 1024L
 
     fun classify(mimeType: String?, sizeBytes: Long?, hasStream: Boolean = false): ShareDecision {
         val normalizedType = mimeType?.trim().orEmpty()
@@ -9,16 +11,23 @@ object AndroidSharePolicy {
             return ShareDecision.DirectText
         }
         if (normalizedType.startsWith("image/")) {
-            return if (sizeBytes != null && sizeBytes > MAX_DIRECT_BYTES) {
+            return if (sizeBytes != null && sizeBytes > MAX_AUTO_RELAY_BYTES) {
                 ShareDecision.TooLarge
             } else {
                 ShareDecision.DirectImage
             }
         }
-        if (sizeBytes != null && sizeBytes > MAX_DIRECT_BYTES) {
+        if (sizeBytes != null && sizeBytes > MAX_RELAY_BYTES) {
             return ShareDecision.TooLarge
         }
-        return if (hasStream) ShareDecision.DirectFile else ShareDecision.UnsupportedFile
+        if (!hasStream) {
+            return ShareDecision.UnsupportedFile
+        }
+        return if (sizeBytes != null && sizeBytes > MAX_AUTO_RELAY_BYTES) {
+            ShareDecision.DeferredFile
+        } else {
+            ShareDecision.DirectFile
+        }
     }
 
     fun historyImageExtension(bytes: ByteArray): String {
@@ -64,6 +73,7 @@ enum class ShareDecision {
     DirectText,
     DirectImage,
     DirectFile,
+    DeferredFile,
     TooLarge,
     UnsupportedFile
 }

@@ -26,7 +26,7 @@ import (
 	"github.com/clipcascade/pkg/constants"
 )
 
-var Version = "2.0"
+var Version = "2.1"
 
 func main() {
 	serverURL := flag.String("server", "", "Server URL")

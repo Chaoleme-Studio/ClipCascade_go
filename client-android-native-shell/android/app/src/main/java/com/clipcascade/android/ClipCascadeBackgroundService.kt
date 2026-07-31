@@ -17,6 +17,7 @@ import android.os.Looper
 import android.util.Base64
 import android.util.Log
 import android.view.WindowManager
+import android.webkit.MimeTypeMap
 import android.widget.LinearLayout
 import androidx.core.content.ContextCompat
 import bridge.bridge.Bridge
@@ -25,6 +26,9 @@ import bridge.bridge.MessageCallback
 import java.io.File
 import java.io.FileOutputStream
 import java.util.UUID
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.Executors
+import java.util.concurrent.RejectedExecutionException
 
 class ClipCascadeBackgroundService : Service(), MessageCallback {
 
@@ -68,6 +72,16 @@ class ClipCascadeBackgroundService : Service(), MessageCallback {
     // 记录最后一次自己写入的记录，防止回环死循环同步
     @Volatile
     private var lastWrittenText: String? = null
+    private val activeDeferredUploads = ConcurrentHashMap.newKeySet<String>()
+    private val incomingPayloadExecutor = Executors.newSingleThreadExecutor()
+    private val deferredUploadExecutor = Executors.newSingleThreadExecutor()
+    private val apiSessionManager by lazy {
+        ApiSessionManager(
+            context = applicationContext,
+            normalizeServerUrl = { normalizeServerUrl(it) },
+            login = { serverURL, username, password -> loginForApi(serverURL, username, password) }
+        )
+    }
 
     override fun onCreate() {
         super.onCreate()
@@ -77,6 +91,7 @@ class ClipCascadeBackgroundService : Service(), MessageCallback {
         windowManager = getSystemService(Context.WINDOW_SERVICE) as WindowManager
         
         startForegroundService()
+        DeferredFileSourceStore.cleanupExpired(this)
         
         // 也可以在这里监听系统的剪贴板回调（虽然 Android 10+ 后台此回调无效，但在前台或悬浮窗期间生效）
         clipboardManager.addPrimaryClipChangedListener(onClipChangeListener)
@@ -149,12 +164,23 @@ class ClipCascadeBackgroundService : Service(), MessageCallback {
     /**
      * 将其他设备推过来的文本写入 Android 的剪贴板
      */
-    override fun onMessage(payload: String, payloadType: String) {
+    override fun onMessage(payload: String, payloadType: String, fileName: String) {
         Log.i(TAG, "📥 收到远端推送: [类型=$payloadType] 大小=${payload.length} chars")
         when (payloadType) {
             "text" -> mainHandler.post { handleIncomingText(payload) }
-            "image" -> Thread { handleIncomingImage(payload) }.start()
+            "image" -> queueIncomingPayload { handleIncomingImage(payload) }
+            "file_eager" -> queueIncomingPayload { handleIncomingEagerFile(payload, fileName) }
             "file_offer" -> mainHandler.post { handleIncomingFileOffer(payload) }
+            "file_request" -> queueDeferredFileRequest(payload)
+            else -> Log.d(TAG, "Android 不处理此剪贴板类型: $payloadType")
+        }
+    }
+
+    private fun queueIncomingPayload(action: () -> Unit) {
+        try {
+            incomingPayloadExecutor.execute(action)
+        } catch (_: RejectedExecutionException) {
+            Log.d(TAG, "后台服务正在停止，忽略待处理内容")
         }
     }
 
@@ -202,14 +228,151 @@ class ClipCascadeBackgroundService : Service(), MessageCallback {
         }
     }
 
+    private fun handleIncomingEagerFile(payload: String, originalFileName: String) {
+        try {
+            val fileName = safeFileName(originalFileName).ifBlank { "clipcascade-file" }
+            val file = EagerFileStore.saveBase64(this, payload, fileName)
+            ClipboardHistoryStore.replaceEagerFile(
+                context = this,
+                localFilePath = file.absolutePath,
+                fileName = fileName,
+                fileSize = file.length(),
+                mimeType = mimeTypeForFileName(fileName),
+                direction = "received"
+            )
+            notifyHistoryChanged()
+            Log.i(TAG, "✅ 已缓存远端小文件: $fileName (${file.length()} bytes)")
+        } catch (e: Exception) {
+            Log.e(TAG, "保存远端小文件失败: ${e.message}", e)
+        }
+    }
+
+    private fun mimeTypeForFileName(fileName: String): String {
+        val extension = fileName.substringAfterLast('.', "").lowercase()
+        return MimeTypeMap.getSingleton().getMimeTypeFromExtension(extension)
+            ?: "application/octet-stream"
+    }
+
     private fun handleIncomingFileOffer(payload: String) {
         try {
-            val fileName = org.json.JSONObject(payload).optString("file_name").ifBlank { "文件" }
-            ClipboardHistoryStore.append(this, "文件：$fileName", "received")
-            notifyHistoryChanged()
+            val fileName = appendFileOfferToHistory(payload, "received")
             Log.i(TAG, "✅ 已记录远端文件分享: $fileName")
         } catch (e: Exception) {
             Log.e(TAG, "处理远端文件分享失败", e)
+        }
+    }
+
+    private fun appendFileOfferToHistory(payload: String, direction: String): String {
+        val obj = org.json.JSONObject(payload)
+        val fileName = obj.optString("file_name").ifBlank { "clipcascade-file" }
+        ClipboardHistoryStore.appendFile(
+            context = this,
+            relayID = obj.optString("relay_id"),
+            fileName = fileName,
+            fileSize = obj.optLong("file_size", 0L),
+            mimeType = obj.optString("mime_type").ifBlank { "application/octet-stream" },
+            direction = direction
+        )
+        notifyHistoryChanged()
+        return fileName
+    }
+
+    private fun queueDeferredFileRequest(payload: String) {
+        val deferredID = try {
+            org.json.JSONObject(payload).optString("deferred_id").trim()
+        } catch (e: Exception) {
+            Log.w(TAG, "无法解析延迟文件请求", e)
+            return
+        }
+        if (deferredID.isBlank()) {
+            return
+        }
+        if (!activeDeferredUploads.add(deferredID)) {
+            Log.d(TAG, "延迟文件已排队或正在上传，忽略重复请求: $deferredID")
+            return
+        }
+        try {
+            deferredUploadExecutor.execute {
+                try {
+                    handleDeferredFileRequest(deferredID)
+                } finally {
+                    activeDeferredUploads.remove(deferredID)
+                }
+            }
+        } catch (_: RejectedExecutionException) {
+            activeDeferredUploads.remove(deferredID)
+            Log.d(TAG, "后台服务正在停止，忽略延迟文件请求: $deferredID")
+        }
+    }
+
+    private fun handleDeferredFileRequest(deferredID: String) {
+        val source = DeferredFileSourceStore.get(this, deferredID) ?: run {
+            Log.d(TAG, "本机没有延迟文件源，忽略请求: $deferredID")
+            return
+        }
+
+        try {
+            val file = File(source.path)
+            if (!file.isFile || file.length() != source.fileSize) {
+                DeferredFileSourceStore.remove(this, deferredID)
+                reportDeferredFailure(deferredID, "source file is no longer available")
+                return
+            }
+            val prefs = getSharedPreferences("clipcascade", Context.MODE_PRIVATE)
+            val serverURL = normalizeServerUrl(prefs.getString("ServerURL", "") ?: "")
+            val username = prefs.getString("Username", "")?.trim().orEmpty()
+            val password = prefs.getString("Password", "").orEmpty()
+            if (serverURL.isBlank() || username.isBlank() || password.isBlank()) {
+                throw IllegalStateException("服务器账号未配置")
+            }
+
+            updateStatus("uploading", "正在上传：${source.fileName}")
+            apiSessionManager.withSession(serverURL, username, password) { cookie ->
+                markDeferredFileUploading(serverURL, cookie, deferredID, 0L)
+            }
+            var lastProgressAt = 0L
+            val result = apiSessionManager.withSession(serverURL, username, password) { cookie ->
+                uploadRelayFile(serverURL, cookie, file, source.fileName, source.mimeType) { sent, total ->
+                    val now = System.currentTimeMillis()
+                    if (now - lastProgressAt >= 1000L || sent == total) {
+                        val percent = if (total > 0L) ((sent.coerceAtMost(total) * 100L) / total).toInt() else 0
+                        updateNotificationContent("正在上传 ${source.fileName}：$percent%")
+                        try {
+                            markDeferredFileUploading(serverURL, cookie, deferredID, sent)
+                            lastProgressAt = now
+                        } catch (e: Exception) {
+                            Log.w(TAG, "回报延迟文件上传进度失败: $deferredID", e)
+                        }
+                    }
+                }
+            }
+            apiSessionManager.withSession(serverURL, username, password) { cookie ->
+                markDeferredFileReady(serverURL, cookie, deferredID, result.relayID)
+            }
+            DeferredFileSourceStore.remove(this, deferredID)
+            updateStatus("connected", "大文件已上传，可供其他设备下载")
+            Log.i(TAG, "延迟文件上传完成: id=$deferredID relay=${result.relayID} name=${result.fileName}")
+        } catch (e: Exception) {
+            Log.e(TAG, "延迟文件上传失败: $deferredID", e)
+            reportDeferredFailure(deferredID, e.message ?: "Android source upload failed")
+            updateStatus("error", "大文件上传失败：${e.message}")
+        }
+    }
+
+    private fun reportDeferredFailure(deferredID: String, message: String) {
+        val prefs = getSharedPreferences("clipcascade", Context.MODE_PRIVATE)
+        val serverURL = normalizeServerUrl(prefs.getString("ServerURL", "") ?: "")
+        val username = prefs.getString("Username", "")?.trim().orEmpty()
+        val password = prefs.getString("Password", "").orEmpty()
+        if (serverURL.isBlank() || username.isBlank() || password.isBlank()) {
+            return
+        }
+        try {
+            apiSessionManager.withSession(serverURL, username, password) { cookie ->
+                markDeferredFileFailed(serverURL, cookie, deferredID, message)
+            }
+        } catch (reportError: Exception) {
+            Log.w(TAG, "回报延迟文件失败状态失败: $deferredID", reportError)
         }
     }
 
@@ -294,9 +457,7 @@ class ClipCascadeBackgroundService : Service(), MessageCallback {
                         }
                     }
                 } else if (payloadType == "file_offer") {
-                    val fileName = org.json.JSONObject(payload).optString("file_name").ifBlank { "文件" }
-                    ClipboardHistoryStore.append(this, "文件：$fileName", "sent")
-                    notifyHistoryChanged()
+                    appendFileOfferToHistory(payload, "sent")
                 }
                 val label = when (payloadType) {
                     "image" -> "图片"
@@ -531,6 +692,8 @@ class ClipCascadeBackgroundService : Service(), MessageCallback {
         } catch (_: Exception) {
         }
         engine = null
+        incomingPayloadExecutor.shutdownNow()
+        deferredUploadExecutor.shutdownNow()
         removeInvisibleOverlay()
         
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {

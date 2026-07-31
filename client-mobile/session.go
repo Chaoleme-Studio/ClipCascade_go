@@ -155,7 +155,7 @@ func (s *Session) DeviceCounts() (DeviceCounts, error) {
 	return DeviceCounts{OnlineDevices: online, SyncTargets: targets}, nil
 }
 
-func (s *Session) OnMessage(payload string, payloadType string) {
+func (s *Session) OnMessage(payload string, payloadType string, _ string) {
 	if payloadType == "text" {
 		fyne.Do(func() {
 			s.mu.Lock()

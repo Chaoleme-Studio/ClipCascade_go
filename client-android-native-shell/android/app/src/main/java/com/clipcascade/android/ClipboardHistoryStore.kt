@@ -9,7 +9,12 @@ data class ClipboardHistoryItem(
     val type: String,
     val direction: String,
     val timestamp: Long,
-    val imagePath: String? = null
+    val imagePath: String? = null,
+    val fileName: String? = null,
+    val relayID: String? = null,
+    val localFilePath: String? = null,
+    val fileSize: Long = 0L,
+    val mimeType: String? = null
 )
 
 object ClipboardHistoryStore {
@@ -47,6 +52,68 @@ object ClipboardHistoryStore {
         appendItem(context, item)
     }
 
+    fun appendFile(
+        context: Context,
+        relayID: String,
+        fileName: String,
+        fileSize: Long,
+        mimeType: String,
+        direction: String
+    ) {
+        val normalizedID = relayID.trim()
+        val normalizedName = safeFileName(fileName)
+        if (normalizedID.isBlank() || normalizedName.isBlank()) {
+            return
+        }
+        val item = JSONObject()
+            .put("text", normalizedName)
+            .put("type", "file")
+            .put("relay_id", normalizedID)
+            .put("file_name", normalizedName)
+            .put("file_size", fileSize.coerceAtLeast(0L))
+            .put("mime_type", mimeType.ifBlank { "application/octet-stream" })
+            .put("direction", direction)
+            .put("timestamp", System.currentTimeMillis())
+
+        appendItem(context, item)
+    }
+
+    @Synchronized
+    fun replaceEagerFile(
+        context: Context,
+        localFilePath: String,
+        fileName: String,
+        fileSize: Long,
+        mimeType: String,
+        direction: String
+    ) {
+        val normalizedPath = localFilePath.trim()
+        val normalizedName = safeFileName(fileName)
+        if (normalizedPath.isBlank() || normalizedName.isBlank()) return
+
+        val item = JSONObject()
+            .put("text", normalizedName)
+            .put("type", "file")
+            .put("local_file_path", normalizedPath)
+            .put("file_name", normalizedName)
+            .put("file_size", fileSize.coerceAtLeast(0L))
+            .put("mime_type", mimeType.ifBlank { "application/octet-stream" })
+            .put("direction", direction)
+            .put("timestamp", System.currentTimeMillis())
+
+        val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        val current = readJsonArray(prefs.getString(KEY_HISTORY, "[]"))
+        val next = JSONArray().put(item)
+        for (i in 0 until current.length()) {
+            if (next.length() >= MAX_ITEMS) break
+            val previous = current.optJSONObject(i) ?: continue
+            if (previous.optString("local_file_path").isNotBlank()) continue
+            next.put(previous)
+        }
+        prefs.edit().putString(KEY_HISTORY, next.toString()).apply()
+    }
+
+    @Synchronized
     private fun appendItem(context: Context, item: JSONObject) {
         val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
         val arr = readJsonArray(prefs.getString(KEY_HISTORY, "[]"))
@@ -61,6 +128,7 @@ object ClipboardHistoryStore {
                 last.optString("type", "text") == type &&
                 last.optString("text") == text &&
                 last.optString("image_path") == item.optString("image_path") &&
+                last.optString("relay_id") == item.optString("relay_id") &&
                 last.optString("direction") == direction
             ) {
                 return
@@ -96,7 +164,12 @@ object ClipboardHistoryStore {
                     type = item.optString("type", "text"),
                     direction = item.optString("direction", "sent"),
                     timestamp = item.optLong("timestamp", 0L),
-                    imagePath = item.optString("image_path").ifBlank { null }
+                    imagePath = item.optString("image_path").ifBlank { null },
+                    fileName = item.optString("file_name").ifBlank { null },
+                    relayID = item.optString("relay_id").ifBlank { null },
+                    localFilePath = item.optString("local_file_path").ifBlank { null },
+                    fileSize = item.optLong("file_size", 0L),
+                    mimeType = item.optString("mime_type").ifBlank { null }
                 )
             )
         }
@@ -106,6 +179,7 @@ object ClipboardHistoryStore {
     fun clear(context: Context) {
         val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
         prefs.edit().putString(KEY_HISTORY, "[]").apply()
+        EagerFileStore.clear(context)
     }
 
     private fun readJsonArray(raw: String?): JSONArray {

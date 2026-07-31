@@ -5,18 +5,34 @@ import org.junit.Test
 
 class AndroidSharePolicyTest {
     @Test
-    fun allowsTextAndSmallImagesForDirectClipboardSync() {
-        assertEquals(ShareDecision.DirectText, AndroidSharePolicy.classify("text/plain", null))
-        assertEquals(ShareDecision.DirectImage, AndroidSharePolicy.classify("image/png", 1024))
-        assertEquals(ShareDecision.DirectImage, AndroidSharePolicy.classify("image/jpeg", AndroidSharePolicy.MAX_DIRECT_BYTES))
+    fun matchesDesktopFileThresholds() {
+        assertEquals(8L * 1024L * 1024L, AndroidSharePolicy.MAX_EAGER_BYTES)
+        assertEquals(25L * 1024L * 1024L, AndroidSharePolicy.MAX_AUTO_RELAY_BYTES)
+        assertEquals(2L * 1024L * 1024L * 1024L, AndroidSharePolicy.MAX_RELAY_BYTES)
     }
 
     @Test
-    fun rejectsOversizedImagesAndFiles() {
-        val oversized = AndroidSharePolicy.MAX_DIRECT_BYTES + 1
+    fun allowsTextAndSmallImagesForDirectClipboardSync() {
+        assertEquals(ShareDecision.DirectText, AndroidSharePolicy.classify("text/plain", null))
+        assertEquals(ShareDecision.DirectImage, AndroidSharePolicy.classify("image/png", 1024))
+        assertEquals(ShareDecision.DirectImage, AndroidSharePolicy.classify("image/jpeg", AndroidSharePolicy.MAX_AUTO_RELAY_BYTES))
+    }
+
+    @Test
+    fun keepsImagesInlineAndDefersLargeFiles() {
+        val oversized = AndroidSharePolicy.MAX_AUTO_RELAY_BYTES + 1
 
         assertEquals(ShareDecision.TooLarge, AndroidSharePolicy.classify("image/png", oversized))
-        assertEquals(ShareDecision.TooLarge, AndroidSharePolicy.classify("application/pdf", oversized))
+        assertEquals(ShareDecision.DeferredFile, AndroidSharePolicy.classify("application/pdf", oversized, hasStream = true))
+        assertEquals(ShareDecision.DeferredFile, AndroidSharePolicy.classify("video/mp4", AndroidSharePolicy.MAX_RELAY_BYTES, hasStream = true))
+    }
+
+    @Test
+    fun rejectsFilesAboveRelayLimit() {
+        assertEquals(
+            ShareDecision.TooLarge,
+            AndroidSharePolicy.classify("video/mp4", AndroidSharePolicy.MAX_RELAY_BYTES + 1, hasStream = true)
+        )
     }
 
     @Test

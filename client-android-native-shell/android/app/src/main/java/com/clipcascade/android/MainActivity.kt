@@ -14,6 +14,9 @@ import android.graphics.Bitmap
 import android.graphics.Color
 import android.graphics.BitmapFactory
 import android.graphics.drawable.ColorDrawable
+import android.net.ConnectivityManager
+import android.net.LinkProperties
+import android.net.Network
 import android.net.Uri
 import android.net.nsd.NsdManager
 import android.net.nsd.NsdServiceInfo
@@ -32,6 +35,7 @@ import android.view.Window
 import android.widget.Button
 import android.widget.CheckBox
 import android.widget.EditText
+import android.widget.ImageButton
 import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.PopupMenu
@@ -40,22 +44,43 @@ import android.widget.TextView
 import android.widget.Toast
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
-import androidx.core.content.FileProvider
 import com.google.android.material.button.MaterialButton
 import com.google.android.material.card.MaterialCardView
 import java.io.File
+import java.util.ArrayDeque
+import java.util.LinkedHashMap
 import java.util.LinkedHashSet
 
 class MainActivity : Activity() {
 
     private val tag = "ClipCascade_UI"
     private val reqPostNotifications = 1002
+    private val reqWriteDownloads = 1003
     private val uiHandler = Handler(Looper.getMainLooper())
+    private var pendingDownloadAction: (() -> Unit)? = null
 
     private var nsdManager: NsdManager? = null
     private var discoveryListener: NsdManager.DiscoveryListener? = null
     private val discoveredServers = LinkedHashSet<String>()
+    private val discoveredServiceUrls = LinkedHashMap<String, String>()
+    private val pendingServiceResolutions = ArrayDeque<NsdServiceInfo>()
+    private var discoveryGeneration = 0
+    private var discoveryRunning = false
+    private var discoveryRestartPending = false
+    private var discoveryUiScanning = false
+    private var openDiscoveryMenuWhenReady = false
+    private var resolveInFlight = false
+    private var activityResumed = false
+    private var connectivityManager: ConnectivityManager? = null
+    private var connectivityCallback: ConnectivityManager.NetworkCallback? = null
+    private var activeNetwork: Network? = null
+    private var activeNetworkFingerprint = ""
+    private var discoveryRestartTask: Runnable? = null
+    private var discoveryUiTimeoutTask: Runnable? = null
+    private var discoveryMenuTask: Runnable? = null
 
+    private lateinit var serverAddressInput: EditText
+    private lateinit var discoverButton: MaterialButton
     private lateinit var clipboardList: LinearLayout
     private lateinit var deferredFileListView: LinearLayout
     private lateinit var clipboardTabButton: MaterialButton
@@ -142,7 +167,7 @@ class MainActivity : Activity() {
             setPadding(0, dp(4), 0, dp(18))
         }
 
-        val serverInput = EditText(this).apply {
+        serverAddressInput = EditText(this).apply {
             hint = "服务器地址，例如 http://192.168.1.8:8080"
             setText(normalizeServerUrl(prefs.getString("ServerURL", "") ?: ""))
             setSingleLine(true)
@@ -151,21 +176,19 @@ class MainActivity : Activity() {
             setHintTextColor(color(R.color.cc_text_secondary))
             layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
         }
-        val discoverMenuBtn = MaterialButton(this).apply {
+        discoverButton = MaterialButton(this).apply {
             text = "发现"
             minWidth = dp(72)
-            setOnClickListener { showDiscoveredServersMenu(this, serverInput) }
-            setOnLongClickListener {
-                restartServerDiscovery(serverInput, this)
+            setOnClickListener {
+                restartServerDiscovery(serverAddressInput, this, showMenuWhenFound = true)
                 Toast.makeText(this@MainActivity, "正在重新发现局域网服务", Toast.LENGTH_SHORT).show()
-                true
             }
         }
         val serverRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            addView(serverInput)
-            addView(discoverMenuBtn)
+            addView(serverAddressInput)
+            addView(discoverButton)
         }
 
         val userInput = EditText(this).apply {
@@ -193,7 +216,7 @@ class MainActivity : Activity() {
         val btnSaveCfg = MaterialButton(this).apply {
             text = "保存配置"
             setOnClickListener {
-                saveConfig(prefs, serverInput, userInput, passInput, e2eeCheck)
+                saveConfig(prefs, serverAddressInput, userInput, passInput, e2eeCheck)
                 Toast.makeText(this@MainActivity, "配置已保存", Toast.LENGTH_SHORT).show()
             }
         }
@@ -201,7 +224,7 @@ class MainActivity : Activity() {
         val btnStartSvc = MaterialButton(this).apply {
             text = "重连同步服务"
             setOnClickListener {
-                saveConfig(prefs, serverInput, userInput, passInput, e2eeCheck)
+                saveConfig(prefs, serverAddressInput, userInput, passInput, e2eeCheck)
                 restartCoreService()
             }
         }
@@ -346,8 +369,6 @@ class MainActivity : Activity() {
 
         setContentView(root)
 
-        addDiscoveredServer(normalizeServerUrl(prefs.getString("ServerURL", "") ?: ""), serverInput, discoverMenuBtn)
-        startServerDiscovery(serverInput, discoverMenuBtn)
         refreshConnectionStatus()
         refreshPermissionStatus()
         refreshHistoryList()
@@ -368,35 +389,49 @@ class MainActivity : Activity() {
         setIntent(intent)
     }
 
+    override fun onRequestPermissionsResult(
+        requestCode: Int,
+        permissions: Array<out String>,
+        grantResults: IntArray
+    ) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode != reqWriteDownloads) {
+            return
+        }
+        val action = pendingDownloadAction
+        pendingDownloadAction = null
+        if (grantResults.firstOrNull() == PackageManager.PERMISSION_GRANTED) {
+            action?.invoke()
+        } else {
+            Toast.makeText(this, "需要存储权限才能保存到 Download", Toast.LENGTH_LONG).show()
+        }
+    }
+
     override fun onResume() {
         super.onResume()
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            registerReceiver(
-                statusReceiver,
-                IntentFilter().apply {
-                    addAction(ClipCascadeBackgroundService.ACTION_STATUS_CHANGED)
-                    addAction(ClipCascadeBackgroundService.ACTION_HISTORY_CHANGED)
-                },
-                Context.RECEIVER_NOT_EXPORTED
-            )
-        } else {
-            @Suppress("DEPRECATION")
-            registerReceiver(
-                statusReceiver,
-                IntentFilter().apply {
-                    addAction(ClipCascadeBackgroundService.ACTION_STATUS_CHANGED)
-                    addAction(ClipCascadeBackgroundService.ACTION_HISTORY_CHANGED)
-                }
-            )
-        }
+        activityResumed = true
+        ContextCompat.registerReceiver(
+            this,
+            statusReceiver,
+            IntentFilter().apply {
+                addAction(ClipCascadeBackgroundService.ACTION_STATUS_CHANGED)
+                addAction(ClipCascadeBackgroundService.ACTION_HISTORY_CHANGED)
+            },
+            ContextCompat.RECEIVER_NOT_EXPORTED
+        )
         refreshConnectionStatus()
         refreshHistoryList()
         refreshPermissionStatus()
         refreshDeviceStatus()
         startDeferredRefreshLoop()
+        registerConnectivityMonitoring()
     }
 
     override fun onPause() {
+        activityResumed = false
+        unregisterConnectivityMonitoring()
+        cancelDiscoveryCallbacks()
+        stopServerDiscovery()
         stopDeferredRefreshLoop()
         try {
             unregisterReceiver(statusReceiver)
@@ -406,6 +441,7 @@ class MainActivity : Activity() {
     }
 
     override fun onDestroy() {
+        cancelDiscoveryCallbacks()
         stopServerDiscovery()
         stopDeferredRefreshLoop()
         super.onDestroy()
@@ -666,115 +702,347 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun startServerDiscovery(serverInput: EditText, discoverMenuBtn: Button) {
-        stopServerDiscovery()
-        nsdManager = getSystemService(Context.NSD_SERVICE) as? NsdManager ?: return
+    private fun registerConnectivityMonitoring() {
+        if (connectivityCallback != null) return
+        val manager = getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager ?: run {
+            restartServerDiscovery(serverAddressInput, discoverButton)
+            return
+        }
+        connectivityManager = manager
+        activeNetwork = manager.activeNetwork
+        activeNetworkFingerprint = networkFingerprint(
+            activeNetwork,
+            activeNetwork?.let(manager::getLinkProperties)
+        )
+
+        val callback = object : ConnectivityManager.NetworkCallback() {
+            override fun onAvailable(network: Network) {
+                val properties = manager.getLinkProperties(network)
+                uiHandler.post { handleNetworkChanged(network, properties) }
+            }
+
+            override fun onLinkPropertiesChanged(network: Network, linkProperties: LinkProperties) {
+                uiHandler.post { handleNetworkChanged(network, linkProperties) }
+            }
+
+            override fun onLost(network: Network) {
+                uiHandler.post {
+                    if (network == activeNetwork) {
+                        activeNetwork = manager.activeNetwork
+                        activeNetworkFingerprint = networkFingerprint(
+                            activeNetwork,
+                            activeNetwork?.let(manager::getLinkProperties)
+                        )
+                        scheduleDiscoveryRestart()
+                    }
+                }
+            }
+        }
+        connectivityCallback = callback
+        try {
+            manager.registerDefaultNetworkCallback(callback)
+        } catch (e: Exception) {
+            connectivityCallback = null
+            Log.w(tag, "无法监听网络变化，局域网发现仍可手动刷新", e)
+        }
+        scheduleDiscoveryRestart(delayMillis = 0L)
+    }
+
+    private fun unregisterConnectivityMonitoring() {
+        val manager = connectivityManager
+        val callback = connectivityCallback
+        if (manager != null && callback != null) {
+            try {
+                manager.unregisterNetworkCallback(callback)
+            } catch (_: Exception) {
+            }
+        }
+        connectivityCallback = null
+        discoveryRestartTask?.let(uiHandler::removeCallbacks)
+        discoveryRestartTask = null
+    }
+
+    private fun handleNetworkChanged(network: Network, linkProperties: LinkProperties?) {
+        val fingerprint = networkFingerprint(network, linkProperties)
+        if (network == activeNetwork && fingerprint == activeNetworkFingerprint) return
+        activeNetwork = network
+        activeNetworkFingerprint = fingerprint
+        Log.i(tag, "局域网地址发生变化，重新发现服务: $fingerprint")
+        scheduleDiscoveryRestart()
+    }
+
+    private fun networkFingerprint(network: Network?, linkProperties: LinkProperties?): String {
+        if (network == null) return ""
+        val addresses = linkProperties?.linkAddresses
+            ?.map { it.address.hostAddress.orEmpty() }
+            ?.sorted()
+            ?.joinToString(",")
+            .orEmpty()
+        return "${network}|${linkProperties?.interfaceName.orEmpty()}|$addresses"
+    }
+
+    private fun scheduleDiscoveryRestart(delayMillis: Long = 500L) {
+        discoveryRestartTask?.let(uiHandler::removeCallbacks)
+        val task = Runnable {
+            discoveryRestartTask = null
+            if (activityResumed) {
+                restartServerDiscovery(serverAddressInput, discoverButton)
+            }
+        }
+        discoveryRestartTask = task
+        uiHandler.postDelayed(task, delayMillis)
+    }
+
+    private fun restartServerDiscovery(
+        serverInput: EditText,
+        discoverMenuBtn: Button,
+        showMenuWhenFound: Boolean = false
+    ) {
+        discoveryGeneration++
+        discoveryRestartPending = false
+        resolveInFlight = false
+        pendingServiceResolutions.clear()
+        synchronized(discoveredServers) {
+            discoveredServers.clear()
+            discoveredServiceUrls.clear()
+        }
+        openDiscoveryMenuWhenReady = showMenuWhenFound
+        discoveryUiScanning = true
+        updateDiscoverButton(discoverMenuBtn)
+        scheduleDiscoveryTimeout(discoverMenuBtn)
+
+        if (discoveryListener != null) {
+            discoveryRestartPending = true
+            stopServerDiscovery(restartAfterStop = true)
+            return
+        }
+        startServerDiscovery(serverInput, discoverMenuBtn, discoveryGeneration)
+    }
+
+    private fun startServerDiscovery(serverInput: EditText, discoverMenuBtn: Button, generation: Int) {
+        if (!activityResumed || generation != discoveryGeneration) return
+        val manager = (getSystemService(Context.NSD_SERVICE) as? NsdManager) ?: run {
+            discoveryUiScanning = false
+            updateDiscoverButton(discoverMenuBtn)
+            return
+        }
+        nsdManager = manager
 
         val listener = object : NsdManager.DiscoveryListener {
             override fun onDiscoveryStarted(serviceType: String) {
+                if (generation != discoveryGeneration) return
+                discoveryRunning = true
                 Log.i(tag, "mDNS discovery started: $serviceType")
             }
 
             override fun onStartDiscoveryFailed(serviceType: String, errorCode: Int) {
                 Log.w(tag, "mDNS discovery failed to start: $errorCode")
+                if (generation != discoveryGeneration) return
+                discoveryListener = null
+                discoveryRunning = false
+                discoveryUiScanning = false
+                updateDiscoverButton(discoverMenuBtn)
+                if (openDiscoveryMenuWhenReady && activityResumed) {
+                    openDiscoveryMenuWhenReady = false
+                    Toast.makeText(this@MainActivity, "局域网扫描启动失败，请重试", Toast.LENGTH_SHORT).show()
+                }
             }
 
             override fun onStopDiscoveryFailed(serviceType: String, errorCode: Int) {
                 Log.w(tag, "mDNS discovery failed to stop: $errorCode")
+                finishDiscoveryStop(this)
             }
 
             override fun onDiscoveryStopped(serviceType: String) {
                 Log.i(tag, "mDNS discovery stopped: $serviceType")
+                finishDiscoveryStop(this)
             }
 
             override fun onServiceLost(serviceInfo: NsdServiceInfo) {
-                Log.d(tag, "mDNS service lost: ${serviceInfo.serviceName}")
+                if (generation != discoveryGeneration) return
+                val changed = synchronized(discoveredServers) {
+                    val oldUrl = discoveredServiceUrls.remove(serviceInfo.serviceName)
+                    oldUrl != null && !discoveredServiceUrls.containsValue(oldUrl) && discoveredServers.remove(oldUrl)
+                }
+                if (changed) updateDiscoverButton(discoverMenuBtn)
             }
 
             override fun onServiceFound(serviceInfo: NsdServiceInfo) {
                 val serviceType = serviceInfo.serviceType ?: return
-                if (!serviceType.equals("_clipcascade._tcp.", ignoreCase = true)) {
+                if (generation != discoveryGeneration ||
+                    !serviceType.equals("_clipcascade._tcp.", ignoreCase = true)
+                ) {
                     return
                 }
-                nsdManager?.resolveService(serviceInfo, object : NsdManager.ResolveListener {
-                    override fun onResolveFailed(info: NsdServiceInfo, errorCode: Int) {
-                        Log.d(tag, "mDNS resolve failed: $errorCode")
-                    }
-
-                    override fun onServiceResolved(info: NsdServiceInfo) {
-                        val host = info.host?.hostAddress ?: info.host?.hostName ?: return
-                        val url = buildHttpUrl(host, info.port)
-                        addDiscoveredServer(url, serverInput, discoverMenuBtn)
-                    }
-                })
+                if (discoveredServiceUrls.containsKey(serviceInfo.serviceName) ||
+                    pendingServiceResolutions.any { it.serviceName == serviceInfo.serviceName }
+                ) {
+                    return
+                }
+                pendingServiceResolutions.addLast(serviceInfo)
+                resolveNextService(serverInput, discoverMenuBtn, generation)
             }
         }
 
         discoveryListener = listener
         try {
-            nsdManager?.discoverServices("_clipcascade._tcp.", NsdManager.PROTOCOL_DNS_SD, listener)
+            manager.discoverServices("_clipcascade._tcp.", NsdManager.PROTOCOL_DNS_SD, listener)
         } catch (e: Exception) {
+            discoveryListener = null
+            discoveryUiScanning = false
+            updateDiscoverButton(discoverMenuBtn)
             Log.w(tag, "mDNS discover start failed", e)
         }
     }
 
-    private fun restartServerDiscovery(serverInput: EditText, discoverMenuBtn: Button) {
-        synchronized(discoveredServers) {
-            discoveredServers.clear()
+    @Suppress("DEPRECATION")
+    private fun resolveNextService(serverInput: EditText, discoverMenuBtn: Button, generation: Int) {
+        if (resolveInFlight || generation != discoveryGeneration) return
+        val serviceInfo = pendingServiceResolutions.pollFirst() ?: return
+        val manager = nsdManager ?: return
+        resolveInFlight = true
+        try {
+            manager.resolveService(serviceInfo, object : NsdManager.ResolveListener {
+                override fun onResolveFailed(info: NsdServiceInfo, errorCode: Int) {
+                    uiHandler.post {
+                        if (generation != discoveryGeneration) return@post
+                        resolveInFlight = false
+                        Log.d(tag, "mDNS resolve failed: $errorCode")
+                        resolveNextService(serverInput, discoverMenuBtn, generation)
+                    }
+                }
+
+                override fun onServiceResolved(info: NsdServiceInfo) {
+                    uiHandler.post {
+                        if (generation != discoveryGeneration) return@post
+                        resolveInFlight = false
+                        val host = info.host?.hostAddress ?: info.host?.hostName
+                        if (!host.isNullOrBlank()) {
+                            addDiscoveredServer(
+                                url = buildHttpUrl(host, info.port),
+                                serviceName = info.serviceName,
+                                serverInput = serverInput,
+                                discoverMenuBtn = discoverMenuBtn
+                            )
+                        }
+                        resolveNextService(serverInput, discoverMenuBtn, generation)
+                    }
+                }
+            })
+        } catch (e: Exception) {
+            resolveInFlight = false
+            Log.d(tag, "mDNS resolve failed to run", e)
+            resolveNextService(serverInput, discoverMenuBtn, generation)
         }
-        updateDiscoverButton(discoverMenuBtn)
-        addDiscoveredServer(serverInput.text?.toString()?.trim().orEmpty(), serverInput, discoverMenuBtn)
-        startServerDiscovery(serverInput, discoverMenuBtn)
     }
 
-    private fun stopServerDiscovery() {
-        val manager = nsdManager ?: return
-        val listener = discoveryListener ?: return
+    private fun stopServerDiscovery(restartAfterStop: Boolean = false) {
+        discoveryRestartPending = discoveryRestartPending || restartAfterStop
+        val manager = nsdManager
+        val listener = discoveryListener
+        if (manager == null || listener == null) {
+            if (discoveryRestartPending && activityResumed) {
+                discoveryRestartPending = false
+                startServerDiscovery(serverAddressInput, discoverButton, discoveryGeneration)
+            }
+            return
+        }
         try {
             manager.stopServiceDiscovery(listener)
-        } catch (_: Exception) {
-        } finally {
-            discoveryListener = null
+        } catch (e: Exception) {
+            Log.d(tag, "mDNS stop failed", e)
+            finishDiscoveryStop(listener)
         }
     }
 
-    private fun addDiscoveredServer(url: String, serverInput: EditText, discoverMenuBtn: Button) {
-        val normalized = url.trim()
-        if (normalized.isBlank() || !isUsableDiscoveryUrl(normalized)) {
-            return
+    private fun finishDiscoveryStop(listener: NsdManager.DiscoveryListener) {
+        if (discoveryListener !== listener) return
+        discoveryListener = null
+        discoveryRunning = false
+        resolveInFlight = false
+        pendingServiceResolutions.clear()
+        if (discoveryRestartPending && activityResumed) {
+            discoveryRestartPending = false
+            uiHandler.postDelayed({
+                startServerDiscovery(serverAddressInput, discoverButton, discoveryGeneration)
+            }, 200L)
         }
+    }
+
+    private fun addDiscoveredServer(
+        url: String,
+        serviceName: String,
+        serverInput: EditText,
+        discoverMenuBtn: Button
+    ) {
+        val normalized = url.trim()
+        if (normalized.isBlank() || !isUsableDiscoveryUrl(normalized)) return
         val added = synchronized(discoveredServers) {
+            val oldUrl = discoveredServiceUrls.put(serviceName, normalized)
+            if (oldUrl != null && oldUrl != normalized && !discoveredServiceUrls.containsValue(oldUrl)) {
+                discoveredServers.remove(oldUrl)
+            }
             discoveredServers.add(normalized)
         }
-        if (!added) {
-            return
+        updateDiscoverButton(discoverMenuBtn)
+        val current = serverInput.text?.toString()?.trim().orEmpty()
+        if (current.isBlank() || current == "http://localhost:8080" || !isUsableDiscoveryUrl(current)) {
+            serverInput.setText(normalized)
         }
-        runOnUiThread {
+        if (added && openDiscoveryMenuWhenReady) {
+            openDiscoveryMenuWhenReady = false
+            discoveryMenuTask?.let(uiHandler::removeCallbacks)
+            val task = Runnable {
+                discoveryMenuTask = null
+                if (activityResumed) showDiscoveredServersMenu(discoverMenuBtn, serverInput)
+            }
+            discoveryMenuTask = task
+            uiHandler.postDelayed(task, 600L)
+        }
+    }
+
+    private fun scheduleDiscoveryTimeout(discoverMenuBtn: Button) {
+        discoveryUiTimeoutTask?.let(uiHandler::removeCallbacks)
+        val task = Runnable {
+            discoveryUiTimeoutTask = null
+            discoveryUiScanning = false
             updateDiscoverButton(discoverMenuBtn)
-            val current = serverInput.text?.toString()?.trim().orEmpty()
-            if (current.isBlank() || current == "http://localhost:8080" || !isUsableDiscoveryUrl(current)) {
-                serverInput.setText(normalized)
+            if (openDiscoveryMenuWhenReady) {
+                openDiscoveryMenuWhenReady = false
+                Toast.makeText(this, "未发现局域网中的 ClipCascade 服务", Toast.LENGTH_SHORT).show()
             }
         }
+        discoveryUiTimeoutTask = task
+        uiHandler.postDelayed(task, 5000L)
+    }
+
+    private fun cancelDiscoveryCallbacks() {
+        discoveryRestartTask?.let(uiHandler::removeCallbacks)
+        discoveryUiTimeoutTask?.let(uiHandler::removeCallbacks)
+        discoveryMenuTask?.let(uiHandler::removeCallbacks)
+        discoveryRestartTask = null
+        discoveryUiTimeoutTask = null
+        discoveryMenuTask = null
+        discoveryUiScanning = false
+        openDiscoveryMenuWhenReady = false
     }
 
     private fun updateDiscoverButton(btn: Button) {
         val count = synchronized(discoveredServers) { discoveredServers.size }
-        btn.text = if (count > 0) "发现($count)" else "发现"
-        btn.isEnabled = count > 0
+        btn.text = when {
+            discoveryUiScanning && count > 0 -> "扫描中($count)"
+            discoveryUiScanning -> "扫描中"
+            count > 0 -> "发现($count)"
+            else -> "发现"
+        }
+        btn.isEnabled = true
     }
 
     private fun showDiscoveredServersMenu(anchor: Button, serverInput: EditText) {
         val options = synchronized(discoveredServers) { discoveredServers.toList().sortedWith(discoveryUrlComparator) }
-        if (options.isEmpty()) {
-            restartServerDiscovery(serverInput, anchor)
-            Toast.makeText(this, "正在发现局域网服务，请稍后再点", Toast.LENGTH_SHORT).show()
-            return
-        }
+        if (options.isEmpty()) return
         val menu = PopupMenu(this, anchor)
-        options.forEachIndexed { index, url ->
-            menu.menu.add(0, index, index, url)
-        }
+        options.forEachIndexed { index, url -> menu.menu.add(0, index, index, url) }
         menu.setOnMenuItemClickListener { item ->
             val selected = options.getOrNull(item.itemId) ?: return@setOnMenuItemClickListener false
             serverInput.setText(selected)
@@ -845,7 +1113,11 @@ class MainActivity : Activity() {
                 "最近事件：暂无同步记录"
             } else {
                 val direction = if (latest.direction == "received") "接收" else "发送"
-                val type = if (latest.type == "image") "图片" else "文本"
+                val type = when (latest.type) {
+                    "image" -> "图片"
+                    "file" -> "文件"
+                    else -> "文本"
+                }
                 "最近事件：$direction$type ${formatTime(latest.timestamp)}"
             }
         }
@@ -902,6 +1174,17 @@ class MainActivity : Activity() {
     }
 
     private fun handleDeferredFileClick(item: DeferredFileItem) {
+        downloadedUriFor(item)?.let { uri ->
+            openDownloadedFile(uri, item.mimeType, item.fileName)
+            return
+        }
+        val downloadKey = item.relayID.ifBlank { item.deferredID }
+        legacyDownloadedFileForKey(downloadKey)?.let { oldFile ->
+            withDownloadsPermission {
+                migrateLegacyDownload(item, downloadKey, oldFile)
+            }
+            return
+        }
         val prefs = getSharedPreferences("clipcascade", Context.MODE_PRIVATE)
         val serverURL = normalizeServerUrl(prefs.getString("ServerURL", "") ?: "")
         val username = prefs.getString("Username", "")?.trim().orEmpty()
@@ -910,32 +1193,74 @@ class MainActivity : Activity() {
             Toast.makeText(this, "请先保存服务器账号", Toast.LENGTH_SHORT).show()
             return
         }
-        Toast.makeText(this, "正在处理文件：${item.fileName}", Toast.LENGTH_SHORT).show()
+        if (item.status == "ready" && item.downloadURL.isNotBlank()) {
+            withDownloadsPermission {
+                downloadReadyDeferredFile(item, serverURL, username, password)
+            }
+            return
+        }
+        Toast.makeText(this, "正在请求文件：${item.fileName}", Toast.LENGTH_SHORT).show()
         Thread {
             try {
-                if (item.status == "ready" && item.downloadURL.isNotBlank()) {
-                    val file = apiSessionManager.withSession(serverURL, username, password) { cookie ->
-                        downloadDeferredFile(serverURL, cookie, item, File(cacheDir, "downloads"))
-                    }
-                    markFileDownloaded(item, file)
-                    runOnUiThread {
-                        updateFileList()
-                        Toast.makeText(this, "已下载到：${file.absolutePath}", Toast.LENGTH_LONG).show()
-                        openDownloadedFile(file, item.mimeType)
-                    }
-                } else {
-                    apiSessionManager.withSession(serverURL, username, password) { cookie ->
-                        requestDeferredFile(serverURL, cookie, item.deferredID)
-                    }
-                    runOnUiThread {
-                        Toast.makeText(this, "已请求源设备上传，稍后刷新查看进度", Toast.LENGTH_LONG).show()
-                        refreshDeferredFiles()
-                    }
+                apiSessionManager.withSession(serverURL, username, password) { cookie ->
+                    requestDeferredFile(serverURL, cookie, item.deferredID)
+                }
+                runOnUiThread {
+                    Toast.makeText(this, "已请求源设备上传，稍后刷新查看进度", Toast.LENGTH_LONG).show()
+                    refreshDeferredFiles()
                 }
             } catch (e: Exception) {
                 Log.e(tag, "处理服务端文件失败", e)
                 runOnUiThread {
                     Toast.makeText(this, "文件处理失败：${e.message}", Toast.LENGTH_LONG).show()
+                }
+            }
+        }.start()
+    }
+
+    private fun migrateLegacyDownload(item: DeferredFileItem, key: String, oldFile: File) {
+        Toast.makeText(this, "正在迁移到 Download：${item.fileName}", Toast.LENGTH_SHORT).show()
+        Thread {
+            try {
+                val download = PublicDownloadStore.saveFile(this, oldFile, item.fileName, item.mimeType)
+                markRelayDownloaded(key, download.uri)
+                oldFile.delete()
+                runOnUiThread {
+                    updateFileList()
+                    Toast.makeText(this, "已迁移到 Download/${download.fileName}", Toast.LENGTH_LONG).show()
+                    openDownloadedFile(download.uri, item.mimeType, download.fileName)
+                }
+            } catch (e: Exception) {
+                Log.e(tag, "迁移旧下载文件失败", e)
+                runOnUiThread {
+                    Toast.makeText(this, "文件迁移失败：${e.message}", Toast.LENGTH_LONG).show()
+                }
+            }
+        }.start()
+    }
+
+    private fun downloadReadyDeferredFile(
+        item: DeferredFileItem,
+        serverURL: String,
+        username: String,
+        password: String
+    ) {
+        Toast.makeText(this, "正在下载：${item.fileName}", Toast.LENGTH_SHORT).show()
+        Thread {
+            try {
+                val download = apiSessionManager.withSession(serverURL, username, password) { cookie ->
+                    downloadDeferredFile(serverURL, cookie, item, this)
+                }
+                markFileDownloaded(item, download.uri)
+                runOnUiThread {
+                    updateFileList()
+                    Toast.makeText(this, "已保存到 Download/${download.fileName}", Toast.LENGTH_LONG).show()
+                    openDownloadedFile(download.uri, item.mimeType, download.fileName)
+                }
+            } catch (e: Exception) {
+                Log.e(tag, "下载服务端大文件失败", e)
+                runOnUiThread {
+                    Toast.makeText(this, "文件下载失败：${e.message}", Toast.LENGTH_LONG).show()
                 }
             }
         }.start()
@@ -953,6 +1278,114 @@ class MainActivity : Activity() {
             return
         }
         showImagePreview(file)
+    }
+
+    private fun saveHistoryImageToDownloads(item: ClipboardHistoryItem) {
+        val file = item.imagePath?.let(::File)
+        if (file == null || !file.isFile) {
+            Toast.makeText(this, "图片文件已被系统清理", Toast.LENGTH_SHORT).show()
+            return
+        }
+        withDownloadsPermission {
+            Thread {
+                try {
+                    val extension = file.extension.ifBlank { "img" }
+                    val mimeType = when (extension.lowercase()) {
+                        "png" -> "image/png"
+                        "jpg", "jpeg" -> "image/jpeg"
+                        "webp" -> "image/webp"
+                        "gif" -> "image/gif"
+                        else -> "application/octet-stream"
+                    }
+                    val download = PublicDownloadStore.saveFile(
+                        context = this,
+                        source = file,
+                        fileName = "ClipCascade-${item.timestamp}.$extension",
+                        mimeType = mimeType
+                    )
+                    runOnUiThread {
+                        Toast.makeText(this, "图片已保存到 Download/${download.fileName}", Toast.LENGTH_LONG).show()
+                    }
+                } catch (e: Exception) {
+                    Log.e(tag, "保存图片到 Download 失败", e)
+                    runOnUiThread {
+                        Toast.makeText(this, "图片保存失败：${e.message}", Toast.LENGTH_LONG).show()
+                    }
+                }
+            }.start()
+        }
+    }
+
+    private fun downloadHistoryFile(item: ClipboardHistoryItem) {
+        val fileName = item.fileName?.ifBlank { item.text } ?: item.text
+        val mimeType = item.mimeType?.ifBlank { "application/octet-stream" } ?: "application/octet-stream"
+        val localFile = item.localFilePath?.takeIf { it.isNotBlank() }?.let(::File)
+        if (localFile != null) {
+            if (!localFile.isFile) {
+                Toast.makeText(this, "这个临时小文件已被系统清理", Toast.LENGTH_LONG).show()
+                return
+            }
+            withDownloadsPermission {
+                saveLocalHistoryFile(localFile, fileName, mimeType)
+            }
+            return
+        }
+
+        val relayID = item.relayID?.trim().orEmpty()
+        if (relayID.isBlank()) {
+            Toast.makeText(this, "这条旧记录没有下载信息", Toast.LENGTH_LONG).show()
+            return
+        }
+        downloadedUriForKey(relayID)?.let { uri ->
+            openDownloadedFile(uri, mimeType, fileName)
+            return
+        }
+        val prefs = getSharedPreferences("clipcascade", Context.MODE_PRIVATE)
+        val serverURL = normalizeServerUrl(prefs.getString("ServerURL", "") ?: "")
+        val username = prefs.getString("Username", "")?.trim().orEmpty()
+        val password = prefs.getString("Password", "").orEmpty()
+        if (serverURL.isBlank() || username.isBlank() || password.isBlank()) {
+            Toast.makeText(this, "请先保存服务器账号", Toast.LENGTH_SHORT).show()
+            return
+        }
+        withDownloadsPermission {
+            Toast.makeText(this, "正在下载：$fileName", Toast.LENGTH_SHORT).show()
+            Thread {
+                try {
+                    val download = apiSessionManager.withSession(serverURL, username, password) { cookie ->
+                        downloadRelayFile(serverURL, cookie, relayID, fileName, mimeType, this)
+                    }
+                    markRelayDownloaded(relayID, download.uri)
+                    runOnUiThread {
+                        Toast.makeText(this, "已保存到 Download/${download.fileName}", Toast.LENGTH_LONG).show()
+                        openDownloadedFile(download.uri, mimeType, download.fileName)
+                    }
+                } catch (e: Exception) {
+                    Log.e(tag, "下载剪贴板文件失败", e)
+                    runOnUiThread {
+                        Toast.makeText(this, "文件下载失败：${e.message}", Toast.LENGTH_LONG).show()
+                    }
+                }
+            }.start()
+        }
+    }
+
+    private fun saveLocalHistoryFile(source: File, fileName: String, mimeType: String) {
+        Toast.makeText(this, "正在保存：$fileName", Toast.LENGTH_SHORT).show()
+        Thread {
+            try {
+                val download = PublicDownloadStore.saveFile(this, source, fileName, mimeType)
+                runOnUiThread {
+                    Toast.makeText(this, "已保存到 Download/${download.fileName}", Toast.LENGTH_LONG).show()
+                    openDownloadedFile(download.uri, mimeType, download.fileName)
+                }
+            } catch (e: Exception) {
+                Log.e(tag, "保存剪贴板小文件失败", e)
+                runOnUiThread {
+                    Toast.makeText(this, "文件保存失败：${e.message}", Toast.LENGTH_LONG).show()
+                }
+            }
+        }.start()
     }
 
     private fun showImagePreview(file: File) {
@@ -1000,8 +1433,7 @@ class MainActivity : Activity() {
         )
     }
 
-    private fun openDownloadedFile(file: File, mimeType: String) {
-        val uri = FileProvider.getUriForFile(this, "$packageName.fileprovider", file)
+    private fun openDownloadedFile(uri: Uri, mimeType: String, fileName: String) {
         val intent = Intent(Intent.ACTION_VIEW).apply {
             setDataAndType(uri, mimeType.ifBlank { "application/octet-stream" })
             addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
@@ -1009,12 +1441,13 @@ class MainActivity : Activity() {
         try {
             startActivity(Intent.createChooser(intent, "打开文件"))
         } catch (_: Exception) {
-            Toast.makeText(this, "文件已下载，但没有可打开的应用：${file.name}", Toast.LENGTH_LONG).show()
+            Toast.makeText(this, "文件已保存，但没有可打开的应用：$fileName", Toast.LENGTH_LONG).show()
         }
     }
 
     private fun deferredStatusLabel(item: DeferredFileItem): String {
-        if (downloadedFileFor(item)?.exists() == true) {
+        val key = item.relayID.ifBlank { item.deferredID }
+        if (downloadedUriFor(item) != null || legacyDownloadedFileForKey(key) != null) {
             return "已下载"
         }
         return when (item.status) {
@@ -1027,28 +1460,61 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun downloadedFileFor(item: DeferredFileItem): File? {
+    private fun downloadedUriFor(item: DeferredFileItem): Uri? {
         val key = item.relayID.ifBlank { item.deferredID }
-        if (key.isBlank()) {
-            return null
-        }
-        val prefs = getSharedPreferences("clipcascade", Context.MODE_PRIVATE)
-        val path = prefs.getString("DownloadedFile_$key", "")?.trim().orEmpty()
-        if (path.isBlank()) {
-            return null
-        }
-        return File(path)
+        return downloadedUriForKey(key)
     }
 
-    private fun markFileDownloaded(item: DeferredFileItem, file: File) {
-        val key = item.relayID.ifBlank { item.deferredID }
-        if (key.isBlank()) {
-            return
+    private fun downloadedUriForKey(key: String): Uri? {
+        if (key.isBlank()) return null
+        val prefs = getSharedPreferences("clipcascade", Context.MODE_PRIVATE)
+        val uriValue = prefs.getString("DownloadedFileUri_$key", "")?.trim().orEmpty()
+        if (uriValue.isNotBlank()) {
+            val uri = Uri.parse(uriValue)
+            if (PublicDownloadStore.isAvailable(this, uri)) {
+                return uri
+            }
         }
+        return null
+    }
+
+    private fun legacyDownloadedFileForKey(key: String): File? {
+        if (key.isBlank()) return null
+        val prefs = getSharedPreferences("clipcascade", Context.MODE_PRIVATE)
+        val path = prefs.getString("DownloadedFile_$key", "")?.trim().orEmpty()
+        val oldFile = path.takeIf { it.isNotBlank() }?.let(::File)
+        return oldFile?.takeIf { it.isFile }
+    }
+
+    private fun markFileDownloaded(item: DeferredFileItem, uri: Uri) {
+        val key = item.relayID.ifBlank { item.deferredID }
+        markRelayDownloaded(key, uri)
+    }
+
+    private fun markRelayDownloaded(key: String, uri: Uri) {
+        if (key.isBlank()) return
         getSharedPreferences("clipcascade", Context.MODE_PRIVATE)
             .edit()
-            .putString("DownloadedFile_$key", file.absolutePath)
+            .putString("DownloadedFileUri_$key", uri.toString())
+            .remove("DownloadedFile_$key")
             .apply()
+    }
+
+    private fun withDownloadsPermission(action: () -> Unit) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q || ContextCompat.checkSelfPermission(
+                this,
+                Manifest.permission.WRITE_EXTERNAL_STORAGE
+            ) == PackageManager.PERMISSION_GRANTED
+        ) {
+            action()
+            return
+        }
+        pendingDownloadAction = action
+        ActivityCompat.requestPermissions(
+            this,
+            arrayOf(Manifest.permission.WRITE_EXTERNAL_STORAGE),
+            reqWriteDownloads
+        )
     }
 
     private fun clipboardHistoryRow(item: ClipboardHistoryItem): View {
@@ -1061,12 +1527,14 @@ class MainActivity : Activity() {
                 setColor(color(R.color.cc_surface_variant))
             }
             setOnClickListener {
-                if (item.type == "image") {
-                    openHistoryImage(item)
-                } else {
-                    val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-                    clipboard.setPrimaryClip(ClipData.newPlainText("ClipCascade", item.text))
-                    Toast.makeText(this@MainActivity, "已回填到系统剪贴板", Toast.LENGTH_SHORT).show()
+                when (item.type) {
+                    "image" -> openHistoryImage(item)
+                    "file" -> downloadHistoryFile(item)
+                    else -> {
+                        val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                        clipboard.setPrimaryClip(ClipData.newPlainText("ClipCascade", item.text))
+                        Toast.makeText(this@MainActivity, "已回填到系统剪贴板", Toast.LENGTH_SHORT).show()
+                    }
                 }
             }
         }
@@ -1084,14 +1552,27 @@ class MainActivity : Activity() {
         row.addView(LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             val direction = if (item.direction == "received") "接收" else "发送"
-            val type = if (item.type == "image") "图片" else "文本"
+            val type = when (item.type) {
+                "image" -> "图片"
+                "file" -> "文件"
+                else -> "文本"
+            }
+            val sizeLabel = if (item.type == "file" && item.fileSize > 0L) {
+                " · ${android.text.format.Formatter.formatShortFileSize(this@MainActivity, item.fileSize)}"
+            } else {
+                ""
+            }
             addView(TextView(this@MainActivity).apply {
-                text = "$direction$type · ${formatTime(item.timestamp)}"
+                text = "$direction$type$sizeLabel · ${formatTime(item.timestamp)}"
                 textSize = 12f
                 setTextColor(color(R.color.cc_text_secondary))
             })
             addView(TextView(this@MainActivity).apply {
-                text = if (item.type == "image") "点击打开图片" else item.text
+                text = when (item.type) {
+                    "image" -> "点击打开图片"
+                    "file" -> item.fileName ?: item.text
+                    else -> item.text
+                }
                 textSize = 15f
                 maxLines = 2
                 setTextColor(color(R.color.cc_text_primary))
@@ -1099,7 +1580,28 @@ class MainActivity : Activity() {
         }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
             if (item.type == "image") marginStart = dp(12)
         })
+        if (item.type == "image" || item.type == "file") {
+            row.addView(downloadIconButton {
+                if (item.type == "image") {
+                    saveHistoryImageToDownloads(item)
+                } else {
+                    downloadHistoryFile(item)
+                }
+            }, LinearLayout.LayoutParams(dp(44), dp(44)))
+        }
         return row
+    }
+
+    private fun downloadIconButton(action: () -> Unit): ImageButton {
+        return ImageButton(this).apply {
+            setImageResource(android.R.drawable.stat_sys_download_done)
+            setColorFilter(color(R.color.cc_primary))
+            background = null
+            contentDescription = "保存到 Download"
+            tooltipText = "保存到 Download"
+            setPadding(dp(10), dp(10), dp(10), dp(10))
+            setOnClickListener { action() }
+        }
     }
 
     private fun fileHistoryRow(item: DeferredFileItem): View {

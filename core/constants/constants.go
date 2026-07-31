@@ -48,7 +48,7 @@ const (
 
 	AppName = "ClipCascade"
 	// AppVersion 是当前应用的版本号。
-	AppVersion = "2.0"
+	AppVersion = "2.1"
 
 	// --- 剪贴板内容类型 ---
 
@@ -78,7 +78,7 @@ const (
 	// 8 MiB 文件 base64 后约 10.7 MiB，低于服务器 20 MiB 消息上限。
 	DefaultFileEagerThresholdBytes int64 = 8 * 1024 * 1024
 	// DefaultFileAutoRelayMaxBytes 是 HTTP relay 自动同步的文件大小上限（25 MiB）。
-	// 超过此大小的文件不会自动传输，仅发送 TypeFileStub 占位通知。
+	// 超过此大小的文件仅登记元数据，接收端请求时才由源设备上传。
 	DefaultFileAutoRelayMaxBytes int64 = 25 * 1024 * 1024
 	// DefaultFileRelayMaxBytes 是 HTTP 文件中转服务端允许的单文件最大大小。（2G）
 	DefaultFileRelayMaxBytes int64 = 2 * 1024 * 1024 * 1024

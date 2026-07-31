@@ -268,8 +268,7 @@ func (m *Manager) handleChange(payload string, payloadType string, filename stri
 		}
 		slog.Debug("剪贴板：检测到文件懒加载占位符", "文件数", meta.Count, "总大小", sizefmt.FormatBytes(meta.TotalBytes), "首文件", first)
 	} else if payloadType == constants.TypeFileEager {
-		// 兼容旧版本: 仍可收到 file_eager，但本端不再主动发送此类型。
-		slog.Debug("剪贴板：收到旧版 file_eager 数据", "文件名", filename, "大小", sizefmt.FormatBytes(int64(sizefmt.EstimatedBase64DecodedSize(payload))))
+		slog.Debug("剪贴板：检测到 file_eager 数据", "文件名", filename, "大小", sizefmt.FormatBytes(int64(sizefmt.EstimatedBase64DecodedSize(payload))))
 	} else {
 		slog.Debug("剪贴板：检测到更改", "类型", payloadType, "大小", len(payload))
 	}
