@@ -1,0 +1,10 @@
+name: Dispatch Diagnostic
+
+on:
+  workflow_dispatch:
+
+jobs:
+  diagnostic:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "workflow dispatch is available"
