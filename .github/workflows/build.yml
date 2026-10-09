@@ -9,7 +9,7 @@ on:
   workflow_dispatch:
     inputs:
       release_ref:
-        description: "Optional Git ref to build (for example v2.1)"
+        description: "Optional Git ref to build (for example v2.2)"
         required: false
         default: ""
 
@@ -93,10 +93,6 @@ jobs:
     strategy:
       matrix:
         include:
-          - os: linux-amd64
-            runner: ubuntu-latest
-            goos: linux
-            goarch: amd64
           - os: macos-arm64
             runner: macos-14
             goos: darwin
@@ -114,9 +110,6 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: ${{ env.GO_VERSION }}
-      - name: Install Linux dependencies
-        if: matrix.goos == 'linux'
-        run: sudo apt-get update && sudo apt-get install -y libx11-dev libxcursor-dev libxrandr-dev libxinerama-dev libxi-dev libgl1-mesa-dev libxxf86vm-dev libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev pkg-config
       - name: Build
         shell: bash
         env:
@@ -134,6 +127,29 @@ jobs:
         with:
           name: desktop-${{ matrix.os }}
           path: clipcascade-desktop-*
+
+  # ──────────────── Build Desktop (Linux, legacy glibc) ────────────────
+  # 统信 UOS V20 / deepin 20 基于 Debian 10（glibc 2.28）。
+  # ubuntu-latest 是 glibc 2.39，编出来的产物硬绑 GLIBC_2.32 / GLIBC_2.34，
+  # 在这些系统上直接 "version not found"。所以 linux-amd64 单独在 Debian 10
+  # 容器里编译，产物只要求 2.28，同时兼容所有更新的发行版。
+  build-desktop-linux-legacy:
+    name: Build Desktop (linux-amd64 · glibc 2.28)
+    needs: test
+    runs-on: ubuntu-latest
+    env:
+      GO_TOOLCHAIN_VERSION: "1.25.0"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build inside Debian 10 (buster)
+        run: docker run --rm -v "$PWD:/src" -e VERSION="${{ github.ref_name }}" -e GO_TOOLCHAIN_VERSION="${{ env.GO_TOOLCHAIN_VERSION }}" debian:buster bash /src/build-scripts/build_linux_legacy.sh desktop
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: desktop-linux-amd64
+          path: clipcascade-desktop-linux-amd64
+          if-no-files-found: error
 
   # ──────────────── Docker ────────────────
   docker:
@@ -188,10 +204,6 @@ jobs:
             runner: ubuntu-latest
             goos: windows
             goarch: amd64
-          - os: linux-amd64
-            runner: ubuntu-latest
-            goos: linux
-            goarch: amd64
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -217,29 +229,47 @@ jobs:
           export PATH="$(go env GOPATH)/bin:$PATH"
           go build -ldflags="-s -w" -o ../build/clipcascade-ui-desktop-${{ matrix.goos }}-${{ matrix.goarch }} .
 
-      - name: Install fyne-cross (Linux/Windows docker)
+      - name: Install fyne-cross (Windows docker)
         if: matrix.goos != 'darwin'
         run: |
           go install github.com/fyne-io/fyne-cross@latest
 
-      - name: Build Windows/Linux cross UI
+      - name: Build Windows cross UI
         if: matrix.goos != 'darwin'
         run: |
           mkdir -p build
           export PATH="$(go env GOPATH)/bin:$PATH"
           cd client-mobile
           GOWORK=off go mod vendor
-          fyne-cross ${{ matrix.goos }} -arch=${{ matrix.goarch }} -app-id com.clipcascade.desktopui -env "GOFLAGS=-mod=vendor" -name fynemobile
-          if [ "${{ matrix.goos }}" = "windows" ]; then
-            mv fyne-cross/bin/windows-${{ matrix.goarch }}/fynemobile.exe ../build/clipcascade-ui-desktop-windows-${{ matrix.goarch }}.exe
-          else
-            mv fyne-cross/bin/linux-${{ matrix.goarch }}/fynemobile ../build/clipcascade-ui-desktop-linux-${{ matrix.goarch }}
-          fi
+          fyne-cross windows -arch=${{ matrix.goarch }} -app-id com.clipcascade.desktopui -env "GOFLAGS=-mod=vendor" -name fynemobile
+          mv fyne-cross/bin/windows-${{ matrix.goarch }}/fynemobile.exe ../build/clipcascade-ui-desktop-windows-${{ matrix.goarch }}.exe
 
       - uses: actions/upload-artifact@v4
         with:
           name: desktop-ui-${{ matrix.os }}
           path: build/clipcascade-ui-desktop-*
+
+  # ──────────────── Build Desktop UI (Fyne, Linux legacy glibc) ────────────────
+  # 与 build-desktop-linux-legacy 同理：Fyne 在 Linux 上同样依赖 CGO
+  # （X11 + OpenGL），所以必须在老 glibc 环境里编译，否则统信 UOS V20 /
+  # deepin 20 这类 glibc 2.28 系统跑不起来。
+  build-desktop-ui-linux-legacy:
+    name: Build Desktop UI (linux-amd64 · glibc 2.28)
+    needs: test
+    runs-on: ubuntu-latest
+    env:
+      GO_TOOLCHAIN_VERSION: "1.25.0"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build inside Debian 10 (buster)
+        run: docker run --rm -v "$PWD:/src" -e VERSION="${{ github.ref_name }}" -e GO_TOOLCHAIN_VERSION="${{ env.GO_TOOLCHAIN_VERSION }}" debian:buster bash /src/build-scripts/build_linux_legacy.sh desktop-ui
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: desktop-ui-linux-amd64
+          path: build/clipcascade-ui-desktop-linux-amd64
+          if-no-files-found: error
 
   # ──────────────── Build Mobile (Android Native Keepalive) ────────────────
   build-mobile-native:
@@ -326,7 +356,7 @@ jobs:
   # ──────────────── Release ────────────────
   release:
     name: Create Release
-    needs: [build-server, build-desktop, build-desktop-ui-native, build-mobile-native, build-web-clip]
+    needs: [build-server, build-desktop, build-desktop-linux-legacy, build-desktop-ui-native, build-desktop-ui-linux-legacy, build-mobile-native, build-web-clip]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/')
     steps:
@@ -338,5 +368,5 @@ jobs:
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
-          body_path: CHANGELOG-2.1.md
+          body_path: CHANGELOG-2.2.md
           files: artifacts/*

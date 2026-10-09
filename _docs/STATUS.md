@@ -1,14 +1,13 @@
 # ClipCascade Go — 项目状态文档
 
-> 最后更新：2026-08-01  版本：v2.1
+> 最后更新：2026-10-09  版本：v2.2
 
-## v2.1 发布重点
+## v2.2 发布重点
 
-- Android 原生端完整识别 PC 发来的 `file_eager`、`file_offer` 和 deferred 文件消息。
-- PC 小文件在 Android 端只保留最近一个临时副本，用户点击后保存到公共 `Download` 目录。
-- Android 接收图片和中继文件支持保存到公共 `Download` 目录，不再依赖应用私有路径。
-- 文件传输上限统一记录为 `8 MiB / 25 MiB / 2 GiB` 三档；Android 的 `content://` 分享发送仍使用专用 HTTP 中继路径。
-- Android 局域网发现支持真正重扫、网络/IP 变化重启发现，以及前后台生命周期管理。
+- 修复 Linux 桌面包在统信 UOS V20、deepin 20 等 glibc 2.28 系统上无法启动的问题（原先产物硬绑 `GLIBC_2.32` / `GLIBC_2.34`）。
+- Linux 桌面端与 Fyne 桌面 UI 产物改为在 Debian 10 容器内编译，只要求 glibc ≥ 2.28，同时兼容所有更新的发行版；产物文件名不变。
+- `build-scripts/build_linux_legacy.sh` 内置 GLIBC 符号版本守卫，产物要求高于 2.28 时直接让 CI 失败。
+- README 补充 Linux 运行时依赖清单。
 
 ## 目录结构
 
@@ -20,7 +19,7 @@ ClipCascade_go/
 ├── client-android-native-shell/   # Android 原生 Kotlin 壳（Gradle）
 ├── core/                          # 共享库：加密、协议、常量
 ├── server-web-clip/               # Web 网页剪贴板（独立子模块）
-├── build-scripts/                 # build.sh / build_android.sh
+├── build-scripts/                 # build.sh / build_android.sh / build_linux_legacy.sh
 ├── _docs/screenshots/             # README 截图
 ├── build/                         # 编译产物（gitignore）
 └── go.work                        # Go workspace
@@ -66,8 +65,8 @@ ClipCascade_go/
 | 产物 | 来源 job |
 |------|---------|
 | clipcascade-server-{os}-{arch} | build-server |
-| clipcascade-desktop-{os}-{arch} | build-desktop |
-| clipcascade-ui-desktop-{os}-{arch} | build-desktop-ui-native |
+| clipcascade-desktop-{os}-{arch} | build-desktop（linux-amd64 由 build-desktop-linux-legacy 提供）|
+| clipcascade-ui-desktop-{os}-{arch} | build-desktop-ui-native（linux-amd64 由 build-desktop-ui-linux-legacy 提供）|
 | clipcascade-web-{os}-{arch} | build-web-clip |
 | ClipCascade-Android-Installable.apk | build-mobile-native |
 

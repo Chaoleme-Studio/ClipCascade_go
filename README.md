@@ -403,6 +403,48 @@ export ANDROID_NDK_HOME="/opt/homebrew/Caskroom/android-ndk/<version>/AndroidNDK
 - 项目已内置 `client-android-native-shell/android/gradlew`，不要求全局安装 Gradle。
 - 若遇到 Gradle 缓存污染，可删除根目录 `.gradle-user-home/` 后重试。
 
+### Linux 运行时依赖
+
+Linux 桌面端和图形化桌面 UI 都依赖 CGO，无法纯静态编译，除二进制本身外还需要系统库。按使用目标安装：
+
+#### 隐形式桌面托盘端（`clipcascade-desktop-linux-amd64`）
+
+```bash
+# Debian / Ubuntu / 统信 UOS / deepin
+sudo apt install libgtk-3-0 libappindicator3-1 libx11-6 xclip
+```
+
+| 依赖 | 用途 | 缺失后果 |
+|------|------|----------|
+| `libgtk-3-0` | 托盘界面的 GTK3 运行时 | 启动失败 |
+| `libappindicator3-1` | 托盘图标注册 | 启动失败 |
+| `libx11-6` | 文本/图片剪贴板读写（运行期 `dlopen`，非链接期） | 文本与图片同步不可用 |
+| `xclip` | 文件剪贴板的 `text/uri-list` 读写 | 仅文件同步不可用，文本与图片正常 |
+
+Wayland 会话下文件剪贴板会优先走 `wl-copy` / `wl-paste`，装了 `wl-clipboard` 包更好。
+
+注意 `libappindicator3-1` 是老库。如果发行版只提供 `libayatana-appindicator3-1`（两者的 ABI 兼容，是同一次 fork），需要把 CI 构建参数 `-tags legacy_appindicator` 去掉，改链 ayatana 后重新编译。
+
+#### 图形化桌面 UI（`clipcascade-ui-desktop-linux-amd64`）
+
+```bash
+sudo apt install libgl1 libx11-6 libxcursor1 libxrandr2 libxinerama1 libxi6 libxxf86vm1
+```
+
+Fyne 需要 OpenGL 2.0+。虚拟机和没有独显驱动的环境装 Mesa 软件渲染兜底：
+
+```bash
+sudo apt install libgl1-mesa-dri
+```
+
+该产物不需要 `libappindicator3` 和 webkit2gtk：Fyne 的 Linux 托盘走 `fyne.io/systray` 的纯 Go D-Bus 实现，Fyne v2.7 也不依赖 webkit。
+
+#### glibc 版本要求
+
+CI 的 `linux-amd64` 产物在 Debian 10 容器内编译，**只要求 glibc ≥ 2.28**，覆盖统信 UOS V20、deepin 20、Debian 10+、Ubuntu 18.10 及更新的发行版。
+
+如果目标系统比这更老（例如基于 CentOS 7 的发行版，glibc 2.17），官方产物无法直接运行，需要在该系统内自行编译。`build-scripts/build_linux_legacy.sh` 记录了所需的系统依赖与编译参数，可参照改成对应发行版的包管理命令；其中的 GLIBC 守卫（用 `objdump -T` 校验产物符号版本上限）建议保留。
+
 ### 常用构建命令
 
 ```bash
@@ -538,6 +580,25 @@ open -a OrbStack
 
 请确认 Windows desktop 已更新到包含图片规范化写入的版本。Android 分享图片仍按 `image` 同步，Windows 端应写入图片剪贴板格式，而不是把图片保存为文件路径。
 
+
+### 5) Linux 上启动报 `GLIBC_2.xx not found`
+
+```
+./clipcascade-desktop-linux-amd64: /lib/x86_64-linux-gnu/libc.so.6:
+version `GLIBC_2.34' not found (required by ./clipcascade-desktop-linux-amd64)
+```
+
+这是二进制要求的 glibc 版本高于系统提供的版本。v2.2 之前的产物在 Ubuntu 24.04 上编译，要求 `GLIBC_2.32` / `GLIBC_2.34`，在统信 UOS V20、deepin 20（glibc 2.28）这类 Debian 10 系系统上无法启动。
+
+升级到 v2.2 及之后的产物即可：Linux 产物改为在 Debian 10 容器内编译，只要求 glibc ≥ 2.28。可以这样确认：
+
+```bash
+objdump -T clipcascade-desktop-linux-amd64 | grep -oE 'GLIBC_2\.[0-9]+' | sort -uV
+```
+
+输出里不应出现高于 `GLIBC_2.28` 的版本。
+
+同时请确认已装齐 [Linux 运行时依赖](#linux-运行时依赖)，尤其是 `libgtk-3-0` 和 `libappindicator3-1` —— 缺少这两个库同样会在启动阶段直接失败。
 
 ## 社区
 

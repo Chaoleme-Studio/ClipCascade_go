@@ -402,6 +402,48 @@ Notes:
 - Project includes a built-in `client-android-native-shell/android/gradlew`, no global Gradle installation required.
 - If Gradle cache is corrupted, delete `.gradle-user-home/` in the root directory and retry.
 
+### Linux Runtime Dependencies
+
+Both the Linux desktop client and the graphical desktop UI rely on CGO and cannot be compiled as pure static binaries, so system libraries are required in addition to the binary itself. Install according to what you intend to run:
+
+#### Headless Tray Client (`clipcascade-desktop-linux-amd64`)
+
+```bash
+# Debian / Ubuntu / UOS / deepin
+sudo apt install libgtk-3-0 libappindicator3-1 libx11-6 xclip
+```
+
+| Dependency | Purpose | Effect if missing |
+|------|------|----------|
+| `libgtk-3-0` | GTK3 runtime for the tray UI | Fails to start |
+| `libappindicator3-1` | Tray icon registration | Fails to start |
+| `libx11-6` | Text/image clipboard access (`dlopen`ed at runtime, not link-time) | Text and image sync unavailable |
+| `xclip` | Reading/writing `text/uri-list` for file clipboard | Only file sync unavailable; text and images still work |
+
+On Wayland sessions the file clipboard prefers `wl-copy` / `wl-paste`; installing the `wl-clipboard` package is recommended.
+
+Note that `libappindicator3-1` is the legacy library. If your distribution only ships `libayatana-appindicator3-1` (the two are ABI-compatible forks of the same project), drop the `-tags legacy_appindicator` build flag and rebuild against ayatana instead.
+
+#### Graphical Desktop UI (`clipcascade-ui-desktop-linux-amd64`)
+
+```bash
+sudo apt install libgl1 libx11-6 libxcursor1 libxrandr2 libxinerama1 libxi6 libxxf86vm1
+```
+
+Fyne requires OpenGL 2.0+. In virtual machines or environments without a GPU driver, install Mesa software rendering as a fallback:
+
+```bash
+sudo apt install libgl1-mesa-dri
+```
+
+This build does not need `libappindicator3` or webkit2gtk: Fyne's Linux tray uses the pure Go D-Bus implementation in `fyne.io/systray`, and Fyne v2.7 does not depend on webkit.
+
+#### glibc Version Requirement
+
+The CI `linux-amd64` artifacts are built inside a Debian 10 container and **require only glibc ≥ 2.28**, covering UOS V20, deepin 20, Debian 10+, Ubuntu 18.10 and newer.
+
+If your target system is older than that (for example a CentOS 7 based distribution with glibc 2.17), the official artifacts cannot run and you need to compile on that system. `build-scripts/build_linux_legacy.sh` records the required system dependencies and build flags; adapt it to your distribution's package manager. Keeping its GLIBC guard (verifying the artifact's symbol version ceiling with `objdump -T`) is recommended.
+
 ### Common Build Commands
 
 ```bash
@@ -536,6 +578,25 @@ Ensure both ends are using the latest desktop binaries and check logs for:
 ### 4) Android shared image received on Windows but cannot paste
 
 Ensure the Windows desktop binary includes image normalization on write. Android shared images are still synchronized as `image`; Windows should write image clipboard formats instead of falling back to file-path paste.
+
+### 5) `GLIBC_2.xx not found` when starting on Linux
+
+```
+./clipcascade-desktop-linux-amd64: /lib/x86_64-linux-gnu/libc.so.6:
+version `GLIBC_2.34' not found (required by ./clipcascade-desktop-linux-amd64)
+```
+
+The binary requires a newer glibc than your system provides. Artifacts before v2.2 were built on Ubuntu 24.04 and required `GLIBC_2.32` / `GLIBC_2.34`, which cannot start on Debian 10 based systems such as UOS V20 or deepin 20 (glibc 2.28).
+
+Upgrade to a v2.2 or later artifact: Linux builds are now compiled inside a Debian 10 container and require only glibc ≥ 2.28. You can verify with:
+
+```bash
+objdump -T clipcascade-desktop-linux-amd64 | grep -oE 'GLIBC_2\.[0-9]+' | sort -uV
+```
+
+No version above `GLIBC_2.28` should appear in the output.
+
+Also make sure the [Linux runtime dependencies](#linux-runtime-dependencies) are installed, especially `libgtk-3-0` and `libappindicator3-1` — missing those libraries also fails immediately at startup.
 
 ## 社区
 
