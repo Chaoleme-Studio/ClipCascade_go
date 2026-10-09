@@ -199,14 +199,13 @@ build_desktop_cross() {
     GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -ldflags="$win_ldflags" -o "$BUILD_DIR/clipcascade-desktop-windows-amd64.exe" . || warn "    ⚠ windows/amd64 编译失败"
 
 
-    # 3. Linux - 使用 Docker 交叉编译 (由于依赖 GTK3)
-    info "  → 编译中: linux/amd64 (通过 Docker)"
+    # 3. Linux - 在 Debian 10 容器内编译（glibc 2.28）
+    #    统信 UOS V20 / deepin 20 等基于 Debian 10，用新 glibc 编出来的产物会直接
+    #    报 "version `GLIBC_2.34' not found"。产物只要求 glibc >= 2.28，同时兼容
+    #    所有更新的发行版，产物文件名和路径保持不变。
+    info "  → 编译中: linux/amd64 (通过 Docker / Debian 10)"
     if docker_daemon_ready; then
-        info "    正在启动 Docker 容器进行 Linux CGO 编译..."
-        docker run --rm -v "$ROOT_DIR:/app" -w /app/client-desktop golang:1.22-bookworm bash -c "
-            apt-get update && apt-get install -y libgtk-3-dev libx11-dev libayatana-appindicator3-dev pkg-config && 
-            GOOS=linux GOARCH=amd64 CGO_ENABLED=1 go build -ldflags=\"$LDFLAGS\" -o /app/build/clipcascade-desktop-linux-amd64 .
-        " || warn "    ⚠ linux/amd64 编译失败"
+        docker run --rm -v "$ROOT_DIR:/src" -e VERSION="$VERSION" -e OUT="/src/build/clipcascade-desktop-linux-amd64" debian:buster bash /src/build-scripts/build_linux_legacy.sh desktop || warn "    ⚠ linux/amd64 编译失败"
     else
         warn "    ⚠ Docker daemon 不可用，跳过 Linux 交叉编译"
     fi
@@ -289,9 +288,8 @@ build_desktop_ui_cross() {
     fyne-cross windows -arch=amd64 -app-id com.clipcascade.desktopui -tags desktopui ./cmd/desktop-ui || warn "⚠ Windows UI 构建失败 (请检查 Docker)"
     mv fyne-cross/bin/windows-amd64/desktop-ui.exe "$BUILD_DIR/clipcascade-desktop-ui-windows-amd64.exe" 2>/dev/null || true
     
-    info "    → 编译中: linux/amd64 (UI 版)"
-    fyne-cross linux -arch=amd64 -app-id com.clipcascade.desktopui -tags desktopui ./cmd/desktop-ui || warn "⚠ Linux UI 构建失败"
-    mv fyne-cross/bin/linux-amd64/desktop-ui "$BUILD_DIR/clipcascade-desktop-ui-linux-amd64" 2>/dev/null || true
+    info "    → 编译中: linux/amd64 (UI 版, 通过 Docker / Debian 10)"
+    docker run --rm -v "$ROOT_DIR:/src" -e VERSION="$VERSION" -e OUT="/src/build/clipcascade-desktop-ui-linux-amd64" debian:buster bash /src/build-scripts/build_linux_legacy.sh desktop-ui || warn "⚠ Linux UI 构建失败"
     
     # 清理 Fyne Cross 临时目录
     rm -rf fyne-cross

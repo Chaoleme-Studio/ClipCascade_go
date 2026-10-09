@@ -294,7 +294,10 @@ func TestRunPluginActionCreatesSucceededTask(t *testing.T) {
 	}
 
 	var task model.AutomationTask
-	deadline := time.Now().Add(2 * time.Second)
+	// 插件是 WASI 解释执行（wazero），-race 下会慢近一个数量级；这里的等待上限必须
+	// 明显大于 cfg.AutomationPluginTimeoutSeconds（本用例为 5s），否则 -race 下
+	// 必然超时（本机实测：单独跑约 17s，整套并行跑更久）。
+	deadline := time.Now().Add(60 * time.Second)
 	for time.Now().Before(deadline) {
 		err = db.Where("event_id = ?", "evt-plugin").First(&task).Error
 		if err == nil && task.Status == model.AutomationTaskSucceeded {

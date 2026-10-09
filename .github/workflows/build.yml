@@ -263,7 +263,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Build inside Debian 10 (buster)
-        run: docker run --rm -v "$PWD:/src" -e VERSION="${{ github.ref_name }}" -e GO_TOOLCHAIN_VERSION="${{ env.GO_TOOLCHAIN_VERSION }}" debian:buster bash /src/build-scripts/build_linux_legacy.sh desktop-ui
+        run: docker run --rm -v "$PWD:/src" -e VERSION="${{ github.ref_name }}" -e GO_TOOLCHAIN_VERSION="${{ env.GO_TOOLCHAIN_VERSION }}" debian:buster bash /src/build-scripts/build_linux_legacy.sh mobile-ui
 
       - uses: actions/upload-artifact@v4
         with:
