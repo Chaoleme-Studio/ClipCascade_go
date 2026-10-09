@@ -19,7 +19,7 @@ version `GLIBC_2.34' not found (required by ./clipcascade-desktop-linux-amd64)
 
 - `clipcascade-desktop-linux-amd64`（隐形式托盘端）改为在 `debian:buster` 容器内编译，产物只要求 glibc ≥ 2.28。
 - 该产物依赖 CGO，无法纯静态编译：`getlantern/systray` 需要 GTK3 + appindicator，`golang.design/x/clipboard` 编译期需要 `<X11/Xlib.h>`。
-- Debian 10 没有 `ayatana-appindicator`（Debian 11 才进包），因此托盘后端改用 `legacy_appindicator` 构建标签，链接 buster 自带的 `libappindicator3`。
+- 托盘后端链接 `libayatana-appindicator3`：统信 UOS V20 只提供 `libayatana-appindicator3.so.1`，没有 `libappindicator3.so.1`。Debian 10 自带 `libayatana-appindicator3-dev`，所以 glibc 仍然是 2.28，无需降级或打包 glibc。
 - 产物文件名保持不变，Release 资产名与既有下载链接不受影响。
 
 ## [fix] Linux 图形化桌面 UI glibc 兼容性

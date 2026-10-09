@@ -411,19 +411,19 @@ Linux 桌面端和图形化桌面 UI 都依赖 CGO，无法纯静态编译，除
 
 ```bash
 # Debian / Ubuntu / 统信 UOS / deepin
-sudo apt install libgtk-3-0 libappindicator3-1 libx11-6 xclip
+sudo apt install libgtk-3-0 libayatana-appindicator3-1 libx11-6 xclip
 ```
 
 | 依赖 | 用途 | 缺失后果 |
 |------|------|----------|
 | `libgtk-3-0` | 托盘界面的 GTK3 运行时 | 启动失败 |
-| `libappindicator3-1` | 托盘图标注册 | 启动失败 |
+| `libayatana-appindicator3-1` | 托盘图标注册 | 启动失败 |
 | `libx11-6` | 文本/图片剪贴板读写（运行期 `dlopen`，非链接期） | 文本与图片同步不可用 |
 | `xclip` | 文件剪贴板的 `text/uri-list` 读写 | 仅文件同步不可用，文本与图片正常 |
 
 Wayland 会话下文件剪贴板会优先走 `wl-copy` / `wl-paste`，装了 `wl-clipboard` 包更好。
 
-注意 `libappindicator3-1` 是老库。如果发行版只提供 `libayatana-appindicator3-1`（两者的 ABI 兼容，是同一次 fork），需要把 CI 构建参数 `-tags legacy_appindicator` 去掉，改链 ayatana 后重新编译。
+托盘端链接的是 `libayatana-appindicator3`，不是老的 `libappindicator3`。两者是同一次 fork、ABI 兼容，但 soname 不同，不能互相顶替：统信 UOS V20 只提供 `libayatana-appindicator3.so.1`，所以构建也统一用 ayatana（Debian 10 自带 `libayatana-appindicator3-dev`）。
 
 #### 图形化桌面 UI（`clipcascade-ui-desktop-linux-amd64`）
 
@@ -598,7 +598,7 @@ objdump -T clipcascade-desktop-linux-amd64 | grep -oE 'GLIBC_2\.[0-9]+' | sort -
 
 输出里不应出现高于 `GLIBC_2.28` 的版本。
 
-同时请确认已装齐 [Linux 运行时依赖](#linux-运行时依赖)，尤其是 `libgtk-3-0` 和 `libappindicator3-1` —— 缺少这两个库同样会在启动阶段直接失败。
+同时请确认已装齐 [Linux 运行时依赖](#linux-运行时依赖)，尤其是 `libgtk-3-0` 和 `libayatana-appindicator3-1` —— 缺少这两个库同样会在启动阶段直接失败。
 
 ## 社区
 

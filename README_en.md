@@ -410,19 +410,19 @@ Both the Linux desktop client and the graphical desktop UI rely on CGO and canno
 
 ```bash
 # Debian / Ubuntu / UOS / deepin
-sudo apt install libgtk-3-0 libappindicator3-1 libx11-6 xclip
+sudo apt install libgtk-3-0 libayatana-appindicator3-1 libx11-6 xclip
 ```
 
 | Dependency | Purpose | Effect if missing |
 |------|------|----------|
 | `libgtk-3-0` | GTK3 runtime for the tray UI | Fails to start |
-| `libappindicator3-1` | Tray icon registration | Fails to start |
+| `libayatana-appindicator3-1` | Tray icon registration | Fails to start |
 | `libx11-6` | Text/image clipboard access (`dlopen`ed at runtime, not link-time) | Text and image sync unavailable |
 | `xclip` | Reading/writing `text/uri-list` for file clipboard | Only file sync unavailable; text and images still work |
 
 On Wayland sessions the file clipboard prefers `wl-copy` / `wl-paste`; installing the `wl-clipboard` package is recommended.
 
-Note that `libappindicator3-1` is the legacy library. If your distribution only ships `libayatana-appindicator3-1` (the two are ABI-compatible forks of the same project), drop the `-tags legacy_appindicator` build flag and rebuild against ayatana instead.
+The tray links against `libayatana-appindicator3`, not the legacy `libappindicator3`. The two are ABI-compatible forks of the same project but have different sonames, so they are not interchangeable: UOS V20 only ships `libayatana-appindicator3.so.1`, which is why the build targets ayatana too (Debian 10 provides `libayatana-appindicator3-dev`).
 
 #### Graphical Desktop UI (`clipcascade-ui-desktop-linux-amd64`)
 
@@ -596,7 +596,7 @@ objdump -T clipcascade-desktop-linux-amd64 | grep -oE 'GLIBC_2\.[0-9]+' | sort -
 
 No version above `GLIBC_2.28` should appear in the output.
 
-Also make sure the [Linux runtime dependencies](#linux-runtime-dependencies) are installed, especially `libgtk-3-0` and `libappindicator3-1` — missing those libraries also fails immediately at startup.
+Also make sure the [Linux runtime dependencies](#linux-runtime-dependencies) are installed, especially `libgtk-3-0` and `libayatana-appindicator3-1` — missing those libraries also fails immediately at startup.
 
 ## 社区
 

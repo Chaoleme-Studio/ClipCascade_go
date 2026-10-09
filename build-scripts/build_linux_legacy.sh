@@ -38,11 +38,13 @@ case "$TARGET" in
     desktop)
         PKG_DIR=/src/client-desktop
         DEFAULT_OUT=/src/clipcascade-desktop-linux-amd64
-        # getlantern/systray 需要 GTK3；buster 没有 ayatana-appindicator
-        # （那是 Debian 11 才进的），所以走 legacy_appindicator 后端。
+        # getlantern/systray 需要 GTK3 + appindicator。这里必须用 ayatana，不能用
+        # legacy libappindicator3：统信 UOS V20 只装了 libayatana-appindicator3.so.1，
+        # 没有 libappindicator3.so.1，链老库的产物在目标机上会直接报找不到该 so。
+        # buster main 里就有 libayatana-appindicator3-dev，所以 glibc 仍然是 2.28。
         # libx11-dev 是 golang.design/x/clipboard 编译期要的 <X11/Xlib.h>。
-        TAGS=legacy_appindicator
-        DEPS="libgtk-3-dev libappindicator3-dev libx11-dev"
+        TAGS=""
+        DEPS="libgtk-3-dev libayatana-appindicator3-dev libx11-dev"
         VERSION_PKG=main
         ;;
     desktop-ui)
