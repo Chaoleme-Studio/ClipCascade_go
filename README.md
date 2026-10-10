@@ -95,7 +95,8 @@ ClipCascade 的定位是：以剪贴板为中心，做一个可自部署、可�
 #### Linux
 
 - 文本/图片监听主要依赖 `golang.design/x/clipboard` 的事件通道。
-- 文件路径通过 `xclip` 读取 `text/uri-list`。
+- 文件剪贴板通过 `xclip` 读写（Wayland 会话优先 `wl-copy`/`wl-paste`）。**写入的 target 按桌面环境选择**：统信 UOS / deepin / GNOME 系使用 `x-special/gnome-copied-files`（数据格式为 `copy\nfile://...`），KDE 使用 `text/uri-list`；读取时会依次尝试多个 target。写错 target 的典型症状是文件管理器能看到剪贴板更新、但 Ctrl+V 粘不出文件。
+- 写入剪贴板时会 fork 一个后台属主进程持有 selection。xclip / wl-copy 默认后台运行但**不关闭继承来的 stdout/stderr**，因此不能用 `CombinedOutput`/`Output` 捕获它们，否则调用方会阻塞到剪贴板被其它程序接管为止。
 - Linux 当前更接近“标准剪贴板格式驱动”的实现，对桌面环境依赖相对更强。
 
 ### 当前设计取舍
@@ -419,9 +420,11 @@ sudo apt install libgtk-3-0 libayatana-appindicator3-1 libx11-6 xclip
 | `libgtk-3-0` | 托盘界面的 GTK3 运行时 | 启动失败 |
 | `libayatana-appindicator3-1` | 托盘图标注册 | 启动失败 |
 | `libx11-6` | 文本/图片剪贴板读写（运行期 `dlopen`，非链接期） | 文本与图片同步不可用 |
-| `xclip` | 文件剪贴板的 `text/uri-list` 读写 | 仅文件同步不可用，文本与图片正常 |
+| `xclip` | 文件剪贴板读写（target 见下方说明） | 仅文件同步不可用，文本与图片正常 |
 
 Wayland 会话下文件剪贴板会优先走 `wl-copy` / `wl-paste`，装了 `wl-clipboard` 包更好。
+
+文件剪贴板的 target 由桌面环境决定。GNOME 系文件管理器（含统信 UOS / deepin 的 `dde-file-manager`，其源码只认 `kGnomeCopyKey` 常量 `x-special/gnome-copied-files`）需要 `x-special/gnome-copied-files` 且数据带 `copy\n` 前缀；KDE (Dolphin) 使用 `text/uri-list`。在 UOS/deepin 上只写 `text/uri-list` 会让文件管理器感知到剪贴板变化、却粘不出任何文件。
 
 托盘端链接的是 `libayatana-appindicator3`，不是老的 `libappindicator3`。两者是同一次 fork、ABI 兼容，但 soname 不同，不能互相顶替：统信 UOS V20 只提供 `libayatana-appindicator3.so.1`，所以构建也统一用 ayatana（Debian 10 自带 `libayatana-appindicator3-dev`）。
 

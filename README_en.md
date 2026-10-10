@@ -95,7 +95,8 @@ This section only describes the technical solutions already implemented in the c
 #### Linux
 
 - Text/image listening mainly relies on `golang.design/x/clipboard` event channels.
-- File paths read via `xclip` from `text/uri-list`.
+- The file clipboard is read/written via `xclip` (Wayland sessions prefer `wl-copy`/`wl-paste`). **The target is chosen per desktop environment**: UnionTech UOS / deepin / GNOME-family use `x-special/gnome-copied-files` (data format `copy\nfile://...`), KDE uses `text/uri-list`; reads try several targets in order. A wrong target shows up as a file manager that sees a clipboard update but pastes nothing on Ctrl+V.
+- Writing to the clipboard forks a background owner process holding the selection. xclip / wl-copy run in the background by default but **do not close the inherited stdout/stderr**, so they must not be captured via `CombinedOutput`/`Output` — otherwise the caller blocks until another program takes over the clipboard.
 - Linux currently adheres more closely to "standard clipboard format driven" implementations, with higher dependency on the desktop environment.
 
 ### Design Trade-offs
@@ -418,9 +419,11 @@ sudo apt install libgtk-3-0 libayatana-appindicator3-1 libx11-6 xclip
 | `libgtk-3-0` | GTK3 runtime for the tray UI | Fails to start |
 | `libayatana-appindicator3-1` | Tray icon registration | Fails to start |
 | `libx11-6` | Text/image clipboard access (`dlopen`ed at runtime, not link-time) | Text and image sync unavailable |
-| `xclip` | Reading/writing `text/uri-list` for file clipboard | Only file sync unavailable; text and images still work |
+| `xclip` | Reading/writing the file clipboard (see the target note below) | Only file sync unavailable; text and images still work |
 
 On Wayland sessions the file clipboard prefers `wl-copy` / `wl-paste`; installing the `wl-clipboard` package is recommended.
+
+The file clipboard target depends on the desktop environment. GNOME-family file managers (including UOS / deepin `dde-file-manager`, which only honours its `kGnomeCopyKey` = `x-special/gnome-copied-files` constant) need `x-special/gnome-copied-files` with a `copy\n` prefix, while KDE (Dolphin) uses `text/uri-list`. Writing only `text/uri-list` on UOS/deepin makes the file manager aware of a clipboard change but unable to paste any file.
 
 The tray links against `libayatana-appindicator3`, not the legacy `libappindicator3`. The two are ABI-compatible forks of the same project but have different sonames, so they are not interchangeable: UOS V20 only ships `libayatana-appindicator3.so.1`, which is why the build targets ayatana too (Debian 10 provides `libayatana-appindicator3-dev`).
 
