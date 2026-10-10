@@ -1,19 +1,19 @@
 # ClipCascade 版本升级检查清单
 
-本清单用于每次正式版本发布，当前记录的发布目标为 `v2.2`。
+本清单用于每次正式版本发布，当前记录的发布目标为 `v2.3`。
 
 ## 版本入口
 
-| 文件 | v2.2 状态 |
+| 文件 | v2.3 状态 |
 |------|------|
-| `core/constants/constants.go` | `AppVersion = "2.2"` |
-| `client-desktop/main.go` | `Version = "2.2"` |
-| `client-desktop/cmd/desktop-ui/main.go` | `Version = "2.2"` |
-| `client-android-native-shell/android/app/build.gradle.kts` | `versionCode = 22`, `versionName = "2.2"` |
-| `Makefile` | `VERSION ?= 2.2` |
-| `_docs/STATUS.md` | `版本：v2.2` |
-| `.github/workflows/build.yml` | Release 正文使用 `CHANGELOG-2.2.md` |
-| `CHANGELOG-2.2.md` | 已记录本次功能、兼容性和验证结果 |
+| `core/constants/constants.go` | `AppVersion = "2.3"` |
+| `client-desktop/main.go` | `Version = "2.3"` |
+| `client-desktop/cmd/desktop-ui/main.go` | `Version = "2.3"` |
+| `client-android-native-shell/android/app/build.gradle.kts` | `versionCode = 23`, `versionName = "2.3"` |
+| `Makefile` | `VERSION ?= 2.3` |
+| `_docs/STATUS.md` | `版本：v2.3` |
+| `.github/workflows/build.yml` | Release 正文使用 `CHANGELOG-2.3.md` |
+| `CHANGELOG-2.3.md` | 已记录本次功能、兼容性和验证结果 |
 
 ## 发布前验证
 
@@ -46,11 +46,11 @@ GLIBC 符号版本守卫，超标会直接让 job 失败。
 
 ## GitHub 发布顺序
 
-1. 提交 `CHANGELOG-2.2.md`、README、状态文档和构建配置。
+1. 提交 `CHANGELOG-2.3.md`、README、状态文档和构建配置。
 2. 推送 `main`。
-3. 创建并推送 `v2.2` Tag。
+3. 创建并推送 `v2.3` Tag。
 4. 等待 `.github/workflows/build.yml` 的 Tag 工作流完成。
 5. 确认 Release 附件包含服务端、桌面端、桌面 UI、Web Clip 和 Android APK。
 6. 在统信 UOS / deepin 真机上启动 `clipcascade-desktop-linux-amd64`，确认托盘与剪贴板同步正常。
 
-插件兼容声明 `>=2.0.0` 属于插件 API 最低兼容版本，不随应用显示版本自动改成 `>=2.2.0`。
+插件兼容声明 `>=2.0.0` 属于插件 API 最低兼容版本，不随应用显示版本自动改成 `>=2.3.0`。

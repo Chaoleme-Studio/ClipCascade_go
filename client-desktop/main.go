@@ -17,7 +17,7 @@ import (
 
 // Version 由构建脚本通过 -ldflags "-X main.Version=..." 注入；
 // 若直接 go run 则为默认值。
-var Version = "2.2"
+var Version = "2.3"
 
 func main() {
 	// 为初始设置解析命令行参数 (flags)

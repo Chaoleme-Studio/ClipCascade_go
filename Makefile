@@ -4,7 +4,7 @@
 .PHONY: all server desktop mobile-android mobile-ios clean tidy docker
 
 # Versioning
-VERSION ?= 2.2
+VERSION ?= 2.3
 LDFLAGS = -ldflags="-s -w -X main.Version=$(VERSION)"
 
 # Output directory

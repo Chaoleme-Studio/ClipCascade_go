@@ -1,6 +1,13 @@
 # ClipCascade Go — 项目状态文档
 
-> 最后更新：2026-10-09  版本：v2.2
+> 最后更新：2026-10-10  版本：v2.3
+
+## v2.3 发布重点
+
+- 修复 Linux 文件剪贴板在统信 UOS / deepin 上**粘贴不出文件**的问题：`dde-file-manager` 只认 `x-special/gnome-copied-files`，写入 target 改为按桌面环境选择（KDE 用 `text/uri-list`，MATE 用 `x-special/mate-copied-files`）。
+- 修复 `xclip` **阻塞接收线程**的问题：属主进程 stdio 指向 `/dev/null`，改用 `Start()` + 异步 `Wait()`，不再等待剪贴板被其它程序接管。
+- 读取文件剪贴板时依次尝试多个 target，清洗 gnome 系 `copy\n` 前缀，并用 `os.Stat` 校验 `file://` 路径是否真实存在。
+- README 补充文件剪贴板 target 的桌面环境差异说明。
 
 ## v2.2 发布重点
 

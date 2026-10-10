@@ -9,7 +9,7 @@ on:
   workflow_dispatch:
     inputs:
       release_ref:
-        description: "Optional Git ref to build (for example v2.2)"
+        description: "Optional Git ref to build (for example v2.3)"
         required: false
         default: ""
 
@@ -373,5 +373,5 @@ jobs:
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
-          body_path: CHANGELOG-2.2.md
+          body_path: CHANGELOG-2.3.md
           files: artifacts/*
