@@ -175,6 +175,7 @@ ClipCascade 的定位是：以剪贴板为中心，做一个可自部署、可�
 | `WEBCLIP_PORT` | `8090` | 端口，占用自动+1 |
 | `WEBCLIP_DB_PATH` | 二进制目录/data.db | 数据库路径 |
 | `WEBCLIP_UPLOAD_DIR` | 二进制目录/uploads | 上传目录 |
+| `WEBCLIP_PASSWORD` | 空 | 设置后全站启用访问口令 |
 
 构建：
 
@@ -486,12 +487,11 @@ CLIPCASCADE_WINDOWS_GUI=1 ./build-scripts/build.sh cross
 | `CC_MAX_MESSAGE_SIZE_IN_BYTES` | `0` | WebSocket 单消息大小上限，单位字节；大于 0 时优先生效 |
 | `CC_P2P_ENABLED` | `false` | 是否启用 P2P 信令与 P2P 同步模式 |
 | `CC_P2P_STUN_URL` | `stun:stun.l.google.com:19302` | WebRTC STUN 地址 |
-| `CC_ALLOWED_ORIGINS` | `*` | CORS 允许来源，多个来源用逗号分隔 |
+| `CC_ALLOWED_ORIGINS` | 空（仅同源） | 跨域浏览器访问时显式配置来源，多个来源用逗号分隔 |
 | `CC_SIGNUP_ENABLED` | `false` | 是否开放自助注册 |
 | `CC_MAX_USER_ACCOUNTS` | `-1` | 最大用户数量；`-1` 表示不限制 |
-| `CC_ACCOUNT_PURGE_TIMEOUT_SECONDS` | `-1` | 账号清理超时；`-1` 表示关闭 |
-| `CC_SESSION_TIMEOUT` | `525960` | 登录会话有效期，单位分钟 |
-| `CC_MAX_UNIQUE_IP_ATTEMPTS` | `15` | 暴力破解防护：唯一 IP 尝试阈值 |
+| `CC_SESSION_TIMEOUT` | `10080` | 登录会话有效期，单位分钟（默认 7 天） |
+| `CC_API_RATE_LIMIT` | `240` | 每 IP 每分钟 `/api/*` 请求上限；`0` 表示关闭 |
 | `CC_MAX_ATTEMPTS_PER_IP` | `30` | 暴力破解防护：单 IP 尝试阈值 |
 | `CC_LOCK_TIMEOUT_SECONDS` | `60` | 触发锁定后的初始锁定时间 |
 | `CC_LOCK_TIMEOUT_SCALING_FACTOR` | `2` | 连续触发锁定后的时间放大倍数 |
@@ -509,6 +509,7 @@ CLIPCASCADE_WINDOWS_GUI=1 ./build-scripts/build.sh cross
 | `CC_AUTOMATION_RULES_PATH` | 空 | 自动化规则 JSONC 文件路径 |
 | `CC_AUTOMATION_COMMANDS_PATH` | 空 | 本地命令白名单 JSONC 文件路径 |
 | `CC_AUTOMATION_PLUGINS_DIR` | `./plugins` | 插件目录；相对路径按服务端二进制所在目录解析 |
+| `CC_PLUGIN_SHA256` | 空 | 可选的 WASI 插件 SHA-256 白名单，多个值用逗号分隔 |
 | `CC_AUTOMATION_COMMAND_TIMEOUT_SECONDS` | `30` | 本地命令单次执行超时 |
 | `CC_AUTOMATION_COMMAND_MAX_OUTPUT_BYTES` | `65536` | 本地命令 stdout 最大读取字节数 |
 | `CC_AUTOMATION_PLUGIN_TIMEOUT_SECONDS` | `30` | WASI 插件单次执行超时 |
@@ -523,6 +524,7 @@ CLIPCASCADE_WINDOWS_GUI=1 ./build-scripts/build.sh cross
 | `WEBCLIP_PORT` | `8090` | Web 剪贴板端口，占用时自动加 1 |
 | `WEBCLIP_DB_PATH` | 二进制目录 `data.db` | Web 剪贴板数据库路径 |
 | `WEBCLIP_UPLOAD_DIR` | 二进制目录 `uploads/` | Web 剪贴板上传目录 |
+| `WEBCLIP_PASSWORD` | 空 | 设置后全站启用访问口令 |
 
 ### 桌面端运行时
 

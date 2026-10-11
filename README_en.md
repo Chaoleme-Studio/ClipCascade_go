@@ -174,6 +174,7 @@ Prints data path and access address upon startup:
 | `WEBCLIP_PORT` | `8090` | Port, auto-increments if occupied |
 | `WEBCLIP_DB_PATH` | binary dir/data.db | Database path |
 | `WEBCLIP_UPLOAD_DIR` | binary dir/uploads | Upload directory |
+| `WEBCLIP_PASSWORD` | empty | Enables password access for the whole site |
 
 Build:
 
@@ -485,12 +486,11 @@ Relative paths are resolved from the server binary directory. The recommended re
 | `CC_MAX_MESSAGE_SIZE_IN_BYTES` | `0` | WebSocket single-message limit in bytes; takes priority when greater than 0 |
 | `CC_P2P_ENABLED` | `false` | Enables P2P signaling and P2P sync mode |
 | `CC_P2P_STUN_URL` | `stun:stun.l.google.com:19302` | WebRTC STUN server |
-| `CC_ALLOWED_ORIGINS` | `*` | CORS allowed origins, comma-separated |
+| `CC_ALLOWED_ORIGINS` | empty (same origin only) | Explicitly allow cross-origin browser access; comma-separated |
 | `CC_SIGNUP_ENABLED` | `false` | Enables public signup |
 | `CC_MAX_USER_ACCOUNTS` | `-1` | Maximum user count; `-1` means unlimited |
-| `CC_ACCOUNT_PURGE_TIMEOUT_SECONDS` | `-1` | Account purge timeout; `-1` disables it |
-| `CC_SESSION_TIMEOUT` | `525960` | Login session lifetime in minutes |
-| `CC_MAX_UNIQUE_IP_ATTEMPTS` | `15` | Brute-force protection unique IP threshold |
+| `CC_SESSION_TIMEOUT` | `10080` | Login session lifetime in minutes (7 days by default) |
+| `CC_API_RATE_LIMIT` | `240` | Requests per IP per minute to `/api/*`; `0` disables it |
 | `CC_MAX_ATTEMPTS_PER_IP` | `30` | Brute-force protection per-IP threshold |
 | `CC_LOCK_TIMEOUT_SECONDS` | `60` | Initial lock duration after protection triggers |
 | `CC_LOCK_TIMEOUT_SCALING_FACTOR` | `2` | Lock duration multiplier after repeated triggers |
@@ -508,6 +508,7 @@ Relative paths are resolved from the server binary directory. The recommended re
 | `CC_AUTOMATION_RULES_PATH` | empty | Automation rule JSONC file path |
 | `CC_AUTOMATION_COMMANDS_PATH` | empty | Local command whitelist JSONC file path |
 | `CC_AUTOMATION_PLUGINS_DIR` | `./plugins` | Plugin directory; relative paths resolve from the server binary directory |
+| `CC_PLUGIN_SHA256` | empty | Optional comma-separated SHA-256 allowlist for WASI plugins |
 | `CC_AUTOMATION_COMMAND_TIMEOUT_SECONDS` | `30` | Local command timeout per run |
 | `CC_AUTOMATION_COMMAND_MAX_OUTPUT_BYTES` | `65536` | Maximum stdout bytes read from local commands |
 | `CC_AUTOMATION_PLUGIN_TIMEOUT_SECONDS` | `30` | WASI plugin timeout per run |
@@ -522,6 +523,7 @@ Relative paths are resolved from the server binary directory. The recommended re
 | `WEBCLIP_PORT` | `8090` | Web clipboard port; auto-increments when occupied |
 | `WEBCLIP_DB_PATH` | binary dir `data.db` | Web clipboard database path |
 | `WEBCLIP_UPLOAD_DIR` | binary dir `uploads/` | Web clipboard upload directory |
+| `WEBCLIP_PASSWORD` | empty | Enables password access for the whole site |
 
 ### Desktop Runtime
 

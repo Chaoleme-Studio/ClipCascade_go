@@ -1,6 +1,13 @@
 # ClipCascade Go — 项目状态文档
 
-> 最后更新：2026-10-10  版本：v2.3
+> 最后更新：2026-10-11  版本：v2.4
+
+## v2.4 发布重点
+
+- Android 后台服务增加剪贴板读取与引擎重试、网络恢复感知和短时 WakeLock；移动引擎断线后保留并补发消息。
+- 桌面端增加消息 UUID 去重、P2P 信令重连和分片边界检查，断线期间的普通剪贴板消息可在连接恢复后补发。
+- 服务端加强 WebSocket、会话、跨域、API 限流和插件校验；WebClip 增加可选访问口令与受控文件下载。
+- 统一构建入口，并沿用 v2.2/v2.3 的 Linux glibc 2.28 兼容构建与文件剪贴板修复。
 
 ## v2.3 发布重点
 
@@ -54,6 +61,7 @@ ClipCascade_go/
 | WEBCLIP_PORT | 8090（占用自动+1）|
 | WEBCLIP_DB_PATH | 二进制目录/data.db |
 | WEBCLIP_UPLOAD_DIR | 二进制目录/uploads |
+| WEBCLIP_PASSWORD | 空（不启用访问口令）|
 
 ## 构建命令
 

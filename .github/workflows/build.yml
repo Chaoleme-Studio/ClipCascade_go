@@ -9,7 +9,7 @@ on:
   workflow_dispatch:
     inputs:
       release_ref:
-        description: "Optional Git ref to build (for example v2.3)"
+        description: "Optional Git ref to build (for example v2.4)"
         required: false
         default: ""
 
@@ -143,7 +143,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Build inside Debian 10 (buster)
-        run: docker run --rm -v "$PWD:/src" -e VERSION="${{ github.ref_name }}" -e GO_TOOLCHAIN_VERSION="${{ env.GO_TOOLCHAIN_VERSION }}" debian:buster bash /src/build-scripts/build_linux_legacy.sh desktop
+        run: docker run --rm -v "$PWD:/src" -e VERSION="${GITHUB_REF_NAME#v}" -e GO_TOOLCHAIN_VERSION="${{ env.GO_TOOLCHAIN_VERSION }}" debian:buster bash /src/build-scripts/build_linux_legacy.sh desktop
 
       - uses: actions/upload-artifact@v4
         with:
@@ -373,5 +373,5 @@ jobs:
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
-          body_path: CHANGELOG-2.3.md
+          body_path: CHANGELOG-2.4.md
           files: artifacts/*
