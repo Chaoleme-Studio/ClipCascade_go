@@ -31,6 +31,10 @@ func UploadFile(client *http.Client, serverURL string, path string, onProgress f
 
 	pr, pw := io.Pipe()
 	errCh := make(chan error, 1)
+	// 失败路径必须关闭 pipe 读端，否则泵 goroutine 与文件句柄永久泄漏。
+	closePipe := func(err error) {
+		_ = pr.CloseWithError(err)
+	}
 	go func() {
 		defer close(errCh)
 		defer file.Close()
@@ -57,6 +61,7 @@ func UploadFile(client *http.Client, serverURL string, path string, onProgress f
 
 	req, err := http.NewRequest(http.MethodPost, serverURL+"/api/files/upload", pr)
 	if err != nil {
+		closePipe(err)
 		return nil, err
 	}
 	req.ContentLength = int64(len(bodyPrefix)) + info.Size() + int64(len(bodySuffix))
@@ -64,6 +69,8 @@ func UploadFile(client *http.Client, serverURL string, path string, onProgress f
 	req.Header.Set("X-File-Size", strconv.FormatInt(info.Size(), 10))
 	resp, err := client.Do(req)
 	if err != nil {
+		// 关闭读端解除泵 goroutine 阻塞，避免 goroutine + 文件句柄泄漏
+		closePipe(err)
 		return nil, err
 	}
 	defer resp.Body.Close()

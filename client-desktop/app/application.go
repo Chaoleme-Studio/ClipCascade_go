@@ -28,6 +28,7 @@ import (
 	"github.com/clipcascade/desktop/config"
 	"github.com/clipcascade/desktop/transfer"
 	"github.com/clipcascade/desktop/transport"
+	"github.com/google/uuid"
 	"github.com/grandcat/zeroconf"
 )
 
@@ -46,6 +47,7 @@ type Application struct {
 	fileHTTPClient *http.Client // 文件传输专用，无超时（大文件上传/下载）
 	stomp          *transport.StompClient
 	p2p            *transport.P2PClient
+	sessionCookies []*http.Cookie // 会话 cookie，用于 P2P 断线自动重连
 	clip           *clipboard.Manager
 	tray           trayController
 	transferMgr    *transfer.Manager
@@ -62,9 +64,26 @@ type Application struct {
 	lastRecvMu   sync.Mutex
 	lastRecvHash string
 	lastRecvTime time.Time
+	recvUUIDs    map[string]time.Time // MessageUUID 去重窗口（跨通道/重连重复投递）
+
+	pastMu            sync.Mutex
+	lastPastedPayload string // 最近一次粘贴到本机的内容，用于回环守卫
+	lastPastedTime    time.Time
+
+	pendingMu       sync.Mutex
+	pendingSends    []pendingSend // 发送失败待重发队列（重连成功后 flush）
+	pendingFlushing bool
 
 	deferredMu    sync.Mutex
 	deferredFiles map[string]string
+}
+
+// pendingSend 是一条等待重发的剪贴板消息。
+type pendingSend struct {
+	body        string // 已编码（可能已加密）的完整消息体
+	payload     string
+	payloadType string
+	filename    string
 }
 
 // New 创建一个新的 Application 实例。
@@ -95,6 +114,7 @@ func newApplication(cfg *config.Config, withTray bool) *Application {
 		ctx:           ctx,
 		cancel:        cancel,
 		deferredFiles: make(map[string]string),
+		recvUUIDs:     make(map[string]time.Time),
 		httpClient: &http.Client{
 			Jar:     jar,
 			Timeout: 15 * time.Second,
@@ -103,14 +123,19 @@ func newApplication(cfg *config.Config, withTray bool) *Application {
 			},
 		},
 	}
-	// 文件传输专用客户端：共享 cookie jar，但无超时限制（大文件可能耗时数分钟）。
+	// 文件传输专用客户端：共享 cookie jar，无总超时（大文件可能耗时数分钟），
+	// 但响应头必须在 30s 内到达，避免服务端挂起时 goroutine 永久阻塞。
+	transportBase := http.DefaultTransport.(*http.Transport).Clone()
+	transportBase.ResponseHeaderTimeout = 30 * time.Second
 	app.fileHTTPClient = &http.Client{
-		Jar:     jar,
-		Timeout: 0,
+		Jar:       jar,
+		Timeout:   0,
+		Transport: transportBase,
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			return http.ErrUseLastResponse
 		},
 	}
+	app.loadDeferredFiles()
 	app.transferMgr = transfer.NewManager(app.setStatus, notify)
 	app.clip.SetNotifier(notify)
 	return app
@@ -152,8 +177,9 @@ func (a *Application) Start(autoConnect bool) error {
 	a.started = true
 	a.connMu.Unlock()
 
-	// 启动即清理 24 小时前的接收临时文件，避免长期累积。
+	// 启动即清理 24 小时前的接收临时文件与历史图片，避免长期累积。
 	a.clip.CleanupExpiredTempFiles()
+	go a.historyStore.CleanupImages(24 * time.Hour)
 
 	if err := a.clip.Init(); err != nil {
 		a.setStatus("Clipboard Error")
@@ -356,10 +382,14 @@ func (a *Application) connect() {
 	}
 
 	// Step 3: Connect WebSocket STOMP
-	a.stomp = transport.NewStompClient(a.cfg.ServerURL, cookies)
-	a.stomp.OnMessage(a.onReceive)
+	stompClient := transport.NewStompClient(a.cfg.ServerURL, cookies)
+	stompClient.OnMessage(a.onReceive)
+	a.connMu.Lock()
+	a.stomp = stompClient
+	a.sessionCookies = cookies
+	a.connMu.Unlock()
 
-	if err := a.stomp.Connect(); err != nil {
+	if err := stompClient.Connect(); err != nil {
 		slog.Error("WebSocket 连接失败", "错误", err)
 		a.setStatus("WS Failed")
 		notify("ClipCascade", "WebSocket connection failed")
@@ -373,9 +403,12 @@ func (a *Application) connect() {
 		if a.cfg.StunURL != "" {
 			stunURL = a.cfg.StunURL
 		}
-		a.p2p = transport.NewP2PClient(a.cfg.ServerURL, cookies, stunURL)
-		a.p2p.OnReceive(a.onReceive)
-		if err := a.p2p.Connect(); err != nil {
+		p2pClient := transport.NewP2PClient(a.cfg.ServerURL, cookies, stunURL)
+		p2pClient.OnReceive(a.onReceive)
+		a.connMu.Lock()
+		a.p2p = p2pClient
+		a.connMu.Unlock()
+		if err := p2pClient.Connect(); err != nil {
 			slog.Warn("应用：P2P 连接失败", "错误", err)
 		}
 	}
@@ -386,6 +419,8 @@ func (a *Application) connect() {
 	go func() {
 		_, _ = a.RefreshDeviceCounts()
 	}()
+	// 重连成功后补发断线期间积压的剪贴板消息
+	go a.flushPendingSends()
 }
 
 // login 执行基于 HTTP 表单的 login 并返回 session cookies。
@@ -451,11 +486,25 @@ func (a *Application) deriveEncryptionKey() error {
 
 // onCopy 在本地剪贴板更改时被调用。发送到 server。
 func (a *Application) onCopy(payload string, payloadType string, filename string) {
-	if a.stomp == nil || !a.stomp.IsConnected() {
+	stomp := a.currentStomp()
+	connected := stomp != nil && stomp.IsConnected()
+	// 回环守卫：最近粘贴到本机的内容触发的复制事件在 5s 内忽略
+	if a.suppressEcho(payload) {
+		slog.Debug("应用：忽略粘贴回环触发的复制事件")
 		return
 	}
 	if !a.allowSendType(payloadType) {
 		slog.Debug("应用：按发送过滤规则跳过", "类型", payloadType, "文件名", filename)
+		return
+	}
+	if !connected {
+		// 文件路径必须在连接恢复后重新登记或上传，不能把本机路径当作普通消息补发。
+		if payloadType == constants.TypeFileStub {
+			slog.Warn("应用：断线期间无法同步文件，请重连后重新复制")
+			return
+		}
+		// 暂存原始数据；重连派生密钥后再编码，避免 E2EE 尚未就绪时发送明文。
+		a.enqueuePendingSend(pendingSend{payload: payload, payloadType: payloadType, filename: filename})
 		return
 	}
 	slog.Info("应用：准备发送剪贴板更新", "类型", payloadType, "大小", sizefmt.HumanSizeFromPayload(payloadType, payload))
@@ -467,9 +516,12 @@ func (a *Application) onCopy(payload string, payloadType string, filename string
 	}
 
 	clipData := &protocol.ClipboardData{
-		Payload:  payload,
-		Type:     payloadType,
-		FileName: filename,
+		Payload:     payload,
+		Type:        payloadType,
+		FileName:    filename,
+		MessageUUID: uuid.New().String(),
+		DeviceID:    a.cfg.DeviceID,
+		TimestampMs: time.Now().UnixMilli(),
 	}
 	body, err := a.encodeClipboardData(clipData)
 	if err != nil {
@@ -477,24 +529,111 @@ func (a *Application) onCopy(payload string, payloadType string, filename string
 		return
 	}
 	if err := a.sendEncodedBody(body); err != nil {
-		slog.Error("发送失败", "错误", err)
+		slog.Error("发送失败，已加入重发队列", "错误", err)
+		a.enqueuePendingSend(pendingSend{body: body, payload: payload, payloadType: payloadType, filename: filename})
 		return
 	}
 	a.appendHistory(payload, payloadType, filename, "sent")
 }
 
 func (a *Application) sendEncodedBody(body string) error {
-	if err := a.stomp.Send(body); err != nil {
+	stomp := a.currentStomp()
+	if stomp == nil {
+		return fmt.Errorf("not connected")
+	}
+	if err := stomp.Send(body); err != nil {
 		return err
 	}
-	if a.p2p != nil {
-		a.p2p.Send(body)
+	if p2p := a.currentP2P(); p2p != nil {
+		p2p.Send(body)
 	}
 	return nil
 }
 
+// rememberPastedPayload 记录最近一次粘贴到本机的内容，用于回环守卫。
+func (a *Application) rememberPastedPayload(payload string) {
+	a.pastMu.Lock()
+	a.lastPastedPayload = payload
+	a.lastPastedTime = time.Now()
+	a.pastMu.Unlock()
+}
+
+// suppressEcho 报告该复制事件是否由本机粘贴（回环）触发。
+func (a *Application) suppressEcho(payload string) bool {
+	a.pastMu.Lock()
+	defer a.pastMu.Unlock()
+	return a.lastPastedPayload == payload && time.Since(a.lastPastedTime) < 5*time.Second
+}
+
+// enqueuePendingSend 将失败消息加入重发队列（上限 20 条，超出丢弃最旧）。
+func (a *Application) enqueuePendingSend(item pendingSend) {
+	a.pendingMu.Lock()
+	defer a.pendingMu.Unlock()
+	if len(a.pendingSends) >= 20 {
+		a.pendingSends = a.pendingSends[1:]
+	}
+	a.pendingSends = append(a.pendingSends, item)
+}
+
+// flushPendingSends 在连接恢复后补发积压消息。
+func (a *Application) flushPendingSends() {
+	stomp := a.currentStomp()
+	if stomp == nil || !stomp.IsConnected() {
+		return
+	}
+	a.pendingMu.Lock()
+	if len(a.pendingSends) == 0 || a.pendingFlushing {
+		a.pendingMu.Unlock()
+		return
+	}
+	a.pendingFlushing = true
+	batch := a.pendingSends
+	a.pendingSends = nil
+	a.pendingMu.Unlock()
+	defer func() {
+		a.pendingMu.Lock()
+		a.pendingFlushing = false
+		a.pendingMu.Unlock()
+	}()
+
+	for i, item := range batch {
+		if item.body == "" {
+			clipData := &protocol.ClipboardData{
+				Payload: item.payload, Type: item.payloadType, FileName: item.filename,
+				MessageUUID: uuid.New().String(), DeviceID: a.cfg.DeviceID, TimestampMs: time.Now().UnixMilli(),
+			}
+			body, err := a.encodeClipboardData(clipData)
+			if err != nil {
+				a.restorePendingSends(batch[i:])
+				return
+			}
+			item.body = body
+			batch[i] = item
+		}
+		if err := a.sendEncodedBody(item.body); err != nil {
+			slog.Warn("应用：重发队列投递失败，保留剩余消息", "错误", err)
+			a.restorePendingSends(batch[i:])
+			return
+		}
+		a.appendHistory(item.payload, item.payloadType, item.filename, "sent")
+	}
+	slog.Info("应用：重发队列已清空", "条数", len(batch))
+}
+
+func (a *Application) restorePendingSends(items []pendingSend) {
+	a.pendingMu.Lock()
+	a.pendingSends = append(append([]pendingSend(nil), items...), a.pendingSends...)
+	if len(a.pendingSends) > 20 {
+		a.pendingSends = a.pendingSends[len(a.pendingSends)-20:]
+	}
+	a.pendingMu.Unlock()
+}
+
 func (a *Application) encodeClipboardData(clipData *protocol.ClipboardData) (string, error) {
-	if a.cfg.E2EEEnabled && a.encKey != nil {
+	if a.cfg.E2EEEnabled {
+		if a.encKey == nil {
+			return "", fmt.Errorf("encryption key not ready")
+		}
 		jsonBytes, _ := clipData.Encode()
 		encrypted, err := pkgcrypto.Encrypt(a.encKey, jsonBytes)
 		if err != nil {
@@ -522,11 +661,38 @@ func (a *Application) allowSendType(payloadType string) bool {
 
 // onReceive 当从 server 接收到剪贴板消息时被调用。
 func (a *Application) onReceive(body string) {
-	// 双通道并发跨线兜底消重 (针对 P2P 瞬间与 STOMP 服务器并发投递同一套 payload 的场景)
-	a.lastRecvMu.Lock()
-	hash := fmt.Sprintf("%x", sha256.Sum256([]byte(body)))
+	clipData, err := a.decodeIncomingClipboardData(body)
+	if err != nil {
+		slog.Warn("剪贴板数据解码失败", "错误", err)
+		return
+	}
+
 	now := time.Now()
-	// 如果在 5 秒内收到完全相同的加密/明文字符串，安全地认为是通道冗余并抛弃
+	a.lastRecvMu.Lock()
+	// 1) 丢弃本机设备 ID 的回环消息（服务端已排除 sender，此为 P2P/重连兜底）
+	if clipData.DeviceID != "" && clipData.DeviceID == a.cfg.DeviceID {
+		a.lastRecvMu.Unlock()
+		slog.Debug("应用：丢弃本机设备回环消息")
+		return
+	}
+	// 2) MessageUUID 级去重（跨通道/重连重复投递），窗口 10 分钟，容量上限 256
+	if clipData.MessageUUID != "" {
+		if _, seen := a.recvUUIDs[clipData.MessageUUID]; seen {
+			a.lastRecvMu.Unlock()
+			slog.Debug("应用：丢弃重复消息（MessageUUID 已见）")
+			return
+		}
+		a.recvUUIDs[clipData.MessageUUID] = now
+		if len(a.recvUUIDs) > 256 {
+			for k, t := range a.recvUUIDs {
+				if now.Sub(t) > 10*time.Minute {
+					delete(a.recvUUIDs, k)
+				}
+			}
+		}
+	}
+	// 3) 兼容旧客户端：字节级 5 秒单槽去重（双通道并发兜底）
+	hash := fmt.Sprintf("%x", sha256.Sum256([]byte(body)))
 	if a.lastRecvHash == hash && now.Sub(a.lastRecvTime) < 5*time.Second {
 		a.lastRecvMu.Unlock()
 		slog.Debug("应用：静默丢弃重复荷载（P2P/STOMP 双通道并发兜底保护）")
@@ -535,12 +701,6 @@ func (a *Application) onReceive(body string) {
 	a.lastRecvHash = hash
 	a.lastRecvTime = now
 	a.lastRecvMu.Unlock()
-
-	clipData, err := a.decodeIncomingClipboardData(body)
-	if err != nil {
-		slog.Warn("剪贴板数据解码失败", "错误", err)
-		return
-	}
 
 	// Paste to local clipboard
 	slog.Info("应用：收到剪贴板更新", "类型", clipData.Type, "大小", sizefmt.HumanSizeFromPayload(clipData.Type, clipData.Payload))
@@ -554,6 +714,7 @@ func (a *Application) onReceive(body string) {
 		return
 	}
 	a.clip.Paste(clipData.Payload, clipData.Type, clipData.FileName)
+	a.rememberPastedPayload(clipData.Payload)
 	a.appendHistory(clipData.Payload, clipData.Type, clipData.FileName, "received")
 	slog.Debug("应用：已接收并粘贴", "类型", clipData.Type, "大小", len(clipData.Payload))
 }
@@ -700,7 +861,7 @@ func (a *Application) handleFileOffer(clipData *protocol.ClipboardData) {
 		a.transferMgr.MarkFailed(transferID, err)
 		return
 	}
-	destPath := filepath.Join(tempDir, sanitizeOfferName(offer.FileName))
+	destPath := filepath.Join(tempDir, fmt.Sprintf("%d-%s", time.Now().UnixNano(), sanitizeOfferName(offer.FileName)))
 	if err := transfer.DownloadFile(a.fileHTTPClient, a.cfg.ServerURL, offer.RelayID, destPath, offer.SHA256, func(done, total int64) {
 		a.transferMgr.UpdateProgress(transferID, done, total)
 	}); err != nil {
@@ -790,7 +951,51 @@ func sanitizeOfferName(name string) string {
 func (a *Application) rememberDeferredFile(deferredID string, path string) {
 	a.deferredMu.Lock()
 	defer a.deferredMu.Unlock()
+	// 上限 100 条，超出丢弃最旧（map 无序，此处仅防无界增长）
+	if len(a.deferredFiles) >= 100 {
+		for k := range a.deferredFiles {
+			delete(a.deferredFiles, k)
+			break
+		}
+	}
 	a.deferredFiles[deferredID] = path
+	a.saveDeferredFilesLocked()
+}
+
+// deferredPath 返回 deferred 文件映射的持久化路径。
+func (a *Application) deferredPath() string {
+	return filepath.Join(config.ConfigDir(), "deferred-files.json")
+}
+
+// loadDeferredFiles 启动时恢复 deferred 文件映射（重启后大文件请求不再死链）。
+func (a *Application) loadDeferredFiles() {
+	data, err := os.ReadFile(a.deferredPath())
+	if err != nil {
+		return
+	}
+	var m map[string]string
+	if err := json.Unmarshal(data, &m); err != nil || m == nil {
+		return
+	}
+	// 校验文件仍存在，清理死链
+	for id, path := range m {
+		if info, err := os.Stat(path); err != nil || info.IsDir() {
+			delete(m, id)
+		}
+	}
+	a.deferredFiles = m
+}
+
+// saveDeferredFilesLocked 将映射持久化到磁盘（调用方需持有 deferredMu）。
+func (a *Application) saveDeferredFilesLocked() {
+	data, err := json.MarshalIndent(a.deferredFiles, "", "  ")
+	if err != nil {
+		return
+	}
+	if err := os.MkdirAll(filepath.Dir(a.deferredPath()), 0o755); err != nil {
+		return
+	}
+	_ = os.WriteFile(a.deferredPath(), data, 0o600)
 }
 
 func (a *Application) lookupDeferredFile(deferredID string) (string, bool) {
@@ -821,6 +1026,20 @@ func extractSingleFilePath(payload string) (string, bool) {
 	return paths[0], true
 }
 
+// currentStomp 安全读取当前 STOMP 客户端（connMu 保护，避免跨 goroutine data race）。
+func (a *Application) currentStomp() *transport.StompClient {
+	a.connMu.Lock()
+	defer a.connMu.Unlock()
+	return a.stomp
+}
+
+// currentP2P 安全读取当前 P2P 客户端。
+func (a *Application) currentP2P() *transport.P2PClient {
+	a.connMu.Lock()
+	defer a.connMu.Unlock()
+	return a.p2p
+}
+
 // monitorConnection 检查连接健康状况并触发重连。
 func (a *Application) monitorConnection() {
 	ticker := time.NewTicker(1 * time.Second)
@@ -831,12 +1050,43 @@ func (a *Application) monitorConnection() {
 		case <-a.ctx.Done():
 			return
 		case <-ticker.C:
-			if a.stomp != nil && !a.stomp.IsConnected() && !a.isReconnecting() {
+			stomp := a.currentStomp()
+			if stomp != nil && !stomp.IsConnected() && !a.isReconnecting() {
 				slog.Warn("应用：连接丢失，正在触发重连")
 				go a.reconnectLoop()
 			}
+			// 断线期间积压的消息在恢复后补发
+			a.pendingMu.Lock()
+			nPending := len(a.pendingSends)
+			a.pendingMu.Unlock()
+			if nPending > 0 && stomp != nil && stomp.IsConnected() {
+				go a.flushPendingSends()
+			}
+			// P2P 静默死亡时自动重建（仅 STOMP 已连接时，cookie 仍有效）
+			if a.cfg.P2PEnabled && stomp != nil && stomp.IsConnected() && a.currentP2P() == nil {
+				if cookies := a.getSessionCookies(); cookies != nil {
+					slog.Info("应用：P2P 信令断开，尝试自动重连")
+					p2pClient := transport.NewP2PClient(a.cfg.ServerURL, cookies, a.cfg.StunURL)
+					p2pClient.OnReceive(a.onReceive)
+					a.connMu.Lock()
+					a.p2p = p2pClient
+					a.connMu.Unlock()
+					if err := p2pClient.Connect(); err != nil {
+						slog.Warn("应用：P2P 自动重连失败", "错误", err)
+						a.connMu.Lock()
+						a.p2p = nil
+						a.connMu.Unlock()
+					}
+				}
+			}
 		}
 	}
+}
+
+func (a *Application) getSessionCookies() []*http.Cookie {
+	a.connMu.Lock()
+	defer a.connMu.Unlock()
+	return a.sessionCookies
 }
 
 // reconnectLoop 会立即发起第一次重连尝试；失败后继续指数退避。
@@ -875,7 +1125,7 @@ func (a *Application) reconnectLoop() {
 		// 先销毁旧传输对象，再按原始 connect 流程重建新的连接。
 		a.closeTransports()
 		a.connect()
-		if a.stomp != nil && a.stomp.IsConnected() {
+		if stomp := a.currentStomp(); stomp != nil && stomp.IsConnected() {
 			return // reconnected
 		}
 
@@ -921,6 +1171,8 @@ func (a *Application) shutdown() {
 }
 
 func (a *Application) closeTransports() {
+	a.connMu.Lock()
+	defer a.connMu.Unlock()
 	if a.stomp != nil {
 		a.stomp.Close()
 		a.stomp = nil
@@ -929,4 +1181,5 @@ func (a *Application) closeTransports() {
 		a.p2p.Close()
 		a.p2p = nil
 	}
+	a.sessionCookies = nil
 }

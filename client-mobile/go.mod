@@ -5,6 +5,7 @@ go 1.24.0
 require (
 	fyne.io/fyne/v2 v2.7.3
 	github.com/clipcascade/pkg v0.0.0
+	github.com/google/uuid v1.6.0
 	github.com/gorilla/websocket v1.5.3
 	github.com/grandcat/zeroconf v1.0.0
 )

@@ -3,9 +3,12 @@ package automation
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -708,6 +711,26 @@ func runWASIPlugin(ctx context.Context, wasmPath string, input []byte, outputLim
 	if err != nil {
 		return "", "", err
 	}
+
+	// 完整性校验：插件目录即信任边界，这里提供两层防护——
+	// 1) 计算并记录 wasm 的 SHA-256（审计可追溯）；
+	// 2) 若设置了 CC_PLUGIN_SHA256（逗号分隔白名单），未命中的插件拒绝执行。
+	sum := sha256.Sum256(wasm)
+	wasmHash := hex.EncodeToString(sum[:])
+	slog.Debug("WASI 插件完整性", "path", filepath.Base(wasmPath), "sha256", wasmHash)
+	if allowed := os.Getenv("CC_PLUGIN_SHA256"); allowed != "" {
+		trusted := false
+		for _, h := range strings.Split(allowed, ",") {
+			if strings.EqualFold(strings.TrimSpace(h), wasmHash) {
+				trusted = true
+				break
+			}
+		}
+		if !trusted {
+			return "", "", fmt.Errorf("插件 sha256=%s 不在 CC_PLUGIN_SHA256 白名单中，拒绝执行", wasmHash[:16]+"...")
+		}
+	}
+
 	runtime := wazero.NewRuntime(ctx)
 	defer runtime.Close(context.Background())
 	if _, err := wasi_snapshot_preview1.Instantiate(ctx, runtime); err != nil {

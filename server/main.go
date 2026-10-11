@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -69,10 +70,25 @@ func main() {
 		os.Exit(1)
 	}
 
-	db, err := gorm.Open(sqlite.Open(cfg.DatabasePath), &gorm.Config{})
+	// SQLite 打开参数：WAL 模式 + busy_timeout，避免高并发写下 database is locked。
+	// 写连接串行为 1（SetMaxOpenConns(1)），彻底规避 SQLite 单写锁竞争。
+	dsn := cfg.DatabasePath
+	sep := "?"
+	if strings.Contains(dsn, "?") {
+		sep = "&"
+	}
+	dsn += sep + "_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)"
+	db, err := gorm.Open(sqlite.Open(dsn), &gorm.Config{})
 	if err != nil {
 		slog.Error("打开数据库失败", "error", err)
 		os.Exit(1)
+	}
+	if sqlDB, err := db.DB(); err == nil {
+		sqlDB.SetMaxOpenConns(1)
+		sqlDB.SetMaxIdleConns(1)
+		sqlDB.SetConnMaxLifetime(0)
+	} else {
+		slog.Warn("无法配置数据库连接池", "error", err)
 	}
 
 	if err := model.InitDB(db); err != nil {
@@ -120,10 +136,14 @@ func main() {
 		Format:     "${time} | ${status} | ${latency} | ${method} ${path}\n",
 		TimeFormat: "15:04:05",
 	}))
-	app.Use(cors.New(cors.Config{
-		AllowOrigins:     cfg.AllowedOrigins,
-		AllowCredentials: cfg.AllowedOrigins != "*",
-	}))
+	// CORS：仅当显式配置了 CC_ALLOWED_ORIGINS 时启用。
+	// 默认（空）= 仅同源：浏览器同源请求本就不需要 CORS 头，跨域一律被浏览器拦截。
+	if cfg.AllowedOrigins != "" {
+		app.Use(cors.New(cors.Config{
+			AllowOrigins:     cfg.AllowedOrigins,
+			AllowCredentials: cfg.AllowedOrigins != "*",
+		}))
+	}
 	app.Use(func(c *fiber.Ctx) error {
 		if c.Path() == "/api/files/upload" {
 			return c.Next()
@@ -138,6 +158,9 @@ func main() {
 		return c.Next()
 	})
 
+	// API 速率限制：每 IP 每分钟上限（默认 240，CC_API_RATE_LIMIT 可调，<=0 关闭）
+	app.Use("/api", middleware.NewAPIRateLimit(cfg.APIRateLimit, time.Minute))
+
 	// 提供嵌入的静态文件服务
 	app.Use("/assets", filesystem.New(filesystem.Config{
 		Root:       http.FS(staticFS),
@@ -146,6 +169,16 @@ func main() {
 
 	// 创建 handlers 和中间件
 	wsHub := handler.NewWSHub()
+	// WS 单条消息上限：消息上限 * 4/3（base64 膨胀）+ 1MB 帧开销，封顶 256MB
+	wsReadLimit := cfg.EffectiveMaxMessageBytes()
+	if wsReadLimit <= 0 {
+		wsReadLimit = 64 << 20 // P2P 模式下消息不限大小，WS 通道仍设 64MiB 上限
+	}
+	wsReadLimit = wsReadLimit*4/3 + 1<<20
+	if wsReadLimit > 256<<20 {
+		wsReadLimit = 256 << 20
+	}
+	wsHub.SetReadLimit(wsReadLimit)
 	var automationEngine *automation.Engine
 	if cfg.AutomationEnabled {
 		var err error
@@ -203,10 +236,22 @@ func main() {
 			return c.Redirect("/login")
 		}
 
-		// 在 local 中为下游 handlers 设置 user 信息
-		c.Locals("username", sess.Get("username"))
-		c.Locals("user_id", sess.Get("user_id"))
-		c.Locals("role", sess.Get("role"))
+		// 回查数据库校验用户状态：禁用/删除的用户立即失效，角色实时生效，
+		// 不再依赖登录时写入 session 的快照。
+		username, _ := sess.Get("username").(string)
+		var u model.User
+		if err := db.Where("username = ?", username).First(&u).Error; err != nil || !u.Enabled {
+			_ = sess.Destroy()
+			if strings.HasPrefix(path, "/api/") {
+				return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "unauthorized"})
+			}
+			return c.Redirect("/login")
+		}
+
+		// 在 local 中为下游 handlers 设置 user 信息（以数据库实时值为准）
+		c.Locals("username", u.Username)
+		c.Locals("user_id", u.ID)
+		c.Locals("role", u.Role)
 		return c.Next()
 	})
 
@@ -279,6 +324,9 @@ func main() {
 
 	// WebSocket 端点 (STOMP)
 	app.Use("/clipsocket", func(c *fiber.Ctx) error {
+		if !originAllowed(cfg, c) {
+			return fiber.ErrForbidden
+		}
 		if websocket.IsWebSocketUpgrade(c) {
 			return c.Next()
 		}
@@ -291,6 +339,9 @@ func main() {
 	// P2P WebSocket signaling 端点
 	p2pSignaling := handler.NewP2PSignaling()
 	app.Use("/p2p", func(c *fiber.Ctx) error {
+		if !originAllowed(cfg, c) {
+			return fiber.ErrForbidden
+		}
 		if websocket.IsWebSocketUpgrade(c) {
 			return c.Next()
 		}
@@ -384,6 +435,30 @@ func main() {
 }
 
 // seedAdminUser 如果不存在 user，则创建默认 admin user。
+// originAllowed 校验 WebSocket 升级请求的 Origin，防跨站 WebSocket 劫持（CSWSH）。
+// 规则：
+//   - 原生客户端（桌面/移动 Go 客户端）不发 Origin → 直接放行；
+//   - CC_ALLOWED_ORIGINS="*" → 不限制；
+//   - 浏览器请求必须同源（Origin host == 请求 host）或命中白名单。
+func originAllowed(cfg *config.Config, c *fiber.Ctx) bool {
+	origin := c.Get("Origin")
+	if origin == "" {
+		return true
+	}
+	if cfg.AllowedOrigins == "*" {
+		return true
+	}
+	if u, err := url.Parse(origin); err == nil && u.Host != "" && strings.EqualFold(u.Host, c.Hostname()) {
+		return true
+	}
+	for _, o := range cfg.AllowedOriginsList() {
+		if strings.TrimSuffix(o, "/") == origin {
+			return true
+		}
+	}
+	return false
+}
+
 func seedAdminUser(db *gorm.DB) {
 	var count int64
 	db.Model(&model.User{}).Count(&count)

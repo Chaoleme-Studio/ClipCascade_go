@@ -2,9 +2,10 @@ package crypto
 
 import (
 	"crypto/sha256"
-	"crypto/sha512"
+	"encoding/hex"
 
 	"golang.org/x/crypto/pbkdf2"
+	"golang.org/x/crypto/sha3"
 )
 
 // DeriveKey 使用 PBKDF2-HMAC-SHA256 派生 AES-256 密钥，
@@ -24,16 +25,10 @@ func DeriveKey(password, username, salt string, rounds int) []byte {
 
 // SHA3_512Hex 计算输入字符串的小写十六进制 SHA3-512 hash，
 // 与 Python 的 hashlib.sha3_512(...).hexdigest() 匹配。
+//
+// 修复记录：旧实现误用 crypto/sha512（SHA-2），与函数名及 Python 端
+// hashlib.sha3_512 不一致。现改为 golang.org/x/crypto/sha3 的真 SHA3-512。
 func SHA3_512Hex(input string) string {
-	h := sha512.New()
-	h.Write([]byte(input))
-	sum := h.Sum(nil)
-	// 转换为小写十六进制
-	const hextable = "0123456789abcdef"
-	dst := make([]byte, len(sum)*2)
-	for i, v := range sum {
-		dst[i*2] = hextable[v>>4]
-		dst[i*2+1] = hextable[v&0x0f]
-	}
-	return string(dst)
+	sum := sha3.Sum512([]byte(input))
+	return hex.EncodeToString(sum[:])
 }

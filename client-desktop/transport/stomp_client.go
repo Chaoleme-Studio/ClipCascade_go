@@ -39,7 +39,9 @@ func NewStompClient(serverURL string, cookies []*http.Cookie) *StompClient {
 
 // OnMessage 设置传入剪贴板消息的回调。
 func (sc *StompClient) OnMessage(fn func(body string)) {
+	sc.mu.Lock()
 	sc.onMessage = fn
+	sc.mu.Unlock()
 }
 
 // Connect 建立 WebSocket 连接并执行 STOMP 握手。
@@ -150,6 +152,13 @@ func (sc *StompClient) IsConnected() bool {
 func (sc *StompClient) readLoop() {
 	const heartbeatInterval = 30 * time.Second
 	const readTimeout = 120 * time.Second // 读超时应大于心跳周期
+
+	// 任何回调 panic 不得杀死整个应用进程
+	defer func() {
+		if r := recover(); r != nil {
+			slog.Error("stomp: read loop panic recovered", "panic", r)
+		}
+	}()
 
 	heartbeatDone := make(chan struct{})
 	defer close(heartbeatDone)

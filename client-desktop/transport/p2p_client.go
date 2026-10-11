@@ -30,10 +30,29 @@ type P2PClient struct {
 	sessionID          string
 	stunURL            string
 	onReceive          func(data string)
-	receivingFragments map[string][]string // ID -> fragments
+	receivingFragments map[string][]string  // ID -> fragments
+	fragmentTimes      map[string]time.Time // ID -> 首个分片到达时间（超时清理用）
+	pendingPeerLists   [][]string           // session-id 分配前到达的 peer-list 缓存（glare 修复）
 	done               chan struct{}
 	wsMu               sync.Mutex // 防止 Gorilla WebSocket 发生并发死写 panic
 }
+
+// p2pFragment 是 P2P 专用分片包装结构（不使用 protocol.ClipboardData
+// 避免与应用层/E2EE 双重嵌套）。
+type p2pFragment struct {
+	Payload        string `json:"payload"`
+	ID             string `json:"id"`
+	Index          int    `json:"index"`
+	TotalFragments int    `json:"totalFragments"`
+}
+
+const (
+	p2pReassembleTimeout   = 60 * time.Second // 不完整分片的淘汰时限
+	p2pSignalReconnectBase = 5 * time.Second  // 信令重连退避起点
+	p2pSignalReconnectMax  = 60 * time.Second // 信令重连退避上限
+	maxP2PFragments        = 4096             // 每条消息最多 64 MiB，限制恶意分片声明占用内存
+	maxP2PFragmentGroups   = 128              // 同时缓存的不完整消息数
+)
 
 // NewP2PClient 创建一个连接到 signaling server 的 P2P client。
 func NewP2PClient(serverURL string, cookies []*http.Cookie, stunURL string) *P2PClient {
@@ -44,33 +63,39 @@ func NewP2PClient(serverURL string, cookies []*http.Cookie, stunURL string) *P2P
 		peers:              make(map[string]*webrtc.PeerConnection),
 		dataChans:          make(map[string]*webrtc.DataChannel),
 		receivingFragments: make(map[string][]string),
+		fragmentTimes:      make(map[string]time.Time),
 		done:               make(chan struct{}),
 	}
 }
 
 // OnReceive 设置通过 DataChannel 接收到数据时的回调。
 func (p *P2PClient) OnReceive(fn func(data string)) {
+	p.mu.Lock()
 	p.onReceive = fn
+	p.mu.Unlock()
 }
 
-// Connect 建立 signaling WebSocket 连接。
+func (p *P2PClient) getOnReceive() func(data string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.onReceive
+}
+
+func (p *P2PClient) getWSConn() *websocket.Conn {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.wsConn
+}
+
+// Connect 建立 signaling WebSocket 连接。断线后由 signalLoop 内部自动重连。
 func (p *P2PClient) Connect() error {
-	wsURL, err := p.buildWSURL()
+	conn, err := p.dialSignaling()
 	if err != nil {
 		return err
 	}
-
-	dialer := websocket.Dialer{}
-	header := http.Header{}
-	for _, c := range p.cookies {
-		header.Add("Cookie", c.String())
-	}
-
-	conn, _, err := dialer.Dial(wsURL, header)
-	if err != nil {
-		return fmt.Errorf("p2p signaling dial: %w", err)
-	}
+	p.mu.Lock()
 	p.wsConn = conn
+	p.mu.Unlock()
 
 	go p.signalLoop()
 
@@ -78,11 +103,37 @@ func (p *P2PClient) Connect() error {
 	return nil
 }
 
+// dialSignaling 建立一条新的信令 WebSocket 连接。
+func (p *P2PClient) dialSignaling() (*websocket.Conn, error) {
+	wsURL, err := p.buildWSURL()
+	if err != nil {
+		return nil, err
+	}
+
+	dialer := websocket.Dialer{HandshakeTimeout: 10 * time.Second}
+	header := http.Header{}
+	for _, c := range p.cookies {
+		header.Add("Cookie", c.String())
+	}
+
+	conn, _, err := dialer.Dial(wsURL, header)
+	if err != nil {
+		return nil, fmt.Errorf("p2p signaling dial: %w", err)
+	}
+	return conn, nil
+}
+
 // Send 通过 DataChannel 向所有已连接的 peers 广播数据。
-// 支持自动分片以处理大数据包。
+// 支持自动分片以处理大数据包。发送过程不持有 p.mu，避免阻塞接收路径。
 func (p *P2PClient) Send(data string) {
 	p.mu.Lock()
-	defer p.mu.Unlock()
+	chans := make([]*webrtc.DataChannel, 0, len(p.dataChans))
+	for _, dc := range p.dataChans {
+		if dc.ReadyState() == webrtc.DataChannelStateOpen {
+			chans = append(chans, dc)
+		}
+	}
+	p.mu.Unlock()
 
 	fragmentID := uuid.New().String()
 	dataBytes := []byte(data)
@@ -90,16 +141,12 @@ func (p *P2PClient) Send(data string) {
 
 	// 计算分片
 	numFragments := (totalSize + constants.FragmentSize - 1) / constants.FragmentSize
-	if numFragments == 0 {
+	if numFragments > maxP2PFragments {
+		slog.Warn("p2p: 消息超过分片上限，跳过 P2P 发送", "fragments", numFragments)
 		return
 	}
-
-	// P2P 专用分片包装结构 (不使用 protocol.ClipboardData 避免与应用层/E2EE 双重嵌套)
-	type p2pFragment struct {
-		Payload        string `json:"payload"`
-		ID             string `json:"id"`
-		Index          int    `json:"index"`
-		TotalFragments int    `json:"totalFragments"`
+	if numFragments == 0 {
+		return
 	}
 
 	for i := 0; i < numFragments; i++ {
@@ -118,11 +165,9 @@ func (p *P2PClient) Send(data string) {
 
 		encoded, _ := json.Marshal(frag)
 
-		for sid, dc := range p.dataChans {
-			if dc.ReadyState() == webrtc.DataChannelStateOpen {
-				if err := dc.SendText(string(encoded)); err != nil {
-					slog.Warn("p2p: send error", "peer", sid, "error", err)
-				}
+		for _, dc := range chans {
+			if err := dc.SendText(string(encoded)); err != nil {
+				slog.Warn("p2p: send error", "error", err)
 			}
 		}
 	}
@@ -153,20 +198,83 @@ func (p *P2PClient) Close() {
 	}
 }
 
-// signalLoop 从 WebSocket 读取 signaling 消息。
+// signalLoop 维护信令连接：读取消息，断线后自动指数退避重连。
 func (p *P2PClient) signalLoop() {
+	for {
+		select {
+		case <-p.done:
+			return
+		default:
+		}
+
+		conn := p.getWSConn()
+		if conn == nil {
+			// 尚未连接（理论不应发生），尝试重拨
+			if c, err := p.dialSignaling(); err == nil {
+				p.mu.Lock()
+				p.wsConn = c
+				p.mu.Unlock()
+				conn = c
+			} else {
+				if !p.waitReconnect(p2pSignalReconnectBase) {
+					return
+				}
+				continue
+			}
+		}
+
+		p.readSignals(conn)
+
+		// 读循环退出 → 连接断开，进入退避重连
+		select {
+		case <-p.done:
+			return
+		default:
+		}
+		if !p.waitReconnect(p2pSignalReconnectBase) {
+			return
+		}
+
+		reconnected := false
+		delay := p2pSignalReconnectBase
+		for attempt := 0; attempt < 10; attempt++ {
+			if c, err := p.dialSignaling(); err == nil {
+				p.mu.Lock()
+				p.wsConn = c
+				p.mu.Unlock()
+				slog.Info("p2p: signaling reconnected")
+				reconnected = true
+				break
+			}
+			if !p.waitReconnect(delay) {
+				return
+			}
+			delay = min(delay*2, p2pSignalReconnectMax)
+		}
+		if !reconnected {
+			slog.Warn("p2p: signaling reconnection gave up (will retry via app monitor)")
+			return
+		}
+	}
+}
+
+// waitReconnect 等待 d 或 done；返回 false 表示已关闭。
+func (p *P2PClient) waitReconnect(d time.Duration) bool {
+	select {
+	case <-p.done:
+		return false
+	case <-time.After(d):
+		return true
+	}
+}
+
+// readSignals 从信令连接读取并分发消息，直到出错或关闭。
+func (p *P2PClient) readSignals(conn *websocket.Conn) {
 	const readTimeout = 120 * time.Second
 	const pingInterval = 30 * time.Second
 
 	heartbeatDone := make(chan struct{})
 	defer close(heartbeatDone)
-
-	p.mu.Lock()
-	conn := p.wsConn
-	p.mu.Unlock()
-	if conn == nil {
-		return
-	}
 
 	conn.SetReadDeadline(time.Now().Add(readTimeout))
 	conn.SetPongHandler(func(string) error {
@@ -175,6 +283,9 @@ func (p *P2PClient) signalLoop() {
 	})
 
 	defer func() {
+		if r := recover(); r != nil {
+			slog.Warn("p2p: signal loop panic recovered", "panic", r)
+		}
 		p.mu.Lock()
 		if p.wsConn == conn {
 			p.wsConn = nil
@@ -193,17 +304,15 @@ func (p *P2PClient) signalLoop() {
 			case <-heartbeatDone:
 				return
 			case <-ticker.C:
-				p.wsMu.Lock()
 				p.mu.Lock()
 				connClosed := p.wsConn != conn || p.wsConn == nil
 				p.mu.Unlock()
-				if !connClosed {
-					_ = conn.WriteMessage(websocket.PingMessage, nil)
-				}
-				p.wsMu.Unlock()
 				if connClosed {
 					return
 				}
+				p.wsMu.Lock()
+				_ = conn.WriteMessage(websocket.PingMessage, nil)
+				p.wsMu.Unlock()
 			}
 		}
 	}()
@@ -236,13 +345,29 @@ func (p *P2PClient) signalLoop() {
 
 		switch signal.Type {
 		case "session-id":
+			p.mu.Lock()
 			p.sessionID = signal.SessionID
+			pending := p.pendingPeerLists
+			p.pendingPeerLists = nil
+			p.mu.Unlock()
 			slog.Info("p2p: assigned session", "id", p.sessionID)
+			// 处理 session-id 分配前缓存的 peer-list（glare 修复）
+			for _, peers := range pending {
+				p.handlePeerList(peers)
+			}
 
 		case "peer-list":
 			var peers []string
 			json.Unmarshal(signal.Data, &peers)
-			p.handlePeerList(peers)
+			p.mu.Lock()
+			noSession := p.sessionID == ""
+			if noSession {
+				p.pendingPeerLists = append(p.pendingPeerLists, peers)
+			}
+			p.mu.Unlock()
+			if !noSession {
+				p.handlePeerList(peers)
+			}
 
 		case "offer":
 			p.handleOffer(signal.From, signal.Data)
@@ -303,8 +428,16 @@ func (p *P2PClient) createOffer(peerID string) {
 	p.sendSignal("offer", peerID, offerJSON)
 }
 
-// handleOffer 处理传入的 SDP offer。
+// handleOffer 处理传入的 SDP offer。同一 peer 重复 offer 时先关闭旧连接防泄漏。
 func (p *P2PClient) handleOffer(from string, data json.RawMessage) {
+	p.mu.Lock()
+	if old, exists := p.peers[from]; exists {
+		delete(p.peers, from)
+		delete(p.dataChans, from)
+		go old.Close()
+	}
+	p.mu.Unlock()
+
 	pc, err := p.newPeerConnection(from)
 	if err != nil {
 		return
@@ -418,58 +551,82 @@ func (p *P2PClient) setupDataChannel(peerID string, dc *webrtc.DataChannel) {
 	})
 
 	dc.OnMessage(func(msg webrtc.DataChannelMessage) {
-		p.mu.Lock()
-		defer p.mu.Unlock()
-
-		// P2P 专用分片包装结构
-		type p2pFragment struct {
-			Payload        string `json:"payload"`
-			ID             string `json:"id"`
-			Index          int    `json:"index"`
-			TotalFragments int    `json:"totalFragments"`
-		}
+		defer func() {
+			if r := recover(); r != nil {
+				slog.Warn("p2p: data channel message panic recovered", "panic", r)
+			}
+		}()
 
 		var frag p2pFragment
 		if err := json.Unmarshal(msg.Data, &frag); err != nil || frag.TotalFragments == 0 {
 			// 如果不是我们期望的分片 JSON 格式，尝试作为原始数据处理
-			if p.onReceive != nil {
-				p.onReceive(string(msg.Data))
+			if cb := p.getOnReceive(); cb != nil {
+				cb(string(msg.Data))
 			}
 			return
 		}
 
+		if frag.TotalFragments > maxP2PFragments {
+			slog.Warn("p2p: 丢弃超出分片上限的消息", "fragments", frag.TotalFragments)
+			return
+		}
 		if frag.TotalFragments <= 1 {
 			// 单包直接透传原始数据
-			if p.onReceive != nil {
-				p.onReceive(frag.Payload)
+			if cb := p.getOnReceive(); cb != nil {
+				cb(frag.Payload)
 			}
 			return
 		}
 
-		// 处理分片
-		if _, ok := p.receivingFragments[frag.ID]; !ok {
-			p.receivingFragments[frag.ID] = make([]string, frag.TotalFragments)
+		// 越界校验：恶意/乱序分片不得触发 index-out-of-range
+		if frag.Index < 0 || frag.Index >= frag.TotalFragments {
+			slog.Warn("p2p: 丢弃越界分片", "id", frag.ID, "index", frag.Index, "total", frag.TotalFragments)
+			return
 		}
-		p.receivingFragments[frag.ID][frag.Index] = frag.Payload
 
-		// 检查是否所有分片都已到达
-		complete := true
-		for _, f := range p.receivingFragments[frag.ID] {
-			if f == "" {
-				complete = false
-				break
+		// 分片重组在锁内完成，回调在锁外执行，避免阻塞其他 peer 的接收
+		fullPayload, complete := func() (string, bool) {
+			p.mu.Lock()
+			defer p.mu.Unlock()
+
+			cur, ok := p.receivingFragments[frag.ID]
+			if !ok || len(cur) != frag.TotalFragments {
+				if !ok && len(p.receivingFragments) >= maxP2PFragmentGroups {
+					var oldestID string
+					var oldestTime time.Time
+					for id, receivedAt := range p.fragmentTimes {
+						if oldestID == "" || receivedAt.Before(oldestTime) {
+							oldestID, oldestTime = id, receivedAt
+						}
+					}
+					delete(p.receivingFragments, oldestID)
+					delete(p.fragmentTimes, oldestID)
+				}
+				cur = make([]string, frag.TotalFragments)
+				p.receivingFragments[frag.ID] = cur
+				p.fragmentTimes[frag.ID] = time.Now()
 			}
-		}
+			cur[frag.Index] = frag.Payload
+
+			for _, f := range cur {
+				if f == "" {
+					return "", false
+				}
+			}
+			// 组装完整的原生 payload (已由应用层加密/打包)，直接透传，切勿二次 json.Marshal!
+			full := strings.Join(cur, "")
+			delete(p.receivingFragments, frag.ID)
+			delete(p.fragmentTimes, frag.ID)
+			return full, true
+		}()
 
 		if complete {
-			// 组装完整的原生 payload (已由应用层加密/打包)，直接透传，切勿二次 json.Marshal!
-			fullPayload := strings.Join(p.receivingFragments[frag.ID], "")
-			delete(p.receivingFragments, frag.ID)
-
-			if p.onReceive != nil {
-				p.onReceive(fullPayload)
+			if cb := p.getOnReceive(); cb != nil {
+				cb(fullPayload)
 			}
+			return
 		}
+		p.pruneStaleFragments()
 	})
 
 	dc.OnClose(func() {
@@ -478,6 +635,20 @@ func (p *P2PClient) setupDataChannel(peerID string, dc *webrtc.DataChannel) {
 		delete(p.dataChans, peerID)
 		p.mu.Unlock()
 	})
+}
+
+// pruneStaleFragments 清理超过时限仍未重组完成的残片，防止内存泄漏。
+func (p *P2PClient) pruneStaleFragments() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	now := time.Now()
+	for id, t := range p.fragmentTimes {
+		if now.Sub(t) > p2pReassembleTimeout {
+			delete(p.receivingFragments, id)
+			delete(p.fragmentTimes, id)
+			slog.Warn("p2p: 重组超时，丢弃不完整分片组", "id", id)
+		}
+	}
 }
 
 // sendSignal 通过 signaling server 向特定 peer 发送 signaling 消息。
@@ -489,8 +660,8 @@ func (p *P2PClient) sendSignal(msgType, to string, data json.RawMessage) {
 	})
 
 	p.wsMu.Lock()
-	if p.wsConn != nil {
-		p.wsConn.WriteMessage(websocket.TextMessage, msg)
+	if conn := p.getWSConn(); conn != nil {
+		_ = conn.WriteMessage(websocket.TextMessage, msg)
 	}
 	p.wsMu.Unlock()
 }

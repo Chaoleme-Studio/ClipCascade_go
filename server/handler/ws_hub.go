@@ -31,6 +31,8 @@ type WSHub struct {
 	totalInboundMsgs  atomic.Int64
 	totalOutboundMsgs atomic.Int64
 	automation        *automation.Engine
+	// readLimit 是单条 WS 消息的最大字节数，超限直接断开（防内存耗尽 DoS）。
+	readLimit int64
 }
 
 // NewWSHub 创建一个新的 WebSocket 连接 hub。
@@ -45,18 +47,29 @@ func (h *WSHub) SetAutomationEngine(engine *automation.Engine) {
 	h.automation = engine
 }
 
+// SetReadLimit 设置单条 WS 消息的最大字节数。
+func (h *WSHub) SetReadLimit(limit int64) {
+	h.readLimit = limit
+}
+
 // Register 为给定的 username 添加一个连接。
-func (h *WSHub) Register(username string, conn *websocket.Conn) {
+// 返回 false 表示超过单用户连接数上限，连接未注册。
+func (h *WSHub) Register(username string, conn *websocket.Conn) bool {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
 	if h.connections[username] == nil {
 		h.connections[username] = make(map[*websocket.Conn]bool)
 	}
+	if len(h.connections[username]) >= constants.MaxWSConnsPerUser {
+		slog.Warn("WS：超过单用户连接数上限，拒绝连接", "用户名", username, "上限", constants.MaxWSConnsPerUser, "IP", conn.RemoteAddr().String())
+		return false
+	}
 	h.connections[username][conn] = true
 	h.writeLocks[conn] = &sync.Mutex{}
 	h.totalConnections.Add(1)
 	slog.Info("WS：客户端已连接", "用户名", username, "IP", conn.RemoteAddr().String(), "当前活动连接数", len(h.connections[username]))
+	return true
 }
 
 // Unregister 为给定的 username 移除一个连接。
@@ -166,7 +179,15 @@ func (h *WSHub) HandleWebSocket(c *websocket.Conn) {
 		return
 	}
 
-	h.Register(username, c)
+	// 限制单条消息大小，防止内存耗尽
+	if h.readLimit > 0 {
+		c.SetReadLimit(h.readLimit)
+	}
+
+	if !h.Register(username, c) {
+		c.Close()
+		return
+	}
 	defer h.Unregister(username, c)
 	defer c.Close()
 

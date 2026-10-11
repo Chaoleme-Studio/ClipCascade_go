@@ -61,7 +61,7 @@ func (a *Application) DownloadDeferredFile(item transfer.DeferredFileRecord) (st
 	if err := os.MkdirAll(downloads, 0o755); err != nil {
 		return "", err
 	}
-	destPath := filepath.Join(downloads, sanitizeOfferName(item.FileName))
+	destPath := filepath.Join(downloads, fmt.Sprintf("%d-%s", time.Now().UnixNano(), sanitizeOfferName(item.FileName)))
 	transferID := "manual-download-" + item.DeferredID
 	a.transferMgr.Start(transferID, transfer.DirectionDownload, item.FileName, item.FileSize)
 	if err := transfer.DownloadFile(a.fileHTTPClient, a.cfg.ServerURL, item.RelayID, destPath, item.SHA256, func(done, total int64) {

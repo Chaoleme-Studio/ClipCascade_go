@@ -1,91 +1,63 @@
 # ClipCascade Go - Build & Cross-Compile
-# Usage: make server | make desktop | make mobile-android | make all
+# 真正的构建逻辑统一在 build-scripts/build.sh，本文件仅作便捷入口。
+# Usage: make server | make desktop | make desktop-ui | make android | make all | make tidy
 
-.PHONY: all server desktop mobile-android mobile-ios clean tidy docker
+.PHONY: all server server-cross plugins desktop desktop-ui desktop-ui-cross \
+        web-clip web-clip-cross android ios cross docker tidy test clean help
 
 # Versioning
 VERSION ?= 2.3
-LDFLAGS = -ldflags="-s -w -X main.Version=$(VERSION)"
+BUILD_SCRIPT := ./build-scripts/build.sh
 
-# Output directory
-OUT = build
+all:
+	VERSION=$(VERSION) $(BUILD_SCRIPT) all
 
-all: server-cross desktop
-
-# --- Server ---
 server:
-	@echo "🔧 Building server..."
-	@mkdir -p $(OUT)
-	cd server && go build $(LDFLAGS) -o ../$(OUT)/clipcascade-server .
-	@echo "✅ Server: $(OUT)/clipcascade-server"
+	VERSION=$(VERSION) $(BUILD_SCRIPT) server
 
 server-cross:
-	@echo "🔧 Cross-compiling server for all platforms..."
-	@mkdir -p $(OUT)
-	cd server && CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build $(LDFLAGS) -o ../$(OUT)/clipcascade-server-linux-amd64 .
-	cd server && CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build $(LDFLAGS) -o ../$(OUT)/clipcascade-server-linux-arm64 .
-	cd server && CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build $(LDFLAGS) -o ../$(OUT)/clipcascade-server-darwin-arm64 .
-	cd server && CGO_ENABLED=0 GOOS=darwin GOARCH=amd64 go build $(LDFLAGS) -o ../$(OUT)/clipcascade-server-darwin-amd64 .
-	cd server && CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build $(LDFLAGS) -o ../$(OUT)/clipcascade-server-windows-amd64.exe .
-	@echo "✅ Server cross-compile complete"
+	VERSION=$(VERSION) $(BUILD_SCRIPT) server-cross
 
-# --- Desktop Client ---
+plugins:
+	VERSION=$(VERSION) $(BUILD_SCRIPT) plugins
+
 desktop:
-	@echo "🔧 Building desktop client..."
-	@mkdir -p $(OUT)
-	cd desktop && go build $(LDFLAGS) -o ../$(OUT)/clipcascade-desktop .
-	@echo "✅ Desktop: $(OUT)/clipcascade-desktop"
+	VERSION=$(VERSION) $(BUILD_SCRIPT) desktop
 
-desktop-all:
-	@mkdir -p $(OUT)
-	cd desktop && GOOS=darwin GOARCH=arm64 go build $(LDFLAGS) -o ../$(OUT)/clipcascade-desktop-darwin-arm64 .
-	cd desktop && GOOS=darwin GOARCH=amd64 go build $(LDFLAGS) -o ../$(OUT)/clipcascade-desktop-darwin-amd64 .
-	cd desktop && GOOS=linux GOARCH=amd64 go build $(LDFLAGS) -o ../$(OUT)/clipcascade-desktop-linux-amd64 .
-	cd desktop && GOOS=windows GOARCH=amd64 go build $(LDFLAGS) -o ../$(OUT)/clipcascade-desktop-windows-amd64.exe .
-	@echo "✅ Desktop cross-compile complete"
+desktop-ui:
+	VERSION=$(VERSION) $(BUILD_SCRIPT) desktop-ui
 
-# --- Mobile (Hybrid Architecture) ---
-mobile-android:
-	@echo "🔧 Building Go Engine AAR..."
-	@mkdir -p mobile/android/app/libs $(OUT)
-	gomobile bind -target=android -o mobile/android/app/libs/engine.aar ./fyne_mobile/engine
-	@echo "🔧 Building Android APK via Gradle..."
-	cd mobile/android && ./gradlew assembleRelease
-	cp mobile/android/app/build/outputs/apk/release/app-release-unsigned.apk $(OUT)/ClipCascade-Android-Release-Unsigned.apk
-	@echo "✅ Android APK: $(OUT)/ClipCascade-Android-Release-Unsigned.apk"
+desktop-ui-cross:
+	VERSION=$(VERSION) $(BUILD_SCRIPT) desktop-ui-cross
 
-mobile-ios:
-	@echo "🔧 Building iOS .xcframework..."
-	@mkdir -p $(OUT)
-	gomobile bind -target=ios -o $(OUT)/Mobile.xcframework ./fyne_mobile/engine
-	@echo "✅ iOS: $(OUT)/Mobile.xcframework"
+web-clip:
+	VERSION=$(VERSION) $(BUILD_SCRIPT) web-clip
 
-# --- Docker ---
+web-clip-cross:
+	VERSION=$(VERSION) $(BUILD_SCRIPT) web-clip-cross
+
+android:
+	VERSION=$(VERSION) $(BUILD_SCRIPT) mobile-android-native
+
+ios:
+	VERSION=$(VERSION) $(BUILD_SCRIPT) mobile-ios
+
+cross:
+	VERSION=$(VERSION) $(BUILD_SCRIPT) cross
+
 docker:
-	@echo "🐳 Building Docker image..."
-	docker build -t clipcascade-server:$(VERSION) -f server/Dockerfile .
-	@echo "✅ Docker: clipcascade-server:$(VERSION)"
+	VERSION=$(VERSION) $(BUILD_SCRIPT) docker
 
-docker-run:
-	docker run -d --name clipcascade \
-		-p 8080:8080 \
-		-v clipcascade-data:/data \
-		-e CC_SIGNUP_ENABLED=true \
-		clipcascade-server:$(VERSION)
-
-# --- Utilities ---
 tidy:
-	cd pkg && go mod tidy
-	cd server && go mod tidy
-	cd desktop && go mod tidy
-	cd fyne_mobile && go mod tidy
+	$(BUILD_SCRIPT) tidy
 
 test:
-	go test ./pkg/... ./server/... ./desktop/...
+	go test ./core/... ./server/...
+	cd client-desktop && go test ./...
+	cd server-web-clip && go build ./...
 
 clean:
-	rm -rf $(OUT) server/database/
-	cd mobile/android && ./gradlew clean || true
+	$(BUILD_SCRIPT) clean
 
-fmt:
-	gofmt -w pkg/ server/ desktop/ fyne_mobile/
+help:
+	@$(BUILD_SCRIPT)

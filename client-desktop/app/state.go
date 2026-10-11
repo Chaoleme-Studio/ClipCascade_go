@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -122,6 +123,35 @@ func (s *historyStore) SaveImage(payload string) string {
 		return ""
 	}
 	return path
+}
+
+// CleanupImages 删除超过 maxAge 的历史图片文件，防止磁盘无界增长。
+// 文件名为纳秒时间戳，天然按创建时间排序；最多保留最新 64 张。
+func (s *historyStore) CleanupImages(maxAge time.Duration) {
+	entries, err := os.ReadDir(s.imageDir)
+	if err != nil {
+		return
+	}
+	// 按文件名（纳秒时间戳）降序：新 → 旧
+	sort.Slice(entries, func(i, j int) bool {
+		return entries[i].Name() > entries[j].Name()
+	})
+	cutoff := time.Now().Add(-maxAge)
+	kept := 0
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil {
+			continue
+		}
+		if info.ModTime().Before(cutoff) || kept >= 64 {
+			_ = os.Remove(filepath.Join(s.imageDir, e.Name()))
+			continue
+		}
+		kept++
+	}
 }
 
 func newAppState(history []HistoryItem) appState {
@@ -259,7 +289,8 @@ func (a *Application) Snapshot() Snapshot {
 }
 
 func (a *Application) IsConnected() bool {
-	return a.stomp != nil && a.stomp.IsConnected()
+	stomp := a.currentStomp()
+	return stomp != nil && stomp.IsConnected()
 }
 
 func statusDetail(status string) string {

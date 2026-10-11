@@ -10,10 +10,15 @@ import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.graphics.PixelFormat
+import android.net.ConnectivityManager
+import android.net.Network
+import android.net.NetworkCapabilities
+import android.net.NetworkRequest
 import android.os.Build
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
+import android.os.PowerManager
 import android.util.Base64
 import android.util.Log
 import android.view.WindowManager
@@ -50,6 +55,11 @@ class ClipCascadeBackgroundService : Service(), MessageCallback {
         const val EXTRA_SHARED_FILE_OFFER = "com.clipcascade.android.extra.SHARED_FILE_OFFER"
         const val EXTRA_ONLINE_DEVICES = "com.clipcascade.android.extra.ONLINE_DEVICES"
         const val EXTRA_SYNC_TARGETS = "com.clipcascade.android.extra.SYNC_TARGETS"
+
+        // 回环守卫时间窗：本地写入/收到某文本后的短时间内，不再把相同文本重新发出去
+        const val LOOPBACK_GUARD_MS = 5_000L
+        // 引擎启动失败后的自动重试间隔
+        const val ENGINE_RETRY_DELAY_MS = 15_000L
     }
     
     private val notificationId = 1001
@@ -69,9 +79,31 @@ class ClipCascadeBackgroundService : Service(), MessageCallback {
     // 用于透明悬浮窗的视图
     private var overlayLayout: LinearLayout? = null
     
-    // 记录最后一次自己写入的记录，防止回环死循环同步
+    // 记录最后一次本地写入剪贴板的文本与时间，防止回环死循环同步
     @Volatile
     private var lastWrittenText: String? = null
+    @Volatile
+    private var lastWrittenAt: Long = 0L
+
+    private var sendWakeLock: PowerManager.WakeLock? = null
+
+    // 网络恢复回调：Doze/断网导致 WS 死链后，onAvailable 会主动拉起引擎重连与补发
+    private val networkCallback = object : ConnectivityManager.NetworkCallback() {
+        override fun onAvailable(network: Network) {
+            Log.i(TAG, "🌐 网络恢复可用，触发引擎重连/补发")
+            mainHandler.post {
+                startEngineIfNeeded()
+            }
+        }
+    }
+
+    private val engineRetryRunnable = Runnable {
+        if (engine == null && !engineStarting) {
+            Log.i(TAG, "🔄 自动重试启动 Go 引擎...")
+            startEngineIfNeeded()
+        }
+    }
+
     private val activeDeferredUploads = ConcurrentHashMap.newKeySet<String>()
     private val incomingPayloadExecutor = Executors.newSingleThreadExecutor()
     private val deferredUploadExecutor = Executors.newSingleThreadExecutor()
@@ -95,6 +127,19 @@ class ClipCascadeBackgroundService : Service(), MessageCallback {
         
         // 也可以在这里监听系统的剪贴板回调（虽然 Android 10+ 后台此回调无效，但在前台或悬浮窗期间生效）
         clipboardManager.addPrimaryClipChangedListener(onClipChangeListener)
+
+        // 网络恢复时主动触发引擎重连与补发（否则 Doze/断网后 WS 死链无法自愈）
+        try {
+            val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+            cm.registerNetworkCallback(
+                NetworkRequest.Builder()
+                    .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+                    .build(),
+                networkCallback
+            )
+        } catch (e: Exception) {
+            Log.w(TAG, "注册网络回调失败: ${e.message}")
+        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -135,29 +180,52 @@ class ClipCascadeBackgroundService : Service(), MessageCallback {
     }
 
     /**
-     * 【核心黑科技】主动通过悬浮窗焦点获取剪贴板数据。
+     * 【核心】主动通过悬浮窗焦点获取剪贴板数据。
      * 就算我们在后台，只要弹出一个瞬间的悬浮窗，系统就会认为我们在前台。
+     *
+     * 注意：addView 后焦点授予是【异步】的，必须轮询等待窗口真正拿到焦点后再读，
+     * 否则 Android 10+ 的 primaryClip 会静默返回 null —— 这正是"后台发不出去、
+     * 切前台才行"的根因（前台 Activity 自带焦点所以必然成功）。
      */
     fun requestClipboardReadForSync() {
         Log.i(TAG, "🔍 开始请求读取剪贴板...")
         startEngineIfNeeded()
-        try {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                // 添加悬浮窗，抢夺前台焦点
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) {
+            // 老系统直接读
+            readClipboardAndSyncToServer()
+            return
+        }
+        mainHandler.post {
+            try {
                 showInvisibleOverlay()
-                
-                // 此时系统判定我们具有交互焦点，读取剪贴板
-                readClipboardAndSyncToServer()
-                
-                // 读完立刻销毁，无痕退出
-                removeInvisibleOverlay()
-            } else {
-                // 老系统直接读
-                readClipboardAndSyncToServer()
+                // 等待悬浮窗获得窗口焦点，最多约 2.4s（16 × 150ms）
+                var attempts = 0
+                val tryRead = object : Runnable {
+                    override fun run() {
+                        val view = overlayLayout
+                        val hasFocus = view?.hasWindowFocus() == true
+                        if (!hasFocus && attempts < 16) {
+                            attempts++
+                            mainHandler.postDelayed(this, 150L)
+                            return
+                        }
+                        if (!hasFocus) {
+                            Log.w(TAG, "⚠️ 悬浮窗 $attempts 次轮询后仍未获得窗口焦点，仍尝试读取（可能失败）")
+                        } else {
+                            Log.d(TAG, "👻 悬浮窗已获得焦点（第 $attempts 次轮询）")
+                        }
+                        try {
+                            readClipboardAndSyncToServer()
+                        } finally {
+                            removeInvisibleOverlay()
+                        }
+                    }
+                }
+                mainHandler.postDelayed(tryRead, 50L)
+            } catch (e: Exception) {
+                Log.e(TAG, "悬浮窗或剪贴板操作失败: ${e.message}", e)
+                removeInvisibleOverlay() // 确保即使崩溃也要尝试移掉视图
             }
-        } catch (e: Exception) {
-            Log.e(TAG, "悬浮窗或剪贴板操作失败: ${e.message}", e)
-            removeInvisibleOverlay() // 确保即使崩溃也要尝试移掉视图
         }
     }
 
@@ -186,9 +254,10 @@ class ClipCascadeBackgroundService : Service(), MessageCallback {
 
     private fun handleIncomingText(payload: String) {
         try {
-            // 如果恰好和我们上次发出去的一样，证明是自己环路过来的，丢弃
-            if (payload == lastWrittenText) {
-                Log.d(TAG, "丢弃自回环文本。")
+            // 如果恰好和我们最近写入的一样（时间窗内），证明是自己环路过来的，丢弃；
+            // 超过时间窗后允许写入——否则同一内容永远无法再次从其他设备同步过来
+            if (payload == lastWrittenText && System.currentTimeMillis() - lastWrittenAt < LOOPBACK_GUARD_MS) {
+                Log.d(TAG, "丢弃 ${LOOPBACK_GUARD_MS / 1000}s 内的自回环文本。")
                 return
             }
 
@@ -198,7 +267,7 @@ class ClipCascadeBackgroundService : Service(), MessageCallback {
                 }
 
                 // 写入前记录一下，防止 OnPrimaryClipChangedListener 再次触发发送
-                lastWrittenText = payload
+                markLocalClipboardWrite(payload)
                 val clip = ClipData.newPlainText("ClipCascade", payload)
                 clipboardManager.setPrimaryClip(clip)
                 ClipboardHistoryStore.append(this, payload, "received")
@@ -390,33 +459,76 @@ class ClipCascadeBackgroundService : Service(), MessageCallback {
     }
 
     private val onClipChangeListener = ClipboardManager.OnPrimaryClipChangedListener {
-        // 这个回调只有在我们处于（真前台、假前台/悬浮窗期间）才会被系统触发
-        // 但无障碍服务其实已经帮我们在全天候盯着剪贴板了，所以这里可以做辅助，或者干脆只信无障碍
-        Log.d(TAG, "系统 OnPrimaryClipChanged 触发了！")
+        // 前台/悬浮窗期间系统会触发此回调；无障碍服务负责全天候兜底触发。
+        // 这里真正执行同步：读取 guard 在 readClipboardAndSyncToServer 内部，
+        // 自己写入引发的回调会被 lastWrittenText + 时间窗守卫拦下，不会造成回环。
+        Log.d(TAG, "系统 OnPrimaryClipChanged 触发，尝试同步剪贴板")
+        readClipboardAndSyncToServer()
     }
 
     private fun readClipboardAndSyncToServer() {
-        val clip = clipboardManager.primaryClip ?: return
-        if (clip.itemCount > 0) {
-            val textToSync = clip.getItemAt(0).text?.toString()
-            if (!textToSync.isNullOrEmpty()) {
-                if (textToSync == lastWrittenText) {
-                    Log.d(TAG, "这是刚才自己收到的文本，防回环阻断上传。")
-                    return
-                }
-                
-                Log.i(TAG, "📤 准备将其发送给其他设备: $textToSync")
-                lastWrittenText = textToSync
-                try {
-                    engine?.sendClipboard(textToSync, "text")
-                    ClipboardHistoryStore.append(this, textToSync, "sent")
-                    notifyHistoryChanged()
-                } catch (e: Exception) {
-                    Log.e(TAG, "发送剪贴板失败: ${e.message}", e)
+        val clip = try {
+            clipboardManager.primaryClip
+        } catch (e: Exception) {
+            Log.w(TAG, "读取 primaryClip 异常: ${e.message}")
+            null
+        }
+        if (clip == null || clip.itemCount == 0) {
+            // Android 10+ 在无窗口焦点时 primaryClip 静默返回 null —— 打日志便于定位
+            Log.w(TAG, "⚠️ primaryClip 不可读（可能未获得窗口焦点或剪贴板为空），本次跳过")
+            return
+        }
+        val textToSync = clip.getItemAt(0).text?.toString()
+        if (textToSync.isNullOrEmpty()) {
+            Log.d(TAG, "剪贴板为空或非文本")
+            return
+        }
+        if (textToSync == lastWrittenText && System.currentTimeMillis() - lastWrittenAt < LOOPBACK_GUARD_MS) {
+            Log.d(TAG, "这是刚才本地写入/收到的文本（${LOOPBACK_GUARD_MS / 1000}s 内），防回环阻断上传。")
+            return
+        }
+
+        Log.i(TAG, "📤 准备将其发送给其他设备: $textToSync")
+        acquireSendWakeLock()
+        try {
+            // 引擎内部已实现发送失败入队重发（重连后补发）
+            engine?.sendClipboard(textToSync, "text")
+            // 仅在发送成功后才记录守卫（旧代码在发送前就记录，发送失败会永久误拦同一文本）
+            lastWrittenText = textToSync
+            lastWrittenAt = System.currentTimeMillis()
+            ClipboardHistoryStore.append(this, textToSync, "sent")
+            notifyHistoryChanged()
+        } catch (e: Exception) {
+            Log.e(TAG, "发送剪贴板失败: ${e.message}", e)
+        } finally {
+            releaseSendWakeLock()
+        }
+    }
+
+    private fun markLocalClipboardWrite(text: String) {
+        lastWrittenText = text
+        lastWrittenAt = System.currentTimeMillis()
+    }
+
+    private fun acquireSendWakeLock() {
+        try {
+            if (sendWakeLock == null) {
+                val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
+                sendWakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "ClipCascade:send").apply {
+                    setReferenceCounted(false)
                 }
             }
-        } else {
-            Log.d(TAG, "剪贴板为空")
+            // 发送 + 建连补发的短窗口；带超时防泄漏
+            sendWakeLock?.acquire(15_000L)
+        } catch (e: Exception) {
+            Log.w(TAG, "获取 WakeLock 失败: ${e.message}")
+        }
+    }
+
+    private fun releaseSendWakeLock() {
+        try {
+            sendWakeLock?.takeIf { it.isHeld }?.release()
+        } catch (_: Exception) {
         }
     }
 
@@ -441,7 +553,7 @@ class ClipCascadeBackgroundService : Service(), MessageCallback {
             try {
                 currentEngine.sendClipboard(payload, payloadType)
                 if (payloadType == "text") {
-                    lastWrittenText = payload
+                    markLocalClipboardWrite(payload)
                     ClipboardHistoryStore.append(this, payload, "sent")
                     notifyHistoryChanged()
                 } else if (payloadType == "image") {
@@ -515,7 +627,9 @@ class ClipCascadeBackgroundService : Service(), MessageCallback {
             } catch (e: Exception) {
                 engine = null
                 Log.e(TAG, "Go 引擎启动失败", e)
-                updateStatus("error", "连接失败: ${e.message}")
+                updateStatus("error", "连接失败: ${e.message}，${ENGINE_RETRY_DELAY_MS / 1000}s 后自动重试")
+                mainHandler.removeCallbacks(engineRetryRunnable)
+                mainHandler.postDelayed(engineRetryRunnable, ENGINE_RETRY_DELAY_MS)
             } finally {
                 engineStarting = false
             }
@@ -684,9 +798,25 @@ class ClipCascadeBackgroundService : Service(), MessageCallback {
         }
     }
 
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        super.onTaskRemoved(rootIntent)
+        // 用户从最近任务划掉应用：前台服务继续保持；若引擎尚未起来则触发重试
+        Log.i(TAG, "用户划掉应用任务，前台服务继续保持运行")
+        if (engine == null && !engineStarting) {
+            mainHandler.post { startEngineIfNeeded() }
+        }
+    }
+
     override fun onDestroy() {
         Log.i(TAG, "🔴 后台服务被销毁")
         clipboardManager.removePrimaryClipChangedListener(onClipChangeListener)
+        try {
+            val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+            cm.unregisterNetworkCallback(networkCallback)
+        } catch (_: Exception) {
+        }
+        mainHandler.removeCallbacks(engineRetryRunnable)
+        releaseSendWakeLock()
         try {
             engine?.stop()
         } catch (_: Exception) {

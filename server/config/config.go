@@ -21,10 +21,10 @@ type Config struct {
 	AllowedOrigins                  string
 	SignupEnabled                   bool
 	MaxUserAccounts                 int
-	AccountPurgeTimeout             int64 // 秒，-1 表示关闭
 	SessionTimeoutMinutes           int
-	MaxUniqueIPAttempts             int
 	MaxAttemptsPerIP                int
+	// APIRateLimit 每 IP 对 /api/* 的每分钟请求上限（<=0 关闭）
+	APIRateLimit int
 	LockTimeoutSeconds              int
 	LockScalingFactor               int
 	BFACacheEnabled                 bool
@@ -58,13 +58,15 @@ func Load() *Config {
 		MaxMessageSizeBytes:             envInt64("CC_MAX_MESSAGE_SIZE_IN_BYTES", 0),
 		P2PEnabled:                      envBool("CC_P2P_ENABLED", false),
 		P2PStunURL:                      envStr("CC_P2P_STUN_URL", constants.DefaultStunURL),
-		AllowedOrigins:                  envStr("CC_ALLOWED_ORIGINS", "*"),
+		// 默认空 = 仅同源（浏览器同源请求不需要 CORS 头，WS 做 Origin 同源校验）；
+		// 需要跨域时显式设置 CC_ALLOWED_ORIGINS（逗号分隔）或 "*"（不限制）
+		AllowedOrigins:                  envStr("CC_ALLOWED_ORIGINS", ""),
 		SignupEnabled:                   envBool("CC_SIGNUP_ENABLED", false),
 		MaxUserAccounts:                 envInt("CC_MAX_USER_ACCOUNTS", -1),
-		AccountPurgeTimeout:             envInt64("CC_ACCOUNT_PURGE_TIMEOUT_SECONDS", -1),
 		SessionTimeoutMinutes:           envInt("CC_SESSION_TIMEOUT", constants.DefaultSessionTimeoutMin),
-		MaxUniqueIPAttempts:             envInt("CC_MAX_UNIQUE_IP_ATTEMPTS", constants.DefaultMaxUniqueIPAttempts),
 		MaxAttemptsPerIP:                envInt("CC_MAX_ATTEMPTS_PER_IP", constants.DefaultMaxAttemptsPerIP),
+		// 每 IP 对 /api/* 的每分钟请求上限；<=0 关闭。局域网自用默认宽松
+		APIRateLimit: envInt("CC_API_RATE_LIMIT", 240),
 		LockTimeoutSeconds:              envInt("CC_LOCK_TIMEOUT_SECONDS", constants.DefaultLockTimeoutSeconds),
 		LockScalingFactor:               envInt("CC_LOCK_TIMEOUT_SCALING_FACTOR", constants.DefaultLockScalingFactor),
 		BFACacheEnabled:                 envBool("CC_BFA_CACHE_ENABLED", true),

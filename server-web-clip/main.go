@@ -2,6 +2,7 @@ package main
 
 import (
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/subtle"
 	"embed"
 	"encoding/hex"
@@ -12,6 +13,7 @@ import (
 	"math"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
@@ -37,6 +39,7 @@ const (
 )
 
 var db *gorm.DB
+var uploadDir string
 
 type Message struct {
 	ID        uint           `gorm:"primaryKey"`
@@ -52,12 +55,47 @@ func initDB(dbPath string) error {
 	if err := os.MkdirAll(filepath.Dir(dbPath), 0o755); err != nil {
 		return err
 	}
+	// WAL + busy_timeout，避免并发写锁冲突
+	sep := "?"
+	if strings.Contains(dbPath, "?") {
+		sep = "&"
+	}
+	dbPath += sep + "_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)"
 	var err error
 	db, err = gorm.Open(sqlite.Open(dbPath), &gorm.Config{})
 	if err != nil {
 		return fmt.Errorf("connect database: %w", err)
 	}
 	return db.AutoMigrate(&Message{})
+}
+
+// inlineExts 是允许浏览器内联预览的扩展名白名单。
+// html/svg 等可执行脚本类型一律强制 attachment 下载，杜绝存储型 XSS。
+var inlineExts = map[string]bool{
+	".png": true, ".jpg": true, ".jpeg": true, ".gif": true, ".webp": true,
+	".bmp": true, ".ico": true, ".avif": true,
+	".mp4": true, ".webm": true, ".mov": true, ".m4v": true,
+	".mp3": true, ".wav": true, ".ogg": true, ".flac": true,
+	".pdf": true, ".txt": true, ".md": true, ".csv": true, ".json": true,
+}
+
+func serveUpload(c *fiber.Ctx) error {
+	name := filepath.Base(c.Params("name"))
+	if name == "" || name == "." {
+		return fiber.ErrNotFound
+	}
+	p := filepath.Join(uploadDir, name)
+	if _, err := os.Stat(p); err != nil {
+		return fiber.ErrNotFound
+	}
+	ext := strings.ToLower(filepath.Ext(name))
+	c.Set("X-Content-Type-Options", "nosniff")
+	disposition := "attachment"
+	if inlineExts[ext] {
+		disposition = "inline"
+	}
+	c.Set("Content-Disposition", fmt.Sprintf("%s; filename*=UTF-8''%s", disposition, url.PathEscape(name)))
+	return c.SendFile(p)
 }
 
 func parsePage(raw string) int {
@@ -196,7 +234,7 @@ func main() {
 	if dbPath == "" {
 		dbPath = filepath.Join(exeDir, "data.db")
 	}
-	uploadDir := strings.TrimSpace(os.Getenv("WEBCLIP_UPLOAD_DIR"))
+	uploadDir = strings.TrimSpace(os.Getenv("WEBCLIP_UPLOAD_DIR"))
 	if uploadDir == "" {
 		uploadDir = filepath.Join(exeDir, "uploads")
 	}
@@ -228,7 +266,65 @@ func main() {
 		BodyLimit: maxUploadBytes,
 	})
 
-	app.Static("/uploads", uploadDir)
+	// ── 可选口令认证：设置 WEBCLIP_PASSWORD 后全站需要登录；未设置则与原来一致 ──
+	authPassword := strings.TrimSpace(os.Getenv("WEBCLIP_PASSWORD"))
+	authCookieName := "webclip_auth"
+	authToken := ""
+	if authPassword != "" {
+		sum := sha256.Sum256([]byte("webclip-auth:" + authPassword))
+		authToken = hex.EncodeToString(sum[:])
+	}
+	renderLoginPage := func(c *fiber.Ctx, errMsg string) error {
+		errHTML := ""
+		if errMsg != "" {
+			errHTML = fmt.Sprintf(`<p style="color:#e53e3e;margin-top:12px">%s</p>`, errMsg)
+		}
+		c.Set("Content-Type", "text/html; charset=utf-8")
+		return c.Status(fiber.StatusUnauthorized).SendString(`<!doctype html><html lang="zh"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>WebClip 登录</title></head>
+<body style="font-family:system-ui;display:flex;justify-content:center;padding-top:15vh;background:#f7faf8">
+<div style="width:320px;background:#fff;border-radius:12px;box-shadow:0 1px 6px rgba(0,0,0,.08);padding:28px">
+<h2 style="margin:0 0 16px;font-size:18px">WebClip 访问口令</h2>
+<form method="post" action="/weblogin">
+<input type="password" name="password" placeholder="访问口令" required autofocus
+ style="width:100%;box-sizing:border-box;padding:10px;border:1px solid #d1d5db;border-radius:8px">
+` + errHTML + `
+<button type="submit" style="width:100%;margin-top:12px;padding:10px;background:#059669;color:#fff;border:0;border-radius:8px;cursor:pointer">进入</button>
+</form></div></body></html>`)
+	}
+	app.Use(func(c *fiber.Ctx) error {
+		if authToken == "" {
+			return c.Next()
+		}
+		if c.Path() == "/weblogin" {
+			return c.Next()
+		}
+		if c.Cookies(authCookieName) != "" &&
+			subtle.ConstantTimeCompare([]byte(c.Cookies(authCookieName)), []byte(authToken)) == 1 {
+			return c.Next()
+		}
+		return renderLoginPage(c, "")
+	})
+	app.Post("/weblogin", func(c *fiber.Ctx) error {
+		if authToken == "" {
+			return c.Redirect("/")
+		}
+		if subtle.ConstantTimeCompare([]byte(c.FormValue("password")), []byte(authPassword)) != 1 {
+			return renderLoginPage(c, "口令错误，请重试")
+		}
+		c.Cookie(&fiber.Cookie{
+			Name:     authCookieName,
+			Value:    authToken,
+			MaxAge:   86400 * 30,
+			Path:     "/",
+			HTTPOnly: true,
+			SameSite: "Lax",
+		})
+		return c.Redirect("/")
+	})
+
+	// 上传文件受控下载：白名单类型内联预览，其余强制 attachment（防存储型 XSS）
+	app.Get("/uploads/:name", serveUpload)
 
 	// ── 首页：列表 + 提交 ──
 	app.Get("/", func(c *fiber.Ctx) error {

@@ -3,6 +3,7 @@ package config
 
 import (
 	"encoding/json"
+	"log/slog"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -11,6 +12,7 @@ import (
 	"strings"
 
 	"github.com/clipcascade/pkg/constants"
+	"github.com/google/uuid"
 )
 
 // Config 保存 client config。
@@ -18,6 +20,7 @@ type Config struct {
 	ServerURL      string `json:"server_url"` // e.g. "http://localhost:8080"
 	Username       string `json:"username"`
 	Password       string `json:"password"`
+	DeviceID       string `json:"device_id,omitempty"` // 稳定设备标识，用于回环过滤与消息溯源
 	E2EEEnabled    bool   `json:"e2ee_enabled"`
 	P2PEnabled     bool   `json:"p2p_enabled"`
 	StunURL        string `json:"stun_url"`
@@ -71,8 +74,20 @@ func Load() *Config {
 	cfgPath := filepath.Join(ConfigDir(), "config.json")
 	cfg.FilePath = cfgPath
 
+	// 首次运行生成稳定设备 ID 并持久化（用于协议层回环过滤与去重）
+	ensureDeviceID := func() {
+		if cfg.DeviceID != "" {
+			return
+		}
+		cfg.DeviceID = uuid.New().String()
+		if err := cfg.Save(); err != nil {
+			slog.Warn("保存设备 ID 失败（不影响运行）", "error", err)
+		}
+	}
+
 	data, err := os.ReadFile(cfgPath)
 	if err != nil {
+		ensureDeviceID()
 		return cfg
 	}
 	_ = json.Unmarshal(data, cfg)
@@ -81,6 +96,7 @@ func Load() *Config {
 	if envPassword := os.Getenv("CLIPCASCADE_PASSWORD"); envPassword != "" {
 		cfg.Password = envPassword
 	}
+	ensureDeviceID()
 	return cfg
 }
 

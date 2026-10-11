@@ -22,6 +22,15 @@ type ClipboardData struct {
 	FileName string `json:"filename,omitempty"`
 	// Metadata 包含分片信息（可选）。
 	Metadata *FragmentMetadata `json:"metadata,omitempty"`
+
+	// --- v2.2 新增：幂等/去重/冲突解决（旧客户端会忽略未知字段，向后兼容） ---
+
+	// MessageUUID 是本次复制事件的唯一 ID，用于端到端去重与幂等。
+	MessageUUID string `json:"msg_uuid,omitempty"`
+	// DeviceID 是发送方设备标识，用于回环过滤与多设备冲突溯源。
+	DeviceID string `json:"device_id,omitempty"`
+	// TimestampMs 是发送方 Unix 毫秒时间戳，用于多设备同时复制时的 last-write-wins 判断。
+	TimestampMs int64 `json:"ts_ms,omitempty"`
 }
 
 // Encode 将 ClipboardData 序列化为 JSON 字节 slice。

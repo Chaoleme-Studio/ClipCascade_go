@@ -17,6 +17,7 @@ import (
 	"github.com/google/uuid"
 	"gorm.io/gorm"
 
+	"github.com/clipcascade/pkg/constants"
 	"github.com/clipcascade/server/config"
 	"github.com/clipcascade/server/model"
 )
@@ -419,12 +420,18 @@ func urlPlatformCandidateAction(_ context.Context, event ClipboardEvent, _ RuleA
 }
 
 func renderCommandTemplate(tpl string, event ClipboardEvent) string {
+	// payload 渲染进 argv 前截断：防止巨量剪贴板内容直接进入命令行参数
+	// （argv 上限受 ARG_MAX 约束，且白名单二进制若自行解释参数存在注入升级面）。
+	payload := event.Clipboard.Payload
+	if len(payload) > constants.MaxCommandArgPayloadBytes {
+		payload = payload[:constants.MaxCommandArgPayloadBytes] + "…[truncated]"
+	}
 	replacements := map[string]string{
 		"{{.event_id}}":               event.EventID,
 		"{{.username}}":               event.Username,
 		"{{.clipboard.type}}":         event.Clipboard.Type,
 		"{{.clipboard.text_preview}}": event.Clipboard.TextPreview,
-		"{{.clipboard.payload}}":      event.Clipboard.Payload,
+		"{{.clipboard.payload}}":      payload,
 		"{{.clipboard.filename}}":     event.Clipboard.FileName,
 		"{{.clipboard.payload_size}}": fmt.Sprintf("%d", event.Clipboard.PayloadSize),
 		"{{.clipboard.is_encrypted}}": fmt.Sprintf("%t", event.Clipboard.IsEncrypted),

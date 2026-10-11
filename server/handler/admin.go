@@ -105,6 +105,15 @@ func (h *AdminHandler) ResetPassword(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "user not found"})
 	}
 
+	// 确保 UserInfo 存在且 salt/rounds 为默认值，保证客户端登录后密钥派生参数一致
+	var user model.User
+	if h.DB.First(&user, id).Error == nil {
+		var info model.UserInfo
+		if h.DB.Where("user_id = ?", id).First(&info).Error != nil {
+			h.DB.Create(&model.UserInfo{UserID: user.ID, Salt: saltForNewUser(user.Username), HashRounds: 100000})
+		}
+	}
+
 	slog.Info("管理员：密码已重置", "用户ID", id, "操作人", c.Locals("username"))
 	return c.JSON(fiber.Map{"message": "password updated"})
 }
@@ -209,7 +218,7 @@ func (h *AdminHandler) RegisterUser(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "create failed"})
 	}
 
-	h.DB.Create(&model.UserInfo{UserID: user.ID, Salt: body.Username, HashRounds: 100000})
+	h.DB.Create(&model.UserInfo{UserID: user.ID, Salt: saltForNewUser(body.Username), HashRounds: 100000})
 	slog.Info("管理员：用户已注册", "用户名", body.Username, "操作人", c.Locals("username"))
 	return c.JSON(fiber.Map{"message": "user registered", "username": body.Username})
 }
@@ -234,7 +243,14 @@ func (h *AdminHandler) UpdateUsername(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusConflict).JSON(fiber.Map{"error": "username already taken"})
 	}
 
+	var target model.User
+	if err := h.DB.First(&target, id).Error; err != nil {
+		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "user not found"})
+	}
+
 	h.DB.Model(&model.User{}).Where("id = ?", id).Update("username", body.Username)
+	// 同步更新 UserInfo.Salt（默认 salt = 用户名），保持 E2EE 密钥派生参数一致
+	h.DB.Model(&model.UserInfo{}).Where("user_id = ? AND salt = ?", id, target.Username).Update("salt", body.Username)
 	slog.Info("管理员：用户名已更改", "用户ID", id, "新用户名", body.Username, "操作人", c.Locals("username"))
 	return c.JSON(fiber.Map{"message": "username updated"})
 }

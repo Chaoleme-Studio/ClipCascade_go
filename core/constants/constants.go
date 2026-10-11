@@ -82,8 +82,9 @@ const (
 	DefaultFileAutoRelayMaxBytes int64 = 25 * 1024 * 1024
 	// DefaultFileRelayMaxBytes 是 HTTP 文件中转服务端允许的单文件最大大小。（2G）
 	DefaultFileRelayMaxBytes int64 = 2 * 1024 * 1024 * 1024
-	// DefaultSessionTimeoutMin 是默认用户会话有效期 (约 1 年)。
-	DefaultSessionTimeoutMin = 525960
+	// DefaultSessionTimeoutMin 是默认用户会话有效期（7 天）。
+	// 旧值约 1 年（525960），过长；可用 CC_SESSION_TIMEOUT 覆盖（单位分钟）。
+	DefaultSessionTimeoutMin = 10080
 	// DefaultMaxUniqueIPAttempts 是允许的同一 IP 对应的最大唯一 IP 尝试次数。
 	DefaultMaxUniqueIPAttempts = 15
 	// DefaultMaxAttemptsPerIP 是同一 IP 允许的最大失败登录尝试次数。
@@ -92,4 +93,12 @@ const (
 	DefaultLockTimeoutSeconds = 60
 	// DefaultLockScalingFactor 是锁定时间增加的缩放倍数。
 	DefaultLockScalingFactor = 2
+
+	// --- 连接与资源限额 ---
+
+	// MaxWSConnsPerUser 是同一用户允许的最大并发 WebSocket 连接数（防连接放大）。
+	MaxWSConnsPerUser = 16
+	// MaxCommandArgPayloadBytes 是自动化命令模板中 {{.clipboard.payload}} 渲染进 argv 的最大字节数。
+	// 超出部分被截断，防止完整剪贴板内容（可能是巨量文本）直接进入命令行参数。
+	MaxCommandArgPayloadBytes = 16 * 1024
 )

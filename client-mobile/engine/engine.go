@@ -17,6 +17,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 
 	pkgcrypto "github.com/clipcascade/pkg/crypto"
@@ -35,6 +36,20 @@ type MessageCallback interface {
 	OnStatusChange(status string)
 }
 
+// pendingSend 是发送失败后等待重连补发的消息。
+type pendingSend struct {
+	payload     string
+	payloadType string
+	fileName    string
+	body        string
+}
+
+const (
+	pendingSendLimit = 20 // 重发队列上限，超出丢弃最旧
+	dedupWindow      = 10 * time.Minute
+	dedupCap         = 256
+)
+
 // Engine 是用于 mobile 剪贴板同步的主要 Go engine。
 type Engine struct {
 	mu         sync.Mutex
@@ -49,6 +64,14 @@ type Engine struct {
 	callback   MessageCallback
 	done       chan struct{}
 	connected  bool
+	deviceID   string // 稳定设备标识，用于回环过滤与消息溯源
+
+	pendingMu       sync.Mutex
+	pendingSends    []pendingSend
+	pendingFlushing bool
+
+	dedupMu   sync.Mutex
+	recvUUIDs map[string]time.Time
 }
 
 // NewEngine 创建一个新的 ClipCascade mobile engine。
@@ -59,6 +82,7 @@ func NewEngine(serverURL, username, password string, e2eeEnabled bool) *Engine {
 		username:  username,
 		password:  password,
 		e2ee:      e2eeEnabled,
+		deviceID:  uuid.New().String(),
 		httpClient: &http.Client{
 			Jar:     jar,
 			Timeout: 15 * time.Second,
@@ -66,7 +90,8 @@ func NewEngine(serverURL, username, password string, e2eeEnabled bool) *Engine {
 				return http.ErrUseLastResponse
 			},
 		},
-		done: make(chan struct{}),
+		done:      make(chan struct{}),
+		recvUUIDs: make(map[string]time.Time),
 	}
 }
 
@@ -134,25 +159,48 @@ func (e *Engine) SendClipboard(payload string, payloadType string) error {
 }
 
 // SendClipboardWithFileName 向 server 发送带原始文件名的剪贴板数据。
+// 连接不可用时消息进入重发队列，重连成功后自动补发。
 func (e *Engine) SendClipboardWithFileName(payload string, payloadType string, fileName string) error {
+	item := pendingSend{payload: payload, payloadType: payloadType, fileName: fileName}
+	body, err := e.encodeClipboardBody(item)
+	if err != nil {
+		e.enqueuePendingSend(item)
+		return err
+	}
+	item.body = body
+	item.payload = ""
+	if err := e.sendEncodedBody(body); err != nil {
+		e.enqueuePendingSend(item)
+		return err
+	}
+	return nil
+}
+
+func (e *Engine) encodeClipboardBody(item pendingSend) (string, error) {
 	e.mu.Lock()
-	conn := e.wsConn
 	encKey := e.encKey
 	e2ee := e.e2ee
+	deviceID := e.deviceID
 	e.mu.Unlock()
-
-	if conn == nil {
-		return fmt.Errorf("not connected")
+	if e2ee && encKey == nil {
+		return "", fmt.Errorf("encryption key not ready")
 	}
 
-	clipData := &protocol.ClipboardData{Payload: payload, Type: payloadType, FileName: fileName}
+	clipData := &protocol.ClipboardData{
+		Payload:     item.payload,
+		Type:        item.payloadType,
+		FileName:    item.fileName,
+		MessageUUID: uuid.New().String(),
+		DeviceID:    deviceID,
+		TimestampMs: time.Now().UnixMilli(),
+	}
 	var body string
 
-	if e2ee && encKey != nil {
+	if e2ee {
 		jsonBytes, _ := clipData.Encode()
 		encrypted, err := pkgcrypto.Encrypt(encKey, jsonBytes)
 		if err != nil {
-			return err
+			return "", err
 		}
 		body, _ = pkgcrypto.EncodeToJSONString(encrypted)
 	} else {
@@ -160,12 +208,77 @@ func (e *Engine) SendClipboardWithFileName(payload string, payloadType string, f
 		body = string(jsonBytes)
 	}
 
+	return body, nil
+}
+
+func (e *Engine) sendEncodedBody(body string) error {
+	e.mu.Lock()
+	conn := e.wsConn
+	e.mu.Unlock()
+	if conn == nil {
+		return fmt.Errorf("not connected (queued for retry)")
+	}
 	sendFrame := protocol.SendFrame("/app/cliptext", body)
 	e.writeMu.Lock()
 	err := conn.WriteMessage(websocket.TextMessage, sendFrame.Encode())
 	e.writeMu.Unlock()
-
 	return err
+}
+
+// enqueuePendingSend 将失败消息加入重发队列（上限 20 条，超出丢弃最旧）。
+func (e *Engine) enqueuePendingSend(item pendingSend) {
+	e.pendingMu.Lock()
+	defer e.pendingMu.Unlock()
+	if len(e.pendingSends) >= pendingSendLimit {
+		e.pendingSends = e.pendingSends[1:]
+	}
+	e.pendingSends = append(e.pendingSends, item)
+}
+
+// flushPendingSends 重连成功后补发积压消息。
+func (e *Engine) flushPendingSends() {
+	e.pendingMu.Lock()
+	if len(e.pendingSends) == 0 || e.pendingFlushing {
+		e.pendingMu.Unlock()
+		return
+	}
+	e.pendingFlushing = true
+	batch := e.pendingSends
+	e.pendingSends = nil
+	e.pendingMu.Unlock()
+	defer func() {
+		e.pendingMu.Lock()
+		e.pendingFlushing = false
+		e.pendingMu.Unlock()
+	}()
+
+	for i, item := range batch {
+		if item.body == "" {
+			body, err := e.encodeClipboardBody(item)
+			if err != nil {
+				e.restorePendingSends(batch[i:])
+				return
+			}
+			item.body = body
+			item.payload = ""
+			batch[i] = item
+		}
+		if err := e.sendEncodedBody(item.body); err != nil {
+			log.Println("bridge: pending send retry failed, keeping remaining messages:", err)
+			e.restorePendingSends(batch[i:])
+			return
+		}
+	}
+	log.Printf("bridge: pending sends flushed (%d items)", len(batch))
+}
+
+func (e *Engine) restorePendingSends(items []pendingSend) {
+	e.pendingMu.Lock()
+	e.pendingSends = append(append([]pendingSend(nil), items...), e.pendingSends...)
+	if len(e.pendingSends) > pendingSendLimit {
+		e.pendingSends = e.pendingSends[len(e.pendingSends)-pendingSendLimit:]
+	}
+	e.pendingMu.Unlock()
 }
 
 // IsConnected 返回 engine 是否已连接。
@@ -231,7 +344,16 @@ func (e *Engine) deriveKey() error {
 		Salt       string `json:"salt"`
 		HashRounds int    `json:"hash_rounds"`
 	}
-	json.NewDecoder(resp.Body).Decode(&info)
+	// 修复记录：旧实现忽略了解码错误，失败时会静默用零值 salt 派生错误密钥
+	if err := json.NewDecoder(resp.Body).Decode(&info); err != nil {
+		return fmt.Errorf("decode user-info: %w", err)
+	}
+	if info.Salt == "" {
+		info.Salt = e.username // 与服务端默认行为一致
+	}
+	if info.HashRounds <= 0 {
+		info.HashRounds = 100000
+	}
 	e.encKey = pkgcrypto.DeriveKey(e.password, e.username, info.Salt, info.HashRounds)
 	return nil
 }
@@ -255,16 +377,26 @@ func (e *Engine) connectWS() error {
 		return err
 	}
 
-	// STOMP handshake
-	conn.WriteMessage(websocket.TextMessage, protocol.ConnectFrame("1.1", "localhost").Encode())
-	_, msg, _ := conn.ReadMessage()
+	// STOMP handshake（修复记录：旧实现忽略握手期的全部写错误）
+	if err := conn.WriteMessage(websocket.TextMessage, protocol.ConnectFrame("1.1", "localhost").Encode()); err != nil {
+		conn.Close()
+		return fmt.Errorf("STOMP CONNECT write: %w", err)
+	}
+	_, msg, err := conn.ReadMessage()
+	if err != nil {
+		conn.Close()
+		return fmt.Errorf("STOMP CONNECT read: %w", err)
+	}
 	frame, _ := protocol.ParseFrame(msg)
 	if frame == nil || frame.Command != "CONNECTED" {
 		conn.Close()
 		return fmt.Errorf("STOMP handshake failed")
 	}
 
-	conn.WriteMessage(websocket.TextMessage, protocol.SubscribeFrame("sub-0", "/user/queue/cliptext").Encode())
+	if err := conn.WriteMessage(websocket.TextMessage, protocol.SubscribeFrame("sub-0", "/user/queue/cliptext").Encode()); err != nil {
+		conn.Close()
+		return fmt.Errorf("STOMP SUBSCRIBE write: %w", err)
+	}
 
 	e.mu.Lock()
 	old := e.wsConn
@@ -347,6 +479,8 @@ func (e *Engine) reconnectLoop() error {
 				if err := e.connectWS(); err == nil {
 					e.setConnected(true)
 					e.notifyStatus("connected")
+					// 重连成功后补发断线期间积压的消息
+					go e.flushPendingSends()
 					return nil
 				}
 			}
@@ -429,9 +563,34 @@ func (e *Engine) handleIncomingData(body string) {
 		clipData, _ = protocol.DecodeClipboardData([]byte(body))
 	}
 
-	if clipData != nil && e.callback != nil {
-		e.callback.OnMessage(clipData.Payload, clipData.Type, clipData.FileName)
+	if clipData == nil || e.callback == nil {
+		return
 	}
+
+	// 回环过滤：丢弃本机设备发出的消息
+	if clipData.DeviceID != "" && clipData.DeviceID == e.deviceID {
+		return
+	}
+	// MessageUUID 去重（重连/重投递兜底）
+	if clipData.MessageUUID != "" {
+		now := time.Now()
+		e.dedupMu.Lock()
+		if _, seen := e.recvUUIDs[clipData.MessageUUID]; seen {
+			e.dedupMu.Unlock()
+			return
+		}
+		e.recvUUIDs[clipData.MessageUUID] = now
+		if len(e.recvUUIDs) > dedupCap {
+			for k, t := range e.recvUUIDs {
+				if now.Sub(t) > dedupWindow {
+					delete(e.recvUUIDs, k)
+				}
+			}
+		}
+		e.dedupMu.Unlock()
+	}
+
+	e.callback.OnMessage(clipData.Payload, clipData.Type, clipData.FileName)
 }
 
 func looksLikeEncryptedEnvelope(body string) bool {

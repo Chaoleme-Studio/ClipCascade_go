@@ -2,6 +2,8 @@
 package handler
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"log/slog"
 
 	"github.com/gofiber/fiber/v2"
@@ -12,6 +14,26 @@ import (
 	"github.com/clipcascade/server/middleware"
 	"github.com/clipcascade/server/model"
 )
+
+// randomSalt 生成 128-bit 随机十六进制 E2EE salt。
+// 客户端登录后通过 /api/user-info 拉取 salt 再派生密钥，因此随机 salt 对所有客户端完全兼容；
+// 仅新用户使用随机 salt，存量用户（salt=用户名）保持不变，避免破坏已有密钥派生。
+func randomSalt() string {
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		slog.Warn("生成随机 salt 失败，退回用户名 salt", "错误", err)
+		return ""
+	}
+	return hex.EncodeToString(b)
+}
+
+// saltForNewUser 返回新用户的 E2EE salt：优先随机，失败时退回用户名（旧行为）。
+func saltForNewUser(username string) string {
+	if s := randomSalt(); s != "" {
+		return s
+	}
+	return username
+}
 
 // AuthHandler 处理 user 身份验证端点。
 type AuthHandler struct {
@@ -149,10 +171,10 @@ func (h *AuthHandler) SignupPost(c *fiber.Ctx) error {
 		return c.Redirect("/signup?error=internal")
 	}
 
-	// 创建默认 UserInfo
+	// 创建默认 UserInfo（随机 salt，防"salt=用户名"导致密钥派生可预测）
 	info := model.UserInfo{
 		UserID:     user.ID,
-		Salt:       username, // 默认 salt
+		Salt:       saltForNewUser(username),
 		HashRounds: 100000,
 	}
 	h.DB.Create(&info)

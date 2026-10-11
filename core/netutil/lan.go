@@ -21,9 +21,9 @@ func IsUsableLANIPv4(ip net.IP) bool {
 	if v4[0] == 192 && v4[1] == 168 && (v4[2] == 52 || v4[2] == 56 || v4[2] == 64) {
 		return false
 	}
-	if v4[0] == 172 && v4[1] >= 16 && v4[1] <= 31 {
-		return false
-	}
+	// 修复记录：不再按网段排除 172.16/12 —— 企业内网常用 172.16-31.x.x，
+	// 虚拟网卡（docker/vbox 等）已由 isVirtualInterfaceName 按接口名过滤。
+	// CGNAT 100.64/10 仍排除：蜂窝数据与部分 VPN 出口使用该段，不适合局域网发现。
 	if v4[0] == 100 && v4[1] >= 64 && v4[1] <= 127 {
 		return false
 	}
