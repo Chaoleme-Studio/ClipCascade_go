@@ -49,8 +49,8 @@ GLIBC 符号版本守卫，超标会直接让 job 失败。
 ## GitHub 发布顺序
 
 1. 提交 `CHANGELOG-2.4.md`、状态文档和构建配置。
-2. 推送 `main`。
-3. 创建并推送 `v2.4` Tag。
+2. 推送 `main`（普通推送不触发整套构建）。
+3. 创建并推送 `v2.4` Tag；只有 `v*` 标签推送自动触发整套构建与 Release，必要时可手动运行 workflow。
 4. 等待 `.github/workflows/build.yml` 的 Tag 工作流完成。
 5. 确认 Release 附件包含服务端、桌面端、桌面 UI、Web Clip 和 Android APK。
 6. 在统信 UOS / deepin 真机上启动 `clipcascade-desktop-linux-amd64`，确认托盘与剪贴板同步正常。
