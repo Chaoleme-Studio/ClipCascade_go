@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"golang.design/x/clipboard"
+	_ "golang.org/x/image/webp"
 
 	"github.com/clipcascade/pkg/constants"
 	pkgcrypto "github.com/clipcascade/pkg/crypto"
@@ -30,6 +31,7 @@ import (
 
 // Manager 处理剪贴板监听、更改检测和内容编码。
 type Manager struct {
+	clipboardMu        sync.Mutex // 原生读取与远端写入串行，防止旧快照覆盖粘贴回环守卫
 	mu                 sync.Mutex
 	lastHash           uint64
 	ignoreChangeCounts map[int64]struct{}
@@ -54,7 +56,7 @@ func NewManager() *Manager {
 
 // Init 初始化剪贴板子系统。在某些平台上必须从 main goroutine 调用。
 func (m *Manager) Init() error {
-	return clipboard.Init()
+	return initClipboardBackend()
 }
 
 // CleanupExpiredTempFiles 在启动阶段清理超过保留时长的临时文件。
@@ -76,21 +78,7 @@ func (m *Manager) SetNotifier(fn func(title, message string)) {
 // Watch 开始监控剪贴板变更。
 // 它通过轮询系统底层的变更计数器（SequenceNumber/ChangeCount）来实现零 CGO 的事件驱动模拟。
 func (m *Manager) Watch(ctx context.Context) {
-	// macOS: 避开 golang.design/x/clipboard 的 Darwin watcher/read 实现，
-	// 统一使用 changeCount 轮询 + 原生 NSPasteboard 读取，避免后台 cgo 读崩溃。
-	if runtime.GOOS == "darwin" {
-		go m.watchLegacyByChangeCount(ctx)
-		return
-	}
-
-	// macOS / Linux: 文本和图片采用事件监听；文件保持 1s 轮询兜底。
-	if runtime.GOOS == "linux" {
-		go m.watchEventDriven(ctx)
-		return
-	}
-
-	// 其他平台（Windows）保持原有变更计数轮询策略。
-	go m.watchLegacyByChangeCount(ctx)
+	go m.watchClipboardBackend(ctx)
 }
 
 func (m *Manager) watchLegacyByChangeCount(ctx context.Context) {
@@ -113,62 +101,6 @@ func (m *Manager) watchLegacyByChangeCount(ctx context.Context) {
 				m.handleSystemChange()
 			}
 			lastCount = count
-		}
-	}
-}
-
-func (m *Manager) watchEventDriven(ctx context.Context) {
-	textCh := clipboard.Watch(ctx, clipboard.FmtText)
-	imageCh := clipboard.Watch(ctx, clipboard.FmtImage)
-	fileTicker := time.NewTicker(1 * time.Second) // 文件一秒循环检测一次
-	defer fileTicker.Stop()
-
-	// 与旧轮询逻辑保持一致：忽略启动后的首次事件，避免刚连接时回放当前剪贴板。
-	skipFirstTextEvent := true
-	skipFirstImageEvent := true
-	skipFirstFileTick := true
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-fileTicker.C:
-			if skipFirstFileTick {
-				skipFirstFileTick = false
-				continue
-			}
-			m.handleFileChange()
-		case data, ok := <-textCh:
-			if !ok {
-				textCh = nil
-				continue
-			}
-			if skipFirstTextEvent {
-				skipFirstTextEvent = false
-				continue
-			}
-			// 保持文件优先级：如果当前是文件剪贴板，优先走文件链路。
-			if m.handleFileChange() {
-				continue
-			}
-			if len(data) > 0 {
-				m.handleChange(string(data), constants.TypeText, "")
-			}
-		case data, ok := <-imageCh:
-			if !ok {
-				imageCh = nil
-				continue
-			}
-			if skipFirstImageEvent {
-				skipFirstImageEvent = false
-				continue
-			}
-			if m.handleFileChange() {
-				continue
-			}
-			if len(data) > 0 {
-				m.handleChange(base64.StdEncoding.EncodeToString(data), constants.TypeImage, "")
-			}
 		}
 	}
 }
@@ -209,14 +141,14 @@ func (m *Manager) handleSystemChange() {
 	}
 
 	// 优先级 2: 图像
-	if data := clipboard.Read(clipboard.FmtImage); len(data) > 0 {
+	if data, _ := clipboard.Read(context.Background(), clipboard.FmtImage); len(data) > 0 {
 		if m.handleChange(base64.StdEncoding.EncodeToString(data), constants.TypeImage, "") {
 			return
 		}
 	}
 
 	// 优先级 3: 文本 (兜底)
-	if data := clipboard.Read(clipboard.FmtText); len(data) > 0 {
+	if data, _ := clipboard.Read(context.Background(), clipboard.FmtText); len(data) > 0 {
 		if m.handleChange(string(data), constants.TypeText, "") {
 			return
 		}
@@ -226,6 +158,10 @@ func (m *Manager) handleSystemChange() {
 func (m *Manager) handleFileChange() bool {
 	// 优先级 1: 文件 (CF_HDROP / Mac Class furl / Linux uri-list)
 	paths, _ := getPlatformFilePaths()
+	return m.handleFilePaths(paths)
+}
+
+func (m *Manager) handleFilePaths(paths []string) bool {
 	if len(paths) > 0 {
 		// 单文件且大小可控时，使用 eager 直传保证跨端可粘贴。
 		if len(paths) == 1 {
@@ -281,6 +217,8 @@ func (m *Manager) handleChange(payload string, payloadType string, filename stri
 
 // Paste sets the clipboard content. Updates lastHash to securely prevent self-trigger loop echoing.
 func (m *Manager) Paste(payload string, payloadType string, filename string) {
+	m.clipboardMu.Lock()
+	defer m.clipboardMu.Unlock()
 	m.mu.Lock()
 	newHash := contentHash(payload, payloadType)
 	slog.Debug("剪贴板：Paste 设置 lastHash", "类型", payloadType, "hash", newHash)
@@ -289,13 +227,13 @@ func (m *Manager) Paste(payload string, payloadType string, filename string) {
 
 	switch payloadType {
 	case constants.TypeText:
-		if runtime.GOOS == "darwin" {
+		if runtime.GOOS == "darwin" || runtime.GOOS == "linux" {
 			if err := setPlatformText(payload); err != nil {
 				slog.Warn("剪贴板：无法写入文本到系统剪贴板", "错误", err)
 				return
 			}
 		} else {
-			clipboard.Write(clipboard.FmtText, []byte(payload))
+			_, _ = clipboard.Write(context.Background(), clipboard.FmtText, []byte(payload))
 		}
 		slog.Debug("剪贴板：已粘贴文本", "大小", len(payload))
 		if m.notifier != nil {
@@ -320,9 +258,12 @@ func (m *Manager) Paste(payload string, payloadType string, filename string) {
 				return
 			}
 		} else if runtime.GOOS == "linux" {
-			clipboard.Write(clipboard.FmtImage, data)
+			if err := setPlatformImage(data); err != nil {
+				slog.Warn("剪贴板：无法写入图像到系统剪贴板", "错误", err)
+				return
+			}
 		} else {
-			clipboard.Write(clipboard.FmtImage, data)
+			_, _ = clipboard.Write(context.Background(), clipboard.FmtImage, data)
 		}
 		slog.Debug("剪贴板：已粘贴图像", "大小", len(data))
 		if m.notifier != nil {
@@ -558,6 +499,8 @@ func cleanupOldTempFiles(dir string, olderThan time.Duration) {
 
 // PasteLocalFile 将现有本地文件路径写入系统剪贴板。
 func (m *Manager) PasteLocalFile(path string) error {
+	m.clipboardMu.Lock()
+	defer m.clipboardMu.Unlock()
 	path = strings.TrimSpace(path)
 	if path == "" {
 		return fmt.Errorf("empty path")

@@ -2,6 +2,7 @@
 package transport
 
 import (
+	"context"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -46,8 +47,18 @@ func (sc *StompClient) OnMessage(fn func(body string)) {
 
 // Connect 建立 WebSocket 连接并执行 STOMP 握手。
 func (sc *StompClient) Connect() error {
+	return sc.ConnectContext(context.Background())
+}
+
+// ConnectContext allows disconnect/shutdown to cancel an in-flight handshake.
+func (sc *StompClient) ConnectContext(ctx context.Context) error {
 	sc.mu.Lock()
 	defer sc.mu.Unlock()
+	select {
+	case <-sc.done:
+		return fmt.Errorf("client is closed")
+	default:
+	}
 
 	// 从 server URL 构建 WebSocket URL
 	wsURL, err := sc.buildWSURL()
@@ -64,11 +75,16 @@ func (sc *StompClient) Connect() error {
 		header.Add("Cookie", c.String())
 	}
 
-	conn, _, err := dialer.Dial(wsURL, header)
+	conn, _, err := dialer.DialContext(ctx, wsURL, header)
 	if err != nil {
 		return fmt.Errorf("websocket dial: %w", err)
 	}
 	sc.conn = conn
+	stopCancel := context.AfterFunc(ctx, func() { _ = conn.Close() })
+	defer stopCancel()
+	// WebSocket 升级成功并不代表 STOMP 服务可用，握手也必须有截止时间。
+	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	_ = conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
 
 	// STOMP CONNECT 握手
 	connectFrame := protocol.ConnectFrame("1.1", "localhost")
@@ -98,6 +114,8 @@ func (sc *StompClient) Connect() error {
 	}
 
 	sc.subscribed = true
+	_ = conn.SetReadDeadline(time.Time{})
+	_ = conn.SetWriteDeadline(time.Time{})
 	slog.Info("stomp: connected and subscribed")
 
 	// 启动消息读取器 goroutine
@@ -248,7 +266,12 @@ func (sc *StompClient) readLoop() {
 func (sc *StompClient) writeMessage(conn *websocket.Conn, msgType int, data []byte) error {
 	sc.writeMu.Lock()
 	defer sc.writeMu.Unlock()
-	return conn.WriteMessage(msgType, data)
+	_ = conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+	err := conn.WriteMessage(msgType, data)
+	if err != nil {
+		_ = conn.Close()
+	}
+	return err
 }
 
 // buildWSURL 将 http(s)://host:port 转换为 ws(s)://host:port/clipsocket

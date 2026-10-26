@@ -94,10 +94,11 @@ ClipCascade 的定位是：以剪贴板为中心，做一个可自部署、可�
 
 #### Linux
 
-- 文本/图片监听主要依赖 `golang.design/x/clipboard` 的事件通道。
-- 文件剪贴板通过 `xclip` 读写（Wayland 会话优先 `wl-copy`/`wl-paste`）。**写入的 target 按桌面环境选择**：统信 UOS / deepin / GNOME 系使用 `x-special/gnome-copied-files`（数据格式为 `copy\nfile://...`），KDE 使用 `text/uri-list`；读取时会依次尝试多个 target。写错 target 的典型症状是文件管理器能看到剪贴板更新、但 Ctrl+V 粘不出文件。
-- 写入剪贴板时会 fork 一个后台属主进程持有 selection。xclip / wl-copy 默认后台运行但**不关闭继承来的 stdout/stderr**，因此不能用 `CombinedOutput`/`Output` 捕获它们，否则调用方会阻塞到剪贴板被其它程序接管为止。
-- Linux 当前更接近“标准剪贴板格式驱动”的实现，对桌面环境依赖相对更强。
+- 剪贴板库更新为 `golang.design/x/clipboard v0.11.0`，程序直接访问系统接口，不再调用 `wl-copy`、`wl-paste` 或 `xclip`。
+- 自动探测合成器能力：支持 `ext-data-control` 或 `wlr-data-control` 时优先使用原生 Wayland 事件；其他环境使用已有的 X11/XWayland。不会要求用户切换桌面会话。
+- 文件一次性发布 `text/uri-list`、`x-special/gnome-copied-files` 和 `x-special/mate-copied-files`，兼容 KDE、GNOME、DDE/UOS 和 MATE 文件管理器。
+- 剪贴板内容由本程序持有，不再为每次写入启动外部属主进程。桌面自带的剪贴板历史管理器仍负责原有历史界面。
+- 各桌面的支持范围、必要运行库和可选工具见 [Linux 运行时依赖](#linux-运行时依赖)。
 
 ### 当前设计取舍
 
@@ -407,29 +408,77 @@ export ANDROID_NDK_HOME="/opt/homebrew/Caskroom/android-ndk/<version>/AndroidNDK
 
 ### Linux 运行时依赖
 
-Linux 桌面端和图形化桌面 UI 都依赖 CGO，无法纯静态编译，除二进制本身外还需要系统库。按使用目标安装：
+**本节适用于 v2.5 及更新版本。v2.4 及更早版本使用旧剪贴板实现，请升级客户端；安装工具不会自动更新程序代码。**
+
+#### 为什么系统已有剪贴板，还会提到剪贴板工具？
+
+系统剪贴板负责复制和粘贴；KDE 的 Klipper 等历史管理器负责保存和展示历史；`wl-copy` / `wl-paste` / `xclip` 是供命令行程序访问系统剪贴板的工具。它们不会提供另一个独立的系统剪贴板。
+
+本次实现已内置访问接口，**不再要求安装 `wl-clipboard`、`xclip` 或 `xsel`，也不要求更换、关闭原有历史管理器或切换到 X11 桌面。**
+
+原生后端适用于 `client-desktop` 托盘端及 `client-desktop/cmd/desktop-ui` 窗口端。`client-mobile` 生成的 Fyne 演示桌面程序（`clipcascade-ui-desktop-linux-amd64`）仍使用 Fyne 剪贴板接口，未包含本次后端适配。
+
+#### 不同桌面环境使用什么接口？
+
+| 桌面 / 会话 | 本程序使用的接口 | 额外剪贴板工具 | 本次验证范围 |
+| --- | --- | --- | --- |
+| KDE Plasma / Wayland | 原生 Wayland data-control，事件监听 | 不需要 | Fedora 44 实机只读；独立 KWin 桌面完成文本、图片、文件往返测试 |
+| GNOME 49+ / Wayland | 原生 Wayland data-control | 不需要 | 上游支持；尚未进行完整 GNOME 桌面实测 |
+| GNOME 48 及更早 / Wayland | 使用会话已有的 XWayland 兼容接口 | 不需要 `wl-clipboard` / `xclip` | 无 data-control 且无 XWayland 时，无法进行后台读取，会报告接口不可用 |
+| Sway / Hyprland 等 | 合成器提供的 ext / wlr data-control | 不需要 | 上游协议支持；尚未逐个桌面实测 |
+| KDE / GNOME / XFCE / MATE / Cinnamon / DDE / UOS 的 X11 会话 | 内置 X11 协议后端 | 不需要 `xclip` / `xsel` | 独立 XWayland 显示上验证；各文件管理器仍需发行版实测 |
+| 其他 Wayland 会话 | 优先探测 data-control，再尝试已有 X11 兼容接口 | 工具安装本身不能补齐合成器缺少的协议 | 按实际接口能力决定，不能仅凭桌面名称保证支持 |
+
+桌面环境决定可用接口，发行版决定软件包名称。上游支持说明见 [clipboard v0.11.0 平台文档](https://github.com/golang-design/clipboard/blob/v0.11.0/README.md#platforms)。本程序不自动安装系统包或修改桌面会话。
 
 #### 隐形式桌面托盘端（`clipcascade-desktop-linux-amd64`）
 
+托盘界面仍需要 GTK3 和 Ayatana AppIndicator 运行库。已具备这些库的桌面无需重复安装；以下命令用于缺少运行库时补齐，**并不安装额外的剪贴板管理器**。
+
 ```bash
-# Debian / Ubuntu / 统信 UOS / deepin
-sudo apt install libgtk-3-0 libayatana-appindicator3-1 libx11-6 xclip
+# Debian / Ubuntu / 统信 UOS / deepin：会通过依赖自动安装对应版本的 GTK3
+sudo apt install libayatana-appindicator3-1
+
+# Fedora
+sudo dnf install gtk3 libayatana-appindicator-gtk3
+
+# Arch Linux
+sudo pacman -S gtk3 libayatana-appindicator
 ```
 
-| 依赖 | 用途 | 缺失后果 |
-|------|------|----------|
-| `libgtk-3-0` | 托盘界面的 GTK3 运行时 | 启动失败 |
-| `libayatana-appindicator3-1` | 托盘图标注册 | 启动失败 |
-| `libx11-6` | 文本/图片剪贴板读写（运行期 `dlopen`，非链接期） | 文本与图片同步不可用 |
-| `xclip` | 文件剪贴板读写（target 见下方说明） | 仅文件同步不可用，文本与图片正常 |
+| 组件 | 用途 | 是否必需 |
+| --- | --- | --- |
+| GTK3 | 托盘程序的界面运行库 | 托盘产物需要，通常已安装 |
+| Ayatana AppIndicator | 托盘图标和菜单 | 托盘产物需要 |
+| `wl-clipboard` | 提供 `wl-copy` / `wl-paste`，便于人工诊断 Wayland 剪贴板 | 可选，本程序不调用 |
+| `xclip` / `xsel` | 便于人工诊断 X11 剪贴板 | 可选，本程序不调用 |
+| Klipper / 其他历史管理器 | 桌面已有的历史记录界面 | 继续使用原有组件，无需为同步再装一个 |
 
-Wayland 会话下文件剪贴板会优先走 `wl-copy` / `wl-paste`，装了 `wl-clipboard` 包更好。
+GNOME 如果没有显示托盘图标，可以启用 AppIndicator 扩展；这只解决托盘显示，不会给应用增加剪贴板读取权限。Fedora 对应包是 `gnome-shell-extension-appindicator`，启用方式见 [Fedora 包说明](https://packages.fedoraproject.org/pkgs/gnome-shell-extension-appindicator/gnome-shell-extension-appindicator/)。
 
-文件剪贴板的 target 由桌面环境决定。GNOME 系文件管理器（含统信 UOS / deepin 的 `dde-file-manager`，其源码只认 `kGnomeCopyKey` 常量 `x-special/gnome-copied-files`）需要 `x-special/gnome-copied-files` 且数据带 `copy\n` 前缀；KDE (Dolphin) 使用 `text/uri-list`。在 UOS/deepin 上只写 `text/uri-list` 会让文件管理器感知到剪贴板变化、却粘不出任何文件。
+托盘产物链接 `libayatana-appindicator3.so.1`，不要用只有 `libappindicator3.so.1` 的旧包替代。可用 `ldd ./build/clipcascade-desktop-linux-amd64` 检查是否确实缺少运行库。
 
-托盘端链接的是 `libayatana-appindicator3`，不是老的 `libappindicator3`。两者是同一次 fork、ABI 兼容，但 soname 不同，不能互相顶替：统信 UOS V20 只提供 `libayatana-appindicator3.so.1`，所以构建也统一用 ayatana（Debian 10 自带 `libayatana-appindicator3-dev`）。
+#### 可选诊断工具：仅需要人工排查时安装
 
-#### 图形化桌面 UI（`clipcascade-ui-desktop-linux-amd64`）
+```bash
+# Debian / Ubuntu：按当前会话选择需要的工具
+sudo apt install wl-clipboard   # Wayland 诊断工具
+sudo apt install xclip          # X11 诊断工具
+
+# Fedora
+sudo dnf install wl-clipboard   # Wayland 诊断工具
+sudo dnf install xclip          # X11 诊断工具
+
+# Arch Linux
+sudo pacman -S wl-clipboard     # Wayland 诊断工具
+sudo pacman -S xclip            # X11 诊断工具
+```
+
+`wl-paste --list-types` 可列出剪贴板格式；它是诊断手段，不是启动本程序的前置条件。复制正常、历史界面正常，但同步异常时，应检查程序后端、连接与发送日志，而不是据此认定系统缺少剪贴板。
+
+#### 图形化桌面 UI（`clipcascade-desktop-ui-linux-amd64`）
+
+以下是 Fyne 窗口和渲染所需的库，与剪贴板后端的选择独立。安装 `libX11` 运行库不等于切换到 X11 桌面。
 
 ```bash
 sudo apt install libgl1 libx11-6 libxcursor1 libxrandr2 libxinerama1 libxi6 libxxf86vm1

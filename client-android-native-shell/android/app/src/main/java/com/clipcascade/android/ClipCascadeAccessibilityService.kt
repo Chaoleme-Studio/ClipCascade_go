@@ -32,7 +32,7 @@ class ClipCascadeAccessibilityService : AccessibilityService() {
         if (event == null) return
 
         // 排除自身应用产生的事件，防止无限循环
-        if (event.packageName == packageName) {
+        if (event.packageName?.toString() == packageName) {
             return
         }
 
@@ -50,7 +50,6 @@ class ClipCascadeAccessibilityService : AccessibilityService() {
             // 类型2: 系统吐司 (Toast) 或弹窗通知状态改变
             AccessibilityEvent.TYPE_NOTIFICATION_STATE_CHANGED -> {
                 val text = event.text.toString()
-                Log.d(TAG, "🔔 监听到通知栈变化: $text")
                 // 大部分手机复制时会弹 Toast，例如 "已复制到剪贴板"
                 if (text.contains("复制") || text.contains("copy") || text.contains("Copied")) {
                     Log.i(TAG, "🎯 识别到强特征复制 Toast，立即触发同步")
@@ -63,7 +62,6 @@ class ClipCascadeAccessibilityService : AccessibilityService() {
             // 类型3: 系统的无障碍语音播报
             AccessibilityEvent.TYPE_ANNOUNCEMENT -> {
                 val text = event.text.toString()
-                Log.d(TAG, "📢 监听到系统宣告: $text")
                 if (text.contains("复制") || text.contains("copy")) {
                     debounceAndTriggerCopy(forceImmediate = true)
                 } else {

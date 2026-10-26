@@ -44,9 +44,13 @@ import android.widget.TextView
 import android.widget.Toast
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
+import androidx.annotation.RequiresApi
 import com.google.android.material.button.MaterialButton
 import com.google.android.material.card.MaterialCardView
 import java.io.File
+import java.math.BigInteger
+import java.net.Inet4Address
+import java.net.InetAddress
 import java.util.ArrayDeque
 import java.util.LinkedHashMap
 import java.util.LinkedHashSet
@@ -64,6 +68,7 @@ class MainActivity : Activity() {
     private val discoveredServers = LinkedHashSet<String>()
     private val discoveredServiceUrls = LinkedHashMap<String, String>()
     private val pendingServiceResolutions = ArrayDeque<NsdServiceInfo>()
+    private val serviceResolutionCleanup = LinkedHashMap<String, () -> Unit>()
     private var discoveryGeneration = 0
     private var discoveryRunning = false
     private var discoveryRestartPending = false
@@ -180,8 +185,15 @@ class MainActivity : Activity() {
             text = "发现"
             minWidth = dp(72)
             setOnClickListener {
+                if (synchronized(discoveredServers) { discoveredServers.isNotEmpty() }) {
+                    showDiscoveredServersMenu(this, serverAddressInput)
+                } else {
+                    restartServerDiscovery(serverAddressInput, this, showMenuWhenFound = true)
+                }
+            }
+            setOnLongClickListener {
                 restartServerDiscovery(serverAddressInput, this, showMenuWhenFound = true)
-                Toast.makeText(this@MainActivity, "正在重新发现局域网服务", Toast.LENGTH_SHORT).show()
+                true
             }
         }
         val serverRow = LinearLayout(this).apply {
@@ -799,6 +811,7 @@ class MainActivity : Activity() {
         showMenuWhenFound: Boolean = false
     ) {
         discoveryGeneration++
+        clearServiceResolutions()
         discoveryRestartPending = false
         resolveInFlight = false
         pendingServiceResolutions.clear()
@@ -830,12 +843,18 @@ class MainActivity : Activity() {
 
         val listener = object : NsdManager.DiscoveryListener {
             override fun onDiscoveryStarted(serviceType: String) {
-                if (generation != discoveryGeneration) return
-                discoveryRunning = true
-                Log.i(tag, "mDNS discovery started: $serviceType")
+                uiHandler.post {
+                    if (generation != discoveryGeneration) return@post
+                    discoveryRunning = true
+                    Log.i(tag, "mDNS discovery started: $serviceType")
+                }
             }
 
             override fun onStartDiscoveryFailed(serviceType: String, errorCode: Int) {
+                uiHandler.post { handleStartDiscoveryFailed(errorCode) }
+            }
+
+            private fun handleStartDiscoveryFailed(errorCode: Int) {
                 Log.w(tag, "mDNS discovery failed to start: $errorCode")
                 if (generation != discoveryGeneration) return
                 discoveryListener = null
@@ -850,16 +869,23 @@ class MainActivity : Activity() {
 
             override fun onStopDiscoveryFailed(serviceType: String, errorCode: Int) {
                 Log.w(tag, "mDNS discovery failed to stop: $errorCode")
-                finishDiscoveryStop(this)
+                val listener = this
+                uiHandler.post { finishDiscoveryStop(listener) }
             }
 
             override fun onDiscoveryStopped(serviceType: String) {
                 Log.i(tag, "mDNS discovery stopped: $serviceType")
-                finishDiscoveryStop(this)
+                val listener = this
+                uiHandler.post { finishDiscoveryStop(listener) }
             }
 
             override fun onServiceLost(serviceInfo: NsdServiceInfo) {
+                uiHandler.post { handleLostService(serviceInfo) }
+            }
+
+            private fun handleLostService(serviceInfo: NsdServiceInfo) {
                 if (generation != discoveryGeneration) return
+                serviceResolutionCleanup.remove(serviceInfo.serviceName)?.invoke()
                 val changed = synchronized(discoveredServers) {
                     val oldUrl = discoveredServiceUrls.remove(serviceInfo.serviceName)
                     oldUrl != null && !discoveredServiceUrls.containsValue(oldUrl) && discoveredServers.remove(oldUrl)
@@ -868,15 +894,24 @@ class MainActivity : Activity() {
             }
 
             override fun onServiceFound(serviceInfo: NsdServiceInfo) {
+                uiHandler.post { handleFoundService(serviceInfo) }
+            }
+
+            private fun handleFoundService(serviceInfo: NsdServiceInfo) {
                 val serviceType = serviceInfo.serviceType ?: return
-                if (generation != discoveryGeneration ||
+                if (!activityResumed || generation != discoveryGeneration ||
                     !serviceType.equals("_clipcascade._tcp.", ignoreCase = true)
                 ) {
                     return
                 }
                 if (discoveredServiceUrls.containsKey(serviceInfo.serviceName) ||
+                    serviceResolutionCleanup.containsKey(serviceInfo.serviceName) ||
                     pendingServiceResolutions.any { it.serviceName == serviceInfo.serviceName }
                 ) {
+                    return
+                }
+                if (Build.VERSION.SDK_INT >= 34) {
+                    resolveServiceUpdates(manager, serviceInfo, serverInput, discoverMenuBtn, generation)
                     return
                 }
                 pendingServiceResolutions.addLast(serviceInfo)
@@ -893,6 +928,78 @@ class MainActivity : Activity() {
             updateDiscoverButton(discoverMenuBtn)
             Log.w(tag, "mDNS discover start failed", e)
         }
+    }
+
+    // Android 14+ 每个服务使用独立的回调，可同时解析多个服务，并接收 IP 更新。
+    // 旧系统的 resolveService 仍按平台要求串行执行。
+    @RequiresApi(34)
+    private fun resolveServiceUpdates(
+        manager: NsdManager,
+        service: NsdServiceInfo,
+        serverInput: EditText,
+        discoverMenuBtn: Button,
+        generation: Int
+    ) {
+        val callback = object : NsdManager.ServiceInfoCallback {
+            override fun onServiceInfoCallbackRegistrationFailed(errorCode: Int) {
+                if (generation != discoveryGeneration) return
+                serviceResolutionCleanup.remove(service.serviceName)
+                Log.d(tag, "mDNS service callback failed: $errorCode")
+            }
+
+            override fun onServiceUpdated(info: NsdServiceInfo) {
+                if (generation != discoveryGeneration || !activityResumed) return
+                val manager = connectivityManager
+                val network = activeNetwork ?: manager?.activeNetwork
+                val localAddresses = network?.let { manager?.getLinkProperties(it)?.linkAddresses }.orEmpty()
+                val candidates = info.hostAddresses
+                    .filter { !it.isLoopbackAddress && !it.isAnyLocalAddress && !it.isLinkLocalAddress }
+                    .filter { address -> address.hostAddress?.let { isUsableDiscoveryUrl(buildHttpUrl(it, info.port)) } == true }
+                    .sortedWith(compareBy<InetAddress>({ address ->
+                        // 服务可能同时广播 Wi-Fi、Hyper-V 和 VMware 地址，优先选择与手机同网段的地址。
+                        if (localAddresses.any { local ->
+                            val bytes = address.address
+                            val localBytes = local.address.address
+                            val shift = bytes.size * 8 - local.prefixLength
+                            bytes.size == localBytes.size && shift >= 0 &&
+                                BigInteger(1, bytes).shiftRight(shift) == BigInteger(1, localBytes).shiftRight(shift)
+                        }) 0 else 1
+                    }, { if (it is Inet4Address) 0 else 1 }, {
+                        discoveryRank(buildHttpUrl(it.hostAddress.orEmpty(), info.port))
+                    }))
+                val host = candidates.firstOrNull()?.hostAddress ?: return
+                addDiscoveredServer(buildHttpUrl(host, info.port), service.serviceName, serverInput, discoverMenuBtn)
+            }
+
+            override fun onServiceLost() {
+                if (generation != discoveryGeneration) return
+                synchronized(discoveredServers) {
+                    val oldUrl = discoveredServiceUrls.remove(service.serviceName)
+                    if (oldUrl != null && !discoveredServiceUrls.containsValue(oldUrl)) discoveredServers.remove(oldUrl)
+                }
+                updateDiscoverButton(discoverMenuBtn)
+            }
+
+            override fun onServiceInfoCallbackUnregistered() {}
+        }
+        serviceResolutionCleanup[service.serviceName] = {
+            try {
+                manager.unregisterServiceInfoCallback(callback)
+            } catch (e: Exception) {
+                Log.d(tag, "mDNS callback cleanup failed", e)
+            }
+        }
+        try {
+            manager.registerServiceInfoCallback(service, mainExecutor, callback)
+        } catch (e: Exception) {
+            serviceResolutionCleanup.remove(service.serviceName)
+            Log.d(tag, "mDNS service callback failed to run", e)
+        }
+    }
+
+    private fun clearServiceResolutions() {
+        serviceResolutionCleanup.values.toList().forEach { it() }
+        serviceResolutionCleanup.clear()
     }
 
     @Suppress("DEPRECATION")
@@ -937,6 +1044,7 @@ class MainActivity : Activity() {
     }
 
     private fun stopServerDiscovery(restartAfterStop: Boolean = false) {
+        clearServiceResolutions()
         discoveryRestartPending = discoveryRestartPending || restartAfterStop
         val manager = nsdManager
         val listener = discoveryListener
@@ -997,7 +1105,7 @@ class MainActivity : Activity() {
                 if (activityResumed) showDiscoveredServersMenu(discoverMenuBtn, serverInput)
             }
             discoveryMenuTask = task
-            uiHandler.postDelayed(task, 600L)
+            uiHandler.post(task)
         }
     }
 
@@ -1073,10 +1181,7 @@ class MainActivity : Activity() {
         if (parts.size != 4) {
             return true
         }
-        if (parts[0] == 192 && parts[1] == 168 && (parts[2] == 52 || parts[2] == 56 || parts[2] == 64)) {
-            return false
-        }
-        if (parts[0] == 172 && parts[1] in 16..31) {
+        if (parts[0] == 198 && parts[1] in 18..19) {
             return false
         }
         if (parts[0] == 100 && parts[1] in 64..127) {
@@ -1841,11 +1946,14 @@ class MainActivity : Activity() {
             if (parts.size != 4) {
                 return 50
             }
-            if (parts[0] == 192 && parts[1] == 168 && parts[2] !in setOf(52, 56, 64)) {
+            if (parts[0] == 192 && parts[1] == 168) {
                 return 0
             }
             if (parts[0] == 10) {
                 return 1
+            }
+            if (parts[0] == 172 && parts[1] in 16..31) {
+                return 2
             }
             return 10
         }

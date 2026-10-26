@@ -4,14 +4,14 @@ package clipboard
 
 import (
 	"bytes"
+	"context"
 	"fmt"
-	"log/slog"
 	"net/url"
 	"os"
-	"os/exec"
 	"strings"
+	"time"
 
-	pkgcrypto "github.com/clipcascade/pkg/crypto"
+	"golang.design/x/clipboard"
 )
 
 // 文件剪贴板的 X11/Wayland target。不同桌面环境约定不同，写错 target 会让文件
@@ -49,13 +49,8 @@ func detectFileClipboardFormat() fileClipboardFormat {
 	}
 }
 
-// getPlatformChangeCount 对于 Linux 零 CGO 方案，较难直接获取 SequenceNumber，
-// 我们通过读取 xclip 的元数据或直接由 Watch 内部状态管理。
-func getPlatformChangeCount() int64 {
-	cmd := exec.Command("xclip", "-selection", "clipboard", "-o", "-t", "TARGETS")
-	out, _ := cmd.Output()
-	return int64(pkgcrypto.XXHash64(string(out)))
-}
+// Linux 使用后端事件，不使用物理变更计数器。
+func getPlatformChangeCount() int64 { return 0 }
 
 // getPlatformFilePaths 尝试从 Wayland/X11 剪贴板获取文件 URI。
 func getPlatformFilePaths() ([]string, error) {
@@ -64,9 +59,13 @@ func getPlatformFilePaths() ([]string, error) {
 		return nil, nil
 	}
 
+	return parseLinuxFilePaths(out), nil
+}
+
+func parseLinuxFilePaths(out []byte) []string {
 	raw := string(bytes.TrimSpace(out))
 	if raw == "" {
-		return nil, nil
+		return nil
 	}
 
 	var validPaths []string
@@ -76,6 +75,9 @@ func getPlatformFilePaths() ([]string, error) {
 		line = strings.Trim(line, "\x00\r\t ")
 		if strings.HasPrefix(line, "file://") {
 			if parsed, err := url.Parse(line); err == nil {
+				if parsed.Host != "" && parsed.Host != "localhost" {
+					continue
+				}
 				// 严格磁盘校验
 				if _, err := os.Stat(parsed.Path); err == nil {
 					validPaths = append(validPaths, parsed.Path)
@@ -84,56 +86,30 @@ func getPlatformFilePaths() ([]string, error) {
 		}
 	}
 
-	return validPaths, nil
+	return validPaths
 }
 
-// setPlatformFilePaths 使用 wl-copy/xclip 写入文件路径。
+// 同时发布标准 URI 和 GNOME/MATE 文件格式，兼容不同文件管理器。
 func setPlatformFilePaths(paths []string) error {
 	if len(paths) == 0 {
 		return nil
 	}
-	target, payload := buildFileClipboardData(paths)
-	if payload == "" {
-		return nil
-	}
-	if _, err := exec.LookPath("wl-copy"); err == nil && os.Getenv("WAYLAND_DISPLAY") != "" {
-		slog.Info("剪贴板：通过 wl-copy 将文件路径写入 Linux 剪贴板...", "target", target)
-		return runClipboardOwner("wl-copy", payload, "--type", target)
-	}
-	if _, err := exec.LookPath("xclip"); err == nil {
-		slog.Info("剪贴板：通过 xclip 将文件路径写入 Linux 剪贴板...", "target", target)
-		return runClipboardOwner("xclip", payload, "-selection", "clipboard", "-t", target)
-	}
-	return fmt.Errorf("missing wl-copy or xclip for Linux file clipboard")
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	_, err := clipboard.WriteAll(ctx, linuxFileClipboardItems(paths)...)
+	return err
 }
 
-// runClipboardOwner 启动剪贴板属主进程后立即返回，不要等待。
-//
-// xclip / wl-copy 默认会 fork 到后台持有 selection，但 fork 出的子进程会继承
-// 调用方的 stdout/stderr。一旦用 CombinedOutput/Output 捕获输出，管道在子进程
-// 退出前不会 EOF，调用方就会一直阻塞到剪贴板被别的程序接管为止（实测可达数十秒
-// 甚至永久），从而卡死整个剪贴板接收流程。
-//
-// 这里把 stdio 指向 /dev/null（传 *os.File 时 exec 直接复用 fd，不会额外建管道），
-// 只等父进程退出，后台子进程继续持有剪贴板；Wait 放到 goroutine 里回收，不阻塞调用方。
-func runClipboardOwner(bin, payload string, args ...string) error {
-	devNull, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
-	if err != nil {
-		return err
+func linuxFileClipboardItems(paths []string) []clipboard.Option {
+	uris := buildURIList(paths)
+	if uris == "" {
+		return nil
 	}
-	cmd := exec.Command(bin, args...)
-	cmd.Stdin = strings.NewReader(payload)
-	cmd.Stdout = devNull
-	cmd.Stderr = devNull
-	if err := cmd.Start(); err != nil {
-		_ = devNull.Close()
-		return fmt.Errorf("%s failed to start: %w", bin, err)
+	return []clipboard.Option{
+		clipboard.Item{Format: clipboard.FmtFiles, Bytes: []byte(uris)},
+		clipboard.Item{Format: clipboard.Register(targetGnomeCopied), Bytes: []byte("copy\n" + uris)},
+		clipboard.Item{Format: clipboard.Register(targetMateCopied), Bytes: []byte("copy\n" + uris)},
 	}
-	go func() {
-		_ = cmd.Wait()
-		_ = devNull.Close()
-	}()
-	return nil
 }
 
 // fileClipboardReadTargets 返回读取文件剪贴板时应依次尝试的 target 列表。
@@ -158,27 +134,13 @@ func fileClipboardReadTargets() []string {
 }
 
 func readURIListClipboard() ([]byte, error) {
-	useWayland := os.Getenv("WAYLAND_DISPLAY") != ""
-	_, wlErr := exec.LookPath("wl-paste")
-	_, xErr := exec.LookPath("xclip")
-	if wlErr != nil && xErr != nil {
-		return nil, fmt.Errorf("missing wl-paste or xclip")
-	}
-
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
 	for _, target := range fileClipboardReadTargets() {
-		var cmd *exec.Cmd
-		if useWayland && wlErr == nil {
-			cmd = exec.Command("wl-paste", "--no-newline", "--type", target)
-		} else if xErr == nil {
-			cmd = exec.Command("xclip", "-selection", "clipboard", "-o", "-t", target)
-		} else {
-			continue
+		out, err := clipboard.Read(ctx, clipboard.Register(target))
+		if err == nil && len(bytes.TrimSpace(out)) > 0 {
+			return out, nil
 		}
-		out, err := cmd.Output()
-		if err != nil || len(bytes.TrimSpace(out)) == 0 {
-			continue
-		}
-		return out, nil
 	}
 	return nil, fmt.Errorf("no file uri-list in clipboard")
 }
@@ -211,17 +173,19 @@ func buildURIList(paths []string) string {
 }
 
 func getPlatformImage() ([]byte, error) {
-	return nil, nil
+	return clipboard.Read(context.Background(), clipboard.FmtImage)
 }
 
 func getPlatformText() ([]byte, error) {
-	return nil, nil
+	return clipboard.Read(context.Background(), clipboard.FmtText)
 }
 
 func setPlatformText(text string) error {
-	return nil
+	_, err := clipboard.Write(context.Background(), clipboard.FmtText, []byte(text))
+	return err
 }
 
 func setPlatformImage(data []byte) error {
-	return nil
+	_, err := clipboard.Write(context.Background(), clipboard.FmtImage, data)
+	return err
 }

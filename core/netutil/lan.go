@@ -17,8 +17,9 @@ func IsUsableLANIPv4(ip net.IP) bool {
 		return false
 	}
 
-	// Common host-only / virtual ranges that frequently appear before the real Wi-Fi IP.
-	if v4[0] == 192 && v4[1] == 168 && (v4[2] == 52 || v4[2] == 56 || v4[2] == 64) {
+	// 198.18/15 是基准测试网段，也常被本地代理 TUN 使用，不是可广播的 LAN 地址。
+	// 不按 192.168.x 的第三段排除虚拟网卡：这些网段同样可能是真实局域网。
+	if v4[0] == 198 && (v4[1] == 18 || v4[1] == 19) {
 		return false
 	}
 	// 修复记录：不再按网段排除 172.16/12 —— 企业内网常用 172.16-31.x.x，
@@ -32,7 +33,7 @@ func IsUsableLANIPv4(ip net.IP) bool {
 
 // IsUsableLANInterface reports whether iface should participate in mDNS publishing/browsing.
 func IsUsableLANInterface(iface net.Interface) bool {
-	if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagMulticast == 0 || iface.Flags&net.FlagLoopback != 0 {
+	if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagMulticast == 0 || iface.Flags&(net.FlagLoopback|net.FlagPointToPoint) != 0 {
 		return false
 	}
 	name := strings.ToLower(iface.Name)
@@ -53,6 +54,11 @@ func IsUsableLANInterface(iface net.Interface) bool {
 
 func isVirtualInterfaceName(name string) bool {
 	if strings.HasPrefix(name, "bridge") ||
+		strings.HasPrefix(name, "br-") ||
+		strings.HasPrefix(name, "virbr") ||
+		strings.HasPrefix(name, "veth") ||
+		strings.HasPrefix(name, "cni") ||
+		strings.HasPrefix(name, "podman") ||
 		strings.HasPrefix(name, "docker") ||
 		strings.HasPrefix(name, "utun") ||
 		strings.HasPrefix(name, "awdl") ||
@@ -65,7 +71,7 @@ func isVirtualInterfaceName(name string) bool {
 		strings.HasPrefix(name, "zt") {
 		return true
 	}
-	return strings.Contains(name, "tailscale") || strings.Contains(name, "zerotier")
+	return strings.Contains(name, "tailscale") || strings.Contains(name, "zerotier") || strings.Contains(name, "mihomo") || strings.Contains(name, "clash")
 }
 
 // UsableLANInterfaces returns physical-looking multicast interfaces for mDNS.

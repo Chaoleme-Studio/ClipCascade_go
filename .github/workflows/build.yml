@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       release_ref:
-        description: "Optional Git ref to build (for example v2.4)"
+        description: "Optional Git ref to build (for example v2.5)"
         required: false
         default: ""
 
@@ -40,9 +40,9 @@ jobs:
           cd ../client-mobile && go mod tidy
           cd ../server-web-clip && go mod tidy
       - name: Run tests
-        run: go test -v -race ./core/... ./server/... ./client-mobile/...
+        run: go test -v -race -tags desktopui ./core/... ./server/... ./client-desktop/... ./client-mobile/... ./server-web-clip/...
       - name: Vet
-        run: go vet ./core/... ./server/... ./client-mobile/...
+        run: go vet -tags desktopui ./core/... ./server/... ./client-desktop/... ./client-mobile/... ./server-web-clip/...
 
   # ──────────────── Build Server ────────────────
   build-server:
@@ -259,13 +259,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Build inside Debian 10 (buster)
-        run: docker run --rm -v "$PWD:/src" -e VERSION="${{ github.ref_name }}" -e GO_TOOLCHAIN_VERSION="${{ env.GO_TOOLCHAIN_VERSION }}" debian:buster bash /src/build-scripts/build_linux_legacy.sh mobile-ui
+      - name: Build main desktop panel inside Debian 10 (buster)
+        run: docker run --rm -v "$PWD:/src" -e VERSION="${GITHUB_REF_NAME#v}" -e GO_TOOLCHAIN_VERSION="${{ env.GO_TOOLCHAIN_VERSION }}" debian:buster bash /src/build-scripts/build_linux_legacy.sh desktop-ui
+
+      - name: Build Fyne desktop demo inside Debian 10 (buster)
+        run: docker run --rm -v "$PWD:/src" -e VERSION="${GITHUB_REF_NAME#v}" -e GO_TOOLCHAIN_VERSION="${{ env.GO_TOOLCHAIN_VERSION }}" debian:buster bash /src/build-scripts/build_linux_legacy.sh mobile-ui
 
       - uses: actions/upload-artifact@v4
         with:
           name: desktop-ui-linux-amd64
-          path: build/clipcascade-ui-desktop-linux-amd64
+          path: |
+            build/clipcascade-desktop-ui-linux-amd64
+            build/clipcascade-ui-desktop-linux-amd64
           if-no-files-found: error
 
   # ──────────────── Build Mobile (Android Native Keepalive) ────────────────
@@ -300,7 +305,9 @@ jobs:
           "$SDKMGR" "platform-tools" "platforms;android-34" "build-tools;34.0.0" "ndk;26.1.10909125"
       - name: Install gomobile
         run: |
-          go install golang.org/x/mobile/cmd/gomobile@latest
+          MOBILE_VERSION="$(go list -m -f '{{.Version}}' golang.org/x/mobile)"
+          go install golang.org/x/mobile/cmd/gomobile@"$MOBILE_VERSION"
+          go install golang.org/x/mobile/cmd/gobind@"$MOBILE_VERSION"
           export PATH="$(go env GOPATH)/bin:$PATH"
           gomobile init
       - name: Build native Android APK
@@ -311,6 +318,18 @@ jobs:
           export ANDROID_HOME="${ANDROID_SDK_ROOT}"
           export ANDROID_NDK_HOME="${ANDROID_SDK_ROOT}/ndk/26.1.10909125"
           ./build-scripts/build.sh mobile-android-native
+      - name: Test and lint Android app
+        working-directory: client-android-native-shell/android
+        env:
+          GRADLE_USER_HOME: ${{ github.workspace }}/.gradle-user-home
+        run: ./gradlew --no-daemon testDebugUnitTest lintDebug
+      - name: Verify Android package
+        run: |
+          APK=build/ClipCascade-Android-Installable.apk
+          TOOLS="$ANDROID_SDK_ROOT/build-tools/34.0.0"
+          "$TOOLS/aapt" dump badging "$APK" > build/android-package-badging.txt
+          grep -m1 "^package:.*versionCode='25' versionName='2.5'" build/android-package-badging.txt
+          "$TOOLS/apksigner" verify --verbose "$APK"
       - uses: actions/upload-artifact@v4
         with:
           name: mobile-android-native
@@ -370,5 +389,5 @@ jobs:
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
-          body_path: CHANGELOG-2.4.md
+          body_path: CHANGELOG-2.5.md
           files: artifacts/*

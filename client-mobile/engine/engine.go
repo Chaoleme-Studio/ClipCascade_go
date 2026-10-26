@@ -52,19 +52,20 @@ const (
 
 // Engine 是用于 mobile 剪贴板同步的主要 Go engine。
 type Engine struct {
-	mu         sync.Mutex
-	writeMu    sync.Mutex
-	serverURL  string
-	username   string
-	password   string
-	e2ee       bool
-	encKey     []byte
-	httpClient *http.Client
-	wsConn     *websocket.Conn
-	callback   MessageCallback
-	done       chan struct{}
-	connected  bool
-	deviceID   string // 稳定设备标识，用于回环过滤与消息溯源
+	mu            sync.Mutex
+	writeMu       sync.Mutex
+	serverURL     string
+	username      string
+	password      string
+	e2ee          bool
+	encKey        []byte
+	httpClient    *http.Client
+	wsConn        *websocket.Conn
+	callback      MessageCallback
+	done          chan struct{}
+	reconnectWake chan struct{}
+	connected     bool
+	deviceID      string // 稳定设备标识，用于回环过滤与消息溯源
 
 	pendingMu       sync.Mutex
 	pendingSends    []pendingSend
@@ -90,8 +91,9 @@ func NewEngine(serverURL, username, password string, e2eeEnabled bool) *Engine {
 				return http.ErrUseLastResponse
 			},
 		},
-		done:      make(chan struct{}),
-		recvUUIDs: make(map[string]time.Time),
+		done:          make(chan struct{}),
+		reconnectWake: make(chan struct{}, 1),
+		recvUUIDs:     make(map[string]time.Time),
 	}
 }
 
@@ -145,12 +147,28 @@ func (e *Engine) Stop() {
 	e.mu.Unlock()
 
 	if conn != nil {
-		e.writeMu.Lock()
-		_ = conn.WriteMessage(websocket.TextMessage, protocol.NewFrame("DISCONNECT").Encode())
-		e.writeMu.Unlock()
+		_ = conn.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""), time.Now().Add(time.Second))
 		_ = conn.Close()
 	}
 	e.notifyStatus("disconnected")
+}
+
+// ReconnectNow 唤醒退避中的单个重连循环；网络切换时关闭旧网络上的死连接。
+func (e *Engine) ReconnectNow() {
+	if e.isStopped() {
+		return
+	}
+	select {
+	case e.reconnectWake <- struct{}{}:
+	default:
+	}
+	e.mu.Lock()
+	conn := e.wsConn
+	e.connected = false
+	e.mu.Unlock()
+	if conn != nil {
+		_ = conn.Close()
+	}
 }
 
 // SendClipboard 向 server 发送剪贴板数据。
@@ -220,8 +238,12 @@ func (e *Engine) sendEncodedBody(body string) error {
 	}
 	sendFrame := protocol.SendFrame("/app/cliptext", body)
 	e.writeMu.Lock()
+	_ = conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
 	err := conn.WriteMessage(websocket.TextMessage, sendFrame.Encode())
 	e.writeMu.Unlock()
+	if err != nil {
+		_ = conn.Close() // 唤醒 readLoop 立即进入重连，不能仅入队后继续持有死连接。
+	}
 	return err
 }
 
@@ -312,7 +334,6 @@ func (e *Engine) DeviceCounts() (onlineDevices int, syncTargets int, err error) 
 // --- Internal methods ---
 
 func (e *Engine) login() error {
-	e.serverURL = normalizeServerURL(e.serverURL)
 	form := url.Values{
 		"username": {e.username},
 		"password": {e.password},
@@ -328,6 +349,12 @@ func (e *Engine) login() error {
 		if strings.Contains(loc, "error") {
 			return fmt.Errorf("invalid credentials")
 		}
+	} else {
+		return fmt.Errorf("login returned HTTP %d", resp.StatusCode)
+	}
+	u, _ := url.Parse(e.serverURL)
+	if len(e.httpClient.Jar.Cookies(u)) == 0 {
+		return fmt.Errorf("no session cookie received")
 	}
 	return nil
 }
@@ -354,7 +381,10 @@ func (e *Engine) deriveKey() error {
 	if info.HashRounds <= 0 {
 		info.HashRounds = 100000
 	}
-	e.encKey = pkgcrypto.DeriveKey(e.password, e.username, info.Salt, info.HashRounds)
+	key := pkgcrypto.DeriveKey(e.password, e.username, info.Salt, info.HashRounds)
+	e.mu.Lock()
+	e.encKey = key
+	e.mu.Unlock()
 	return nil
 }
 
@@ -372,10 +402,13 @@ func (e *Engine) connectWS() error {
 		header.Add("Cookie", c.String())
 	}
 
-	conn, _, err := websocket.DefaultDialer.Dial(wsURL, header)
+	dialer := websocket.Dialer{HandshakeTimeout: 5 * time.Second}
+	conn, _, err := dialer.Dial(wsURL, header)
 	if err != nil {
 		return err
 	}
+	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	_ = conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
 
 	// STOMP handshake（修复记录：旧实现忽略握手期的全部写错误）
 	if err := conn.WriteMessage(websocket.TextMessage, protocol.ConnectFrame("1.1", "localhost").Encode()); err != nil {
@@ -397,8 +430,17 @@ func (e *Engine) connectWS() error {
 		conn.Close()
 		return fmt.Errorf("STOMP SUBSCRIBE write: %w", err)
 	}
+	_ = conn.SetReadDeadline(time.Now().Add(35 * time.Second))
+	conn.SetPongHandler(func(string) error {
+		return conn.SetReadDeadline(time.Now().Add(35 * time.Second))
+	})
 
 	e.mu.Lock()
+	if e.isStopped() {
+		e.mu.Unlock()
+		_ = conn.Close()
+		return fmt.Errorf("stopped")
+	}
 	old := e.wsConn
 	e.wsConn = conn
 	e.mu.Unlock()
@@ -457,6 +499,7 @@ func (e *Engine) readLoop() {
 			}
 			continue
 		}
+		_ = conn.SetReadDeadline(time.Now().Add(35 * time.Second))
 
 		frame, err := protocol.ParseFrame(msg)
 		if err != nil || frame.Command != "MESSAGE" {
@@ -489,11 +532,12 @@ func (e *Engine) reconnectLoop() error {
 		select {
 		case <-e.done:
 			return fmt.Errorf("stopped")
+		case <-e.reconnectWake:
+			backoff = 2 * time.Second
+			continue
 		case <-time.After(backoff):
 		}
-		if backoff < 30*time.Second {
-			backoff *= 2
-		}
+		backoff = min(backoff*2, 30*time.Second)
 	}
 }
 
@@ -513,10 +557,8 @@ func (e *Engine) heartbeatLoop() {
 				continue
 			}
 
-			// STOMP heartbeat: single LF
-			e.writeMu.Lock()
-			err := conn.WriteMessage(websocket.TextMessage, []byte("\n"))
-			e.writeMu.Unlock()
+			// Ping/Pong 能检测半开连接；仅写入 LF 无法确认对端仍在响应。
+			err := conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(5*time.Second))
 			if err != nil {
 				log.Println("bridge: heartbeat failed:", err)
 				_ = conn.Close() // readLoop will detect and reconnect
@@ -549,12 +591,15 @@ func (e *Engine) isStopped() bool {
 func (e *Engine) handleIncomingData(body string) {
 	var clipData *protocol.ClipboardData
 
-	if e.e2ee && e.encKey != nil && looksLikeEncryptedEnvelope(body) {
+	e.mu.Lock()
+	encKey := e.encKey
+	e.mu.Unlock()
+	if e.e2ee && encKey != nil && looksLikeEncryptedEnvelope(body) {
 		encrypted, err := pkgcrypto.DecodeFromJSONString(body)
 		if err != nil {
 			return
 		}
-		plaintext, err := pkgcrypto.Decrypt(e.encKey, encrypted)
+		plaintext, err := pkgcrypto.Decrypt(encKey, encrypted)
 		if err != nil {
 			return
 		}

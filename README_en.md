@@ -94,10 +94,11 @@ This section only describes the technical solutions already implemented in the c
 
 #### Linux
 
-- Text/image listening mainly relies on `golang.design/x/clipboard` event channels.
-- The file clipboard is read/written via `xclip` (Wayland sessions prefer `wl-copy`/`wl-paste`). **The target is chosen per desktop environment**: UnionTech UOS / deepin / GNOME-family use `x-special/gnome-copied-files` (data format `copy\nfile://...`), KDE uses `text/uri-list`; reads try several targets in order. A wrong target shows up as a file manager that sees a clipboard update but pastes nothing on Ctrl+V.
-- Writing to the clipboard forks a background owner process holding the selection. xclip / wl-copy run in the background by default but **do not close the inherited stdout/stderr**, so they must not be captured via `CombinedOutput`/`Output` — otherwise the caller blocks until another program takes over the clipboard.
-- Linux currently adheres more closely to "standard clipboard format driven" implementations, with higher dependency on the desktop environment.
+- Uses `golang.design/x/clipboard v0.11.0` to access the desktop directly, without `wl-copy`, `wl-paste` or `xclip` subprocesses.
+- Probes compositor capabilities and prefers native Wayland data-control events (ext or wlr), with the existing X11/XWayland interface as fallback. No desktop session switch is required.
+- File writes publish `text/uri-list`, GNOME copied-files and MATE copied-files together, covering KDE, GNOME, DDE/UOS and MATE conventions.
+- The application owns clipboard data itself; the desktop's existing history manager continues to provide its history UI.
+- See [Linux Runtime Dependencies](#linux-runtime-dependencies) for desktop support, required UI libraries and optional diagnostic tools.
 
 ### Design Trade-offs
 
@@ -406,29 +407,63 @@ Notes:
 
 ### Linux Runtime Dependencies
 
-Both the Linux desktop client and the graphical desktop UI rely on CGO and cannot be compiled as pure static binaries, so system libraries are required in addition to the binary itself. Install according to what you intend to run:
+**This section applies to v2.5 and later. v2.4 and earlier binaries use the old clipboard implementation: upgrade the client; installing a tool does not update that code.**
 
-#### Headless Tray Client (`clipcascade-desktop-linux-amd64`)
+The system clipboard provides copy/paste, a history manager such as KDE's Klipper displays past copies, and `wl-copy` / `wl-paste` / `xclip` expose the clipboard to command-line programs. This implementation accesses the system directly: **none of those command-line tools is required, and you can keep your current history manager and desktop session.**
+
+The native backend applies to `client-desktop` and `client-desktop/cmd/desktop-ui`. The separate `client-mobile` Fyne desktop demo (`clipcascade-ui-desktop-linux-amd64`) still uses Fyne clipboard APIs and is outside this backend migration.
+
+| Desktop / session | Backend | Additional clipboard tools | Validation |
+| --- | --- | --- | --- |
+| KDE Plasma / Wayland | Native data-control events | None | Fedora 44 read-only probe; isolated KWin text/image/file round trips |
+| GNOME 49+ / Wayland | Native data-control | None | Supported upstream; full GNOME desktop not tested here |
+| GNOME 48 or earlier / Wayland | Existing XWayland interface | None | Without data-control and XWayland, background access is unavailable |
+| Sway / Hyprland | ext / wlr data-control | None | Upstream protocol support; individual desktops not tested here |
+| KDE / GNOME / XFCE / MATE / Cinnamon / DDE / UOS on X11 | Built-in X11 protocol backend | None | Isolated XWayland display validation; distro-specific file managers still need testing |
+| Other Wayland sessions | Probe data-control, then existing X11 compatibility | Installing tools does not add compositor protocols | Depends on the actual interfaces available |
+
+See the [upstream platform documentation](https://github.com/golang-design/clipboard/blob/v0.11.0/README.md#platforms). The application does not install packages or alter desktop sessions.
+
+#### Tray Client (`clipcascade-desktop-linux-amd64`)
+
+The tray UI needs GTK3 and Ayatana AppIndicator libraries. Install these only if missing; they are not additional clipboard managers:
 
 ```bash
-# Debian / Ubuntu / UOS / deepin
-sudo apt install libgtk-3-0 libayatana-appindicator3-1 libx11-6 xclip
+# Debian / Ubuntu / UOS / deepin: pulls in the appropriate GTK3 dependency
+sudo apt install libayatana-appindicator3-1
+
+# Fedora
+sudo dnf install gtk3 libayatana-appindicator-gtk3
+
+# Arch Linux
+sudo pacman -S gtk3 libayatana-appindicator
 ```
 
-| Dependency | Purpose | Effect if missing |
-|------|------|----------|
-| `libgtk-3-0` | GTK3 runtime for the tray UI | Fails to start |
-| `libayatana-appindicator3-1` | Tray icon registration | Fails to start |
-| `libx11-6` | Text/image clipboard access (`dlopen`ed at runtime, not link-time) | Text and image sync unavailable |
-| `xclip` | Reading/writing the file clipboard (see the target note below) | Only file sync unavailable; text and images still work |
+GNOME users whose tray icon is hidden can enable the AppIndicator extension; this affects tray visibility, not clipboard access. Fedora provides `gnome-shell-extension-appindicator` ([package instructions](https://packages.fedoraproject.org/pkgs/gnome-shell-extension-appindicator/gnome-shell-extension-appindicator/)).
 
-On Wayland sessions the file clipboard prefers `wl-copy` / `wl-paste`; installing the `wl-clipboard` package is recommended.
+The tray binary links `libayatana-appindicator3.so.1`, which is not supplied by the older `libappindicator3.so.1` package. Check missing libraries with `ldd ./build/clipcascade-desktop-linux-amd64`.
 
-The file clipboard target depends on the desktop environment. GNOME-family file managers (including UOS / deepin `dde-file-manager`, which only honours its `kGnomeCopyKey` = `x-special/gnome-copied-files` constant) need `x-special/gnome-copied-files` with a `copy\n` prefix, while KDE (Dolphin) uses `text/uri-list`. Writing only `text/uri-list` on UOS/deepin makes the file manager aware of a clipboard change but unable to paste any file.
+#### Optional diagnostic tools
 
-The tray links against `libayatana-appindicator3`, not the legacy `libappindicator3`. The two are ABI-compatible forks of the same project but have different sonames, so they are not interchangeable: UOS V20 only ships `libayatana-appindicator3.so.1`, which is why the build targets ayatana too (Debian 10 provides `libayatana-appindicator3-dev`).
+The application does not call these tools. Install them only for manual investigation:
 
-#### Graphical Desktop UI (`clipcascade-ui-desktop-linux-amd64`)
+```bash
+# Debian / Ubuntu
+sudo apt install wl-clipboard  # Wayland tools
+sudo apt install xclip         # X11 tool
+
+# Fedora
+sudo dnf install wl-clipboard
+sudo dnf install xclip
+
+# Arch Linux
+sudo pacman -S wl-clipboard
+sudo pacman -S xclip
+```
+
+`wl-paste --list-types` lists clipboard formats. It is a diagnostic command, not a startup prerequisite. Existing clipboard history software can stay installed and enabled.
+
+#### Graphical Desktop UI (`clipcascade-desktop-ui-linux-amd64`)
 
 ```bash
 sudo apt install libgl1 libx11-6 libxcursor1 libxrandr2 libxinerama1 libxi6 libxxf86vm1

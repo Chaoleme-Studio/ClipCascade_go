@@ -6,12 +6,10 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
-	"io"
 	"log/slog"
 	"mime"
 	"net/http"
 	"net/http/cookiejar"
-	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -20,7 +18,6 @@ import (
 
 	"github.com/clipcascade/pkg/constants"
 	pkgcrypto "github.com/clipcascade/pkg/crypto"
-	"github.com/clipcascade/pkg/netutil"
 	"github.com/clipcascade/pkg/protocol"
 	"github.com/clipcascade/pkg/sizefmt"
 
@@ -29,7 +26,6 @@ import (
 	"github.com/clipcascade/desktop/transfer"
 	"github.com/clipcascade/desktop/transport"
 	"github.com/google/uuid"
-	"github.com/grandcat/zeroconf"
 )
 
 type trayController interface {
@@ -42,24 +38,26 @@ type trayController interface {
 
 // Application 是主要的 desktop client 控制器。
 type Application struct {
-	cfg            *config.Config
-	httpClient     *http.Client // 通用 HTTP 客户端，15s 超时（登录/认证）
-	fileHTTPClient *http.Client // 文件传输专用，无超时（大文件上传/下载）
-	stomp          *transport.StompClient
-	p2p            *transport.P2PClient
-	sessionCookies []*http.Cookie // 会话 cookie，用于 P2P 断线自动重连
-	clip           *clipboard.Manager
-	tray           trayController
-	transferMgr    *transfer.Manager
-	historyStore   *historyStore
-	state          appState
-	ctx            context.Context
-	cancel         context.CancelFunc
-	encKey         []byte // 从 password 派生的 AES-256-GCM 密钥
-	reconnecting   bool
-	connecting     bool // 防止用户重复点击连接产生并发泄漏
-	started        bool
-	connMu         sync.Mutex
+	cfg               *config.Config
+	httpClient        *http.Client // 通用 HTTP 客户端，15s 超时（登录/认证）
+	fileHTTPClient    *http.Client // 文件传输专用，无超时（大文件上传/下载）
+	stomp             *transport.StompClient
+	p2p               *transport.P2PClient
+	sessionCookies    []*http.Cookie // 会话 cookie，用于 P2P 断线自动重连
+	clip              *clipboard.Manager
+	tray              trayController
+	transferMgr       *transfer.Manager
+	historyStore      *historyStore
+	state             appState
+	ctx               context.Context
+	cancel            context.CancelFunc
+	encKey            []byte // 从 password 派生的 AES-256-GCM 密钥
+	reconnecting      bool
+	connecting        bool // 防止用户重复点击连接产生并发泄漏
+	connectionDesired bool
+	connectCancel     context.CancelFunc
+	started           bool
+	connMu            sync.Mutex
 
 	lastRecvMu   sync.Mutex
 	lastRecvHash string
@@ -155,7 +153,7 @@ func (a *Application) Run() {
 
 	// 设置 tray 回调
 	a.tray.OnConnect(func() {
-		go a.connect()
+		go a.Connect()
 	})
 	a.tray.OnDisconnect(func() {
 		a.disconnect()
@@ -192,56 +190,13 @@ func (a *Application) Start(autoConnect bool) error {
 
 	// 如果配置了凭据，则自动连接
 	if autoConnect && a.cfg.Username != "" && a.cfg.Password != "" {
-		go a.connect()
+		go a.Connect()
 	}
 	return nil
 }
 
-// discoverServer 尝试在局域网中发现所有可用的 ClipCascade 服务器。
 func (a *Application) discoverServer() ([]string, error) {
-	resolver, err := zeroconf.NewResolver(zeroconf.SelectIfaces(netutil.UsableLANInterfaces()))
-	if err != nil {
-		return nil, err
-	}
-
-	entries := make(chan *zeroconf.ServiceEntry)
-	ctx, cancel := context.WithTimeout(a.ctx, 5*time.Second)
-	defer cancel()
-
-	err = resolver.Browse(ctx, "_clipcascade._tcp", "local.", entries)
-	if err != nil {
-		return nil, err
-	}
-
-	var foundURLs []string
-	seen := make(map[string]bool)
-
-	for {
-		select {
-		case <-ctx.Done():
-			if len(foundURLs) > 0 {
-				netutil.SortDiscoveredURLs(foundURLs)
-				return foundURLs, nil
-			}
-			return nil, fmt.Errorf("server discovery timed out")
-		case entry := <-entries:
-			if entry != nil {
-				// 收集该服务条目下的所有 IPv4 地址
-				for _, ip := range entry.AddrIPv4 {
-					if !netutil.IsUsableLANIPv4(ip) {
-						slog.Debug("应用：跳过虚拟或不可用发现地址", "地址", ip.String())
-						continue
-					}
-					url := fmt.Sprintf("http://%s:%d", ip, entry.Port)
-					if !seen[url] {
-						foundURLs = append(foundURLs, url)
-						seen[url] = true
-						slog.Debug("应用：发现潜在服务器地址", "地址", url)
-					}
-				}
-			}
-		}
-	}
+	return discoverServers(a.ctx)
 }
 
 func (a *Application) DiscoverServers() ([]string, error) {
@@ -263,6 +218,9 @@ func (a *Application) SaveConfig(serverURL, username, password string, e2eeEnabl
 }
 
 func (a *Application) Connect() {
+	a.connMu.Lock()
+	a.connectionDesired = true
+	a.connMu.Unlock()
 	a.connect()
 }
 
@@ -277,88 +235,42 @@ func (a *Application) Shutdown() {
 // connect 执行 login → 获取加密密钥 → 启动 WebSocket → 开始剪贴板监控。
 func (a *Application) connect() {
 	a.connMu.Lock()
+	if !a.connectionDesired {
+		a.connMu.Unlock()
+		return
+	}
 	if a.connecting || (a.stomp != nil && a.stomp.IsConnected()) {
 		a.connMu.Unlock()
 		slog.Info("应用：已在连接中或已连接，忽略重复请求")
 		return
 	}
 	a.connecting = true
+	attemptCtx, cancelAttempt := context.WithCancel(a.ctx)
+	a.connectCancel = cancelAttempt
 	a.connMu.Unlock()
 
+	retryNeeded := false
 	defer func() {
+		cancelAttempt()
 		a.connMu.Lock()
 		a.connecting = false
+		a.connectCancel = nil
+		shouldRetry := retryNeeded && a.connectionDesired
 		a.connMu.Unlock()
+		if shouldRetry {
+			go a.reconnectLoop()
+		}
 	}()
 
 	a.setStatus("Connecting...")
 
-	// 确定待尝试的服务器列表
-	var urlsToTry []string
-	if a.cfg.ServerURL != "" {
-		a.cfg.ServerURL = config.NormalizeServerURL(a.cfg.ServerURL)
-		urlsToTry = append(urlsToTry, a.cfg.ServerURL)
-	}
-
-	// 如果未配置、使用的是 localhost、或显式要求发现，则搜索局域网
-	if len(urlsToTry) == 0 || strings.Contains(urlsToTry[0], "localhost") {
-		slog.Info("应用：启动局域网自动发现...")
-		discovered, err := a.discoverServer()
-		if err == nil {
-			urlsToTry = append(urlsToTry, discovered...)
-		}
-	}
-
-	var lastErr error
-	var successfulURL string
-	var cookies []*http.Cookie
-
-	// 依次尝试所有地址
-	for _, targetURL := range urlsToTry {
-		targetURL = config.NormalizeServerURL(targetURL)
-		a.cfg.ServerURL = targetURL
-		slog.Info("应用：正在尝试登录服务器", "URL", targetURL)
-
-		cookies, lastErr = a.login()
-		if lastErr == nil {
-			successfulURL = targetURL
-			break
-		}
-		slog.Warn("应用：尝试服务器失败", "URL", targetURL, "错误", lastErr)
-	}
-
-	// 如果所有预设地址都失败了，最后再做一次全网大搜索尝试补救
-	if successfulURL == "" {
-		slog.Info("应用：初次尝试均失败，执行深度补救发现...")
-		discovered, dErr := a.discoverServer()
-		if dErr == nil {
-			slog.Info("应用：局域网发现结果", "候选地址数", len(discovered), "列表", discovered)
-			for _, targetURL := range discovered {
-				targetURL = config.NormalizeServerURL(targetURL)
-				// 跳过已经试过失败的
-				retry := true
-				for _, tried := range urlsToTry {
-					if tried == targetURL {
-						retry = false
-						break
-					}
-				}
-				if !retry {
-					continue
-				}
-
-				a.cfg.ServerURL = targetURL
-				slog.Info("应用：正在尝试发现的备选地址", "URL", targetURL)
-				cookies, lastErr = a.login()
-				if lastErr == nil {
-					successfulURL = targetURL
-					break
-				}
-			}
-		}
+	successfulURL, cookies, lastErr := a.findServer(attemptCtx)
+	if attemptCtx.Err() != nil {
+		return
 	}
 
 	if successfulURL == "" {
+		retryNeeded = true
 		slog.Error("登录完全失败，请检查服务器状态或配置", "错误", lastErr)
 		a.setStatus("Login Failed")
 		notify("ClipCascade", "Failed to connect to any server")
@@ -375,6 +287,7 @@ func (a *Application) connect() {
 	// 步骤 2: 获取用于加密密钥派生的 user 信息技巧。
 	if a.cfg.E2EEEnabled {
 		if err := a.deriveEncryptionKey(); err != nil {
+			retryNeeded = true
 			slog.Error("密钥派生失败", "错误", err)
 			a.setStatus("Key Error")
 			return
@@ -382,6 +295,9 @@ func (a *Application) connect() {
 	}
 
 	// Step 3: Connect WebSocket STOMP
+	if attemptCtx.Err() != nil {
+		return
+	}
 	stompClient := transport.NewStompClient(a.cfg.ServerURL, cookies)
 	stompClient.OnMessage(a.onReceive)
 	a.connMu.Lock()
@@ -389,11 +305,14 @@ func (a *Application) connect() {
 	a.sessionCookies = cookies
 	a.connMu.Unlock()
 
-	if err := stompClient.Connect(); err != nil {
+	if err := stompClient.ConnectContext(attemptCtx); err != nil {
+		if attemptCtx.Err() != nil {
+			return
+		}
 		slog.Error("WebSocket 连接失败", "错误", err)
 		a.setStatus("WS Failed")
 		notify("ClipCascade", "WebSocket connection failed")
-		go a.reconnectLoop()
+		retryNeeded = true
 		return
 	}
 
@@ -413,6 +332,9 @@ func (a *Application) connect() {
 		}
 	}
 
+	if attemptCtx.Err() != nil {
+		return
+	}
 	a.setStatus("Connected ✓")
 	notify("ClipCascade", "Connected to server as "+a.cfg.Username)
 	slog.Info("应用：已连接并开始监控剪贴板")
@@ -421,46 +343,6 @@ func (a *Application) connect() {
 	}()
 	// 重连成功后补发断线期间积压的剪贴板消息
 	go a.flushPendingSends()
-}
-
-// login 执行基于 HTTP 表单的 login 并返回 session cookies。
-func (a *Application) login() ([]*http.Cookie, error) {
-	a.cfg.ServerURL = config.NormalizeServerURL(a.cfg.ServerURL)
-	if a.cfg.ServerURL == "" {
-		return nil, fmt.Errorf("empty server URL")
-	}
-	loginURL := a.cfg.ServerURL + "/login"
-
-	form := url.Values{
-		"username": {a.cfg.Username},
-		"password": {a.cfg.Password},
-	}
-
-	resp, err := a.httpClient.PostForm(loginURL, form)
-	if err != nil {
-		return nil, fmt.Errorf("POST /login: %w", err)
-	}
-	defer resp.Body.Close()
-	io.ReadAll(resp.Body)
-
-	// Check for redirect to "/" (success) vs "/login?error" (failure)
-	if resp.StatusCode == http.StatusFound || resp.StatusCode == http.StatusSeeOther {
-		location := resp.Header.Get("Location")
-		if strings.Contains(location, "error") {
-			return nil, fmt.Errorf("invalid credentials")
-		}
-	}
-
-	// Extract cookies from jar
-	u, _ := url.Parse(a.cfg.ServerURL)
-	cookies := a.httpClient.Jar.Cookies(u)
-
-	if len(cookies) == 0 {
-		return nil, fmt.Errorf("no session cookie received")
-	}
-
-	slog.Info("应用：已登录", "用户名", a.cfg.Username, "Cookie 数量", len(cookies))
-	return cookies, nil
 }
 
 // deriveEncryptionKey 从 server 获取 user 信息并在本地派生 AES 密钥。
@@ -1118,6 +1000,15 @@ func (a *Application) reconnectLoop() {
 			return
 		case <-time.After(wait):
 		}
+		a.connMu.Lock()
+		wanted := a.connectionDesired
+		a.connMu.Unlock()
+		if !wanted {
+			return
+		}
+		if stomp := a.currentStomp(); stomp != nil && stomp.IsConnected() {
+			return
+		}
 
 		failCount++
 		slog.Info("应用：正在尝试重连", "延迟", wait, "失败次数", failCount)
@@ -1129,14 +1020,16 @@ func (a *Application) reconnectLoop() {
 			return // reconnected
 		}
 
-		delay = min(delay*2, maxDelay)
+		if failCount > 1 {
+			delay = min(delay*2, maxDelay)
+		}
 	}
 }
 
 func (a *Application) beginReconnect() bool {
 	a.connMu.Lock()
 	defer a.connMu.Unlock()
-	if a.reconnecting {
+	if a.reconnecting || !a.connectionDesired {
 		return false
 	}
 	a.reconnecting = true
@@ -1157,6 +1050,12 @@ func (a *Application) isReconnecting() bool {
 
 // disconnect disconnects from the server.
 func (a *Application) disconnect() {
+	a.connMu.Lock()
+	a.connectionDesired = false
+	if a.connectCancel != nil {
+		a.connectCancel()
+	}
+	a.connMu.Unlock()
 	a.closeTransports()
 	a.setStatus("Disconnected")
 	notify("ClipCascade", "Disconnected from server")

@@ -42,9 +42,9 @@ case "$TARGET" in
         # legacy libappindicator3：统信 UOS V20 只装了 libayatana-appindicator3.so.1，
         # 没有 libappindicator3.so.1，链老库的产物在目标机上会直接报找不到该 so。
         # buster main 里就有 libayatana-appindicator3-dev，所以 glibc 仍然是 2.28。
-        # libx11-dev 是 golang.design/x/clipboard 编译期要的 <X11/Xlib.h>。
+        # 剪贴板后端已内置 Wayland/X11 协议，不需要外部剪贴板工具或 libX11 开发头文件。
         TAGS=""
-        DEPS="libgtk-3-dev libayatana-appindicator3-dev libx11-dev"
+        DEPS="libgtk-3-dev libayatana-appindicator3-dev"
         VERSION_PKG=main
         ;;
     desktop-ui)

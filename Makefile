@@ -6,7 +6,7 @@
         web-clip web-clip-cross android ios cross docker tidy test clean help
 
 # Versioning
-VERSION ?= 2.4
+VERSION ?= 2.5
 BUILD_SCRIPT := ./build-scripts/build.sh
 
 all:

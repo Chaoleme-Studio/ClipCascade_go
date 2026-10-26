@@ -57,6 +57,11 @@ func (e *Engine) Stop() {
 	e.inner.Stop()
 }
 
+// ReconnectNow wakes the reconnect loop after a network change.
+func (e *Engine) ReconnectNow() {
+	e.inner.ReconnectNow()
+}
+
 // SendClipboard sends clipboard payload.
 func (e *Engine) SendClipboard(payload string, payloadType string) error {
 	return e.inner.SendClipboard(payload, payloadType)
