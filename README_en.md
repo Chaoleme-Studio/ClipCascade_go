@@ -104,7 +104,7 @@ This section only describes the technical solutions already implemented in the c
 
 - Text and standard images are "sync on copy" by default.
 - Files are not forced to be fully transferred directly; instead, a distinction is made between small file direct transfer and large/multi-file placeholder notifications.
-- File handling uses three shared protocol bands: `<= 8 MiB` `file_eager`, `> 8 MiB and <= 25 MiB` HTTP relay, and `> 25 MiB and <= 2 GiB` deferred registration.
+- File handling uses three shared protocol bands: `<= 8 MiB` `file_eager`, `> 8 MiB and <= 25 MiB` HTTP relay, and `> 25 MiB and within the configured server limit` deferred registration.
 - Android cannot reliably write files into the system clipboard. Received `file_eager` data therefore keeps only the newest temporary copy, while `file_offer` keeps download metadata; both are saved to the public `Download` directory only when the user taps save.
 - Android received images can be previewed in the app and saved to the public `Download` directory. Temporary caching is event-driven and does not acquire an extra wake lock.
 - For screenshot-like content, the current strategy is still to sync as images directly, rather than requiring users to "paste and then copy."
@@ -348,17 +348,33 @@ Notes:
 
 - Single file and size `<= 8 MiB`: `file_eager` direct transfer.
 - Single file and size `> 8 MiB and <= 25 MiB`: automatic HTTP relay; the receiver downloads it in the background and writes the local file path to the system clipboard.
-- Single file and size `> 25 MiB and <= 2 GiB`: registered in the server deferred list only. It is not pushed into other devices' clipboards automatically; users can request/download it from the Web page.
+- Single file and size `> 25 MiB and within the configured server limit`: registered in the server deferred list only. It is not pushed into other devices' clipboards automatically; users can request/download it from the Web page.
 - Multiple files or files over the supported limit: `file_stub` placeholder (metadata notification).
 
 Android native receiving behavior:
 
 - `file_eager`: decoded into app cache, with only the newest temporary copy retained; it is not written to the Android system clipboard, and the history save action writes it to `Download/`.
 - `file_offer`: history stores the file name, size, and relay ID only. The content is downloaded to `Download/` only after the user taps it.
-- Files above `25 MiB`: shown in the deferred files view and downloaded on demand, up to `2 GiB`.
+- Files above `25 MiB`: shown in the deferred files view and downloaded on demand, up to the server-configured limit (`2 GiB` by default).
 - Images: previewed in the app and saved to `Download/` on demand.
 
 Because Android share sources are exposed as `content://` URIs, the Android sending path continues to use HTTP relay for files up to `25 MiB`. This is a platform-specific source-handling path; it does not change the three-band protocol understood by PC receivers or pre-upload large files.
+
+### Configuring the file limit (v2.6+)
+
+Configure the limit once at **server startup**. The default remains `2 GiB` (2147483648 bytes). To allow 20 GiB:
+
+```bash
+./clipcascade-server --file-relay-max-size 20GiB
+# Or use an environment variable:
+CC_FILE_RELAY_MAX_BYTES=21474836480 ./clipcascade-server
+```
+
+The flag overrides the environment variable. Both accept positive integer byte counts or integer KiB/MiB/GiB/TiB units. Zero, negative, invalid and out-of-range values are rejected at startup. Restart the server after changing the setting. Reverse-proxy body limits, timeouts and available disk space must also accommodate the selected size.
+
+On Windows PowerShell, set `$env:CC_FILE_RELAY_MAX_BYTES="21474836480"` before launching the server, or pass the same flag. For Docker Compose, put `CC_FILE_RELAY_MAX_BYTES=21474836480` in `.env`, then run `docker compose up -d --force-recreate`.
+
+**Upgrade desktop and Android clients to v2.6 once; no client configuration or recompilation is needed for subsequent limit changes.** Clients read the current server policy before HTTP uploads and deferred registration; the Web home page displays the configured limit. Older clients still enforce their local 2 GiB limit. New clients fall back to 2 GiB when an older server lacks the policy API. The 8 MiB direct-transfer and 25 MiB automatic-relay thresholds are unchanged. Android still stages a private copy of deferred files and needs enough local storage.
 
 `file_eager` behavior on receiving end:
 
@@ -533,7 +549,7 @@ Relative paths are resolved from the server binary directory. The recommended re
 | `CC_DATABASE_PATH` | `./database/clipcascade.db` | SQLite database path |
 | `CC_FILE_RELAY_ENABLED` | `true` | Enables HTTP file relay |
 | `CC_FILE_RELAY_DIR` | `./uploads` | HTTP file relay storage directory |
-| `CC_FILE_RELAY_MAX_BYTES` | `2147483648` | Maximum relay file size, 2 GiB by default |
+| `CC_FILE_RELAY_MAX_BYTES` | `2147483648` | Relay file limit; default 2 GiB; bytes or integer units such as `20GiB`; CLI flag takes precedence |
 | `CC_FILE_RELAY_TTL_SECONDS` | `86400` | Relay file retention time |
 | `CC_EXTERNAL_BROKER_ENABLED` | `false` | Enables external STOMP broker |
 | `CC_BROKER_HOST` | `localhost` | External broker host |

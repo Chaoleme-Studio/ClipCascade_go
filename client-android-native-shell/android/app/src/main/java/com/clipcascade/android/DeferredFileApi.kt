@@ -38,6 +38,32 @@ data class RelayUploadResult(
     val mimeType: String
 )
 
+fun fetchFileRelayPolicy(serverURL: String, cookie: String): FileRelayPolicy {
+    val baseURL = normalizeServerUrl(serverURL)
+    val conn = (URL("${baseURL.trimEnd('/')}/api/files/config").openConnection() as HttpURLConnection).apply {
+        requestMethod = "GET"
+        connectTimeout = 6000
+        readTimeout = 6000
+        instanceFollowRedirects = false
+        setRequestProperty("Cookie", cookie)
+    }
+    try {
+        ensureAuthorized(conn, "file config")
+        if (conn.responseCode == HttpURLConnection.HTTP_NOT_FOUND) {
+            return FileRelayPolicy(true, DEFAULT_FILE_RELAY_MAX_BYTES)
+        }
+        check(conn.responseCode == HttpURLConnection.HTTP_OK) {
+            "无法读取服务器文件限制：HTTP ${conn.responseCode}"
+        }
+        val obj = JSONObject(conn.inputStream.bufferedReader().use { it.readText() })
+        return FileRelayPolicy(obj.getBoolean("enabled"), obj.getLong("max_file_bytes")).also {
+            check(it.enabled) { "服务器未启用文件中转" }
+        }
+    } finally {
+        conn.disconnect()
+    }
+}
+
 fun registerDeferredFile(
     serverURL: String,
     cookie: String,
@@ -100,9 +126,7 @@ fun uploadRelayFile(
     onProgress: ((sentBytes: Long, totalBytes: Long) -> Unit)? = null
 ): RelayUploadResult {
     val fileSize = file.length()
-    if (fileSize <= 0L || fileSize > AndroidSharePolicy.MAX_RELAY_BYTES) {
-        throw IllegalArgumentException("invalid relay file size: $fileSize")
-    }
+    fetchFileRelayPolicy(serverURL, cookie).checkSize(fileSize)
     val boundary = "ClipCascade-${UUID.randomUUID()}"
     val header = ("--$boundary\r\n" +
         "Content-Disposition: form-data; name=\"file\"; filename=\"${multipartEscape(fileName)}\"\r\n" +

@@ -22,6 +22,14 @@ func UploadFile(client *http.Client, serverURL string, path string, onProgress f
 		_ = file.Close()
 		return nil, err
 	}
+	policy, err := FetchFileRelayConfig(client, serverURL)
+	if err == nil {
+		err = policy.CheckSize(info.Size())
+	}
+	if err != nil {
+		_ = file.Close()
+		return nil, err
+	}
 
 	bodyPrefix, bodySuffix, contentType, err := multipartEnvelope(filepath.Base(path))
 	if err != nil {

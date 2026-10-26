@@ -1,6 +1,9 @@
 # Build outputs
 build/
 server/.cache
+temp/
+TEMP/
+/server-web-clip/server-web-clip
 
 # Local databases / runtime artifacts
 database/

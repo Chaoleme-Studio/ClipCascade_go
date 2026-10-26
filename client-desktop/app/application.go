@@ -661,9 +661,7 @@ func (a *Application) tryRegisterDeferredFile(payload string) bool {
 	if info.Size() <= constants.DefaultFileAutoRelayMaxBytes {
 		return false
 	}
-	if info.Size() > constants.DefaultFileRelayMaxBytes {
-		return false
-	}
+	// The background registration path checks the current server policy.
 	go a.registerDeferredFile(path, info.Size())
 	return true
 }
@@ -714,7 +712,7 @@ func (a *Application) registerDeferredFile(path string, fileSize int64) {
 	})
 	if err != nil {
 		slog.Error("大文件登记失败", "path", path, "error", err)
-		notify("ClipCascade", fmt.Sprintf("大文件登记失败: %s", filepath.Base(path)))
+		notify("ClipCascade", fmt.Sprintf("大文件登记失败: %s: %v", filepath.Base(path), err))
 		return
 	}
 	a.rememberDeferredFile(record.DeferredID, path)

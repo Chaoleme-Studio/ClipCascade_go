@@ -3,7 +3,6 @@ package com.clipcascade.android
 object AndroidSharePolicy {
     const val MAX_EAGER_BYTES: Long = 8L * 1024L * 1024L
     const val MAX_AUTO_RELAY_BYTES: Long = 25L * 1024L * 1024L
-    const val MAX_RELAY_BYTES: Long = 2L * 1024L * 1024L * 1024L
 
     fun classify(mimeType: String?, sizeBytes: Long?, hasStream: Boolean = false): ShareDecision {
         val normalizedType = mimeType?.trim().orEmpty()
@@ -17,9 +16,7 @@ object AndroidSharePolicy {
                 ShareDecision.DirectImage
             }
         }
-        if (sizeBytes != null && sizeBytes > MAX_RELAY_BYTES) {
-            return ShareDecision.TooLarge
-        }
+        // The background transfer checks the server's current file limit.
         if (!hasStream) {
             return ShareDecision.UnsupportedFile
         }

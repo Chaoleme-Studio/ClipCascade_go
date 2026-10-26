@@ -269,7 +269,7 @@
             </div>
             <div class="info-box">
                 <h3>📦 File Tiers</h3>
-                <p><strong>&lt;= 8 MiB</strong>: clipboard direct. <strong>8-25 MiB</strong>: HTTP auto relay. <strong>25 MiB-2 GiB</strong>: listed here for on-demand web downloads. <strong>&gt; 2 GiB</strong>: not supported.</p>
+                <p><strong>&lt;= 8 MiB</strong>: clipboard direct. <strong>8-25 MiB</strong>: HTTP auto relay. <strong>&gt; 25 MiB</strong>: listed here for on-demand web downloads. Server file limit: <strong>{{.file_relay_max}}</strong>. {{if not .file_relay_enabled}}HTTP file relay is disabled.{{end}}</p>
             </div>
         </div>
 

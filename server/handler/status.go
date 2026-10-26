@@ -43,3 +43,11 @@ func (h *StatusHandler) GetStunURL(c *fiber.Ctx) error {
 func (h *StatusHandler) GetMaxSizeAllowed(c *fiber.Ctx) error {
 	return c.JSON(fiber.Map{"max_size": h.Config.EffectiveMaxMessageBytes()})
 }
+
+// FileRelayConfig exposes the server's effective file policy to authenticated clients.
+func (h *StatusHandler) FileRelayConfig(c *fiber.Ctx) error {
+	return c.JSON(fiber.Map{
+		"enabled":        h.Config.FileRelayEnabled,
+		"max_file_bytes": h.Config.FileRelayMaxBytes,
+	})
+}

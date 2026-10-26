@@ -8,7 +8,6 @@ class AndroidSharePolicyTest {
     fun matchesDesktopFileThresholds() {
         assertEquals(8L * 1024L * 1024L, AndroidSharePolicy.MAX_EAGER_BYTES)
         assertEquals(25L * 1024L * 1024L, AndroidSharePolicy.MAX_AUTO_RELAY_BYTES)
-        assertEquals(2L * 1024L * 1024L * 1024L, AndroidSharePolicy.MAX_RELAY_BYTES)
     }
 
     @Test
@@ -24,14 +23,14 @@ class AndroidSharePolicyTest {
 
         assertEquals(ShareDecision.TooLarge, AndroidSharePolicy.classify("image/png", oversized))
         assertEquals(ShareDecision.DeferredFile, AndroidSharePolicy.classify("application/pdf", oversized, hasStream = true))
-        assertEquals(ShareDecision.DeferredFile, AndroidSharePolicy.classify("video/mp4", AndroidSharePolicy.MAX_RELAY_BYTES, hasStream = true))
+        assertEquals(ShareDecision.DeferredFile, AndroidSharePolicy.classify("video/mp4", DEFAULT_FILE_RELAY_MAX_BYTES, hasStream = true))
     }
 
     @Test
-    fun rejectsFilesAboveRelayLimit() {
+    fun routesFilesAboveOldLimitToServerPolicyCheck() {
         assertEquals(
-            ShareDecision.TooLarge,
-            AndroidSharePolicy.classify("video/mp4", AndroidSharePolicy.MAX_RELAY_BYTES + 1, hasStream = true)
+            ShareDecision.DeferredFile,
+            AndroidSharePolicy.classify("video/mp4", 20L * 1024L * 1024L * 1024L, hasStream = true)
         )
     }
 

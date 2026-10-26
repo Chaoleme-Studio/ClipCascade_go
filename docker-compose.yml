@@ -14,6 +14,8 @@ services:
       - CC_SIGNUP_ENABLED=true
       - CC_P2P_ENABLED=false
       - CC_MAX_MESSAGE_SIZE_IN_MiB=1
+      # Single-file relay limit; override in .env and recreate the container.
+      - CC_FILE_RELAY_MAX_BYTES=${CC_FILE_RELAY_MAX_BYTES:-2147483648}
       # - CC_ALLOWED_ORIGINS=https://yourdomain.com
       # - CC_MAX_USER_ACCOUNTS=10
 

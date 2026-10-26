@@ -104,7 +104,7 @@ ClipCascade 的定位是：以剪贴板为中心，做一个可自部署、可�
 
 - 文本与标准图片默认是“复制即同步”。
 - 文件不强行全部直传，而是区分小文件直传、中等文件自动 HTTP relay、大文件仅登记到 Web 的延迟下载。
-- 文件分级统一为：`<= 8 MiB` 的 `file_eager`、`> 8 MiB 且 <= 25 MiB` 的 HTTP relay、`> 25 MiB 且 <= 2 GiB` 的 deferred 登记。
+- 文件分级统一为：`<= 8 MiB` 的 `file_eager`、`> 8 MiB 且 <= 25 MiB` 的 HTTP relay、`> 25 MiB 且不超过服务端配置上限` 的 deferred 登记。
 - Android 无法可靠地把文件写入系统剪贴板，因此接收文件只进入应用历史：`file_eager` 只保留最近一个临时副本，`file_offer` 只保留下载元数据，用户点击后统一保存到公共 `Download` 目录。
 - Android 接收图片会在应用内预览，点击保存后写入公共 `Download` 目录。临时缓存不启动定时任务，也不额外持有唤醒锁。
 - 对截图类内容，当前策略仍然是直接按图片同步，而不是要求用户“先粘贴再复制”。
@@ -349,17 +349,37 @@ plugins/
 
 - 单文件且大小 `<= 8 MiB`：`file_eager` 直传。
 - 单文件且大小 `> 8 MiB 且 <= 25 MiB`：自动走 HTTP relay，接收端后台下载后写入本地剪贴板文件路径。
-- 单文件且大小 `> 25 MiB 且 <= 2 GiB`：只登记到服务端 Web 的 deferred 列表，不自动塞进其他设备剪贴板；需要的人在 Web 页面手动请求/下载。
+- 单文件且大小 `> 25 MiB 且不超过服务端配置上限`：只登记到服务端 Web 的 deferred 列表，不自动塞进其他设备剪贴板；需要的人在 Web 页面手动请求/下载。
 - 多文件或超过上限的文件：继续走 `file_stub` 占位（元信息通知）。
 
 Android 原生端的接收行为：
 
 - `file_eager`：解码到应用缓存，仅保留最近一个；不会写入 Android 系统剪贴板，点击历史记录中的保存按钮后写入 `Download/`。
 - `file_offer`：历史记录只保存文件名、大小和 relay ID，不会把文件内容长期存到手机；点击后才从服务端下载到 `Download/`。
-- `25 MiB` 以上文件：在“大文件”页查看 deferred 登记并按需下载，最大支持 `2 GiB`。
+- `25 MiB` 以上文件：在“大文件”页查看 deferred 登记并按需下载，上限由服务端配置，默认 `2 GiB`。
 - 图片：应用内预览，点击保存后写入 `Download/`。
 
 Android 分享发送端因为系统只提供 `content://` 文件源，`<=25 MiB` 文件继续使用 HTTP relay；这不会改变 PC 端接收的三档协议，也不会把大文件预先上传。
+
+### 配置单文件上限（v2.6+）
+
+只在**服务端启动时**配置，默认 `2 GiB`（2147483648 字节）。例如改为 20 GiB：
+
+```bash
+# Linux / macOS：启动参数，支持整数 KiB、MiB、GiB、TiB 或纯字节数
+./clipcascade-server --file-relay-max-size 20GiB
+
+# 或使用环境变量
+CC_FILE_RELAY_MAX_BYTES=21474836480 ./clipcascade-server
+```
+
+Windows PowerShell：`$env:CC_FILE_RELAY_MAX_BYTES="21474836480"`，然后启动服务端程序；也可直接传 `--file-relay-max-size 20GiB`。
+
+Docker Compose 在 `.env` 中写入 `CC_FILE_RELAY_MAX_BYTES=21474836480`，再运行 `docker compose up -d --force-recreate`。
+
+启动参数优先于环境变量；环境变量也支持 `20GiB` 等整数单位。必须为正数，`0`、负数、无效值或超出平台范围的值会在启动时拒绝。修改后重启服务端生效；反向代理的请求体大小、超时以及可用磁盘空间也应允许目标文件大小。
+
+**桌面端和 Android 需先升级到 v2.6，之后无需逐台配置或重新编译。** 每次 HTTP 上传或大文件登记会读取服务端当前上限，Web 首页也显示实际配置；旧客户端仍有 2 GiB 本地限制。v2.6 客户端连接没有配置接口的旧服务端时，按默认 2 GiB 处理。8 MiB 直传、25 MiB 自动中转的门槛保持不变；Android 仍会先保存一份大文件源，需要足够的本地空间。
 
 接收端 `file_eager` 行为：
 
@@ -548,7 +568,7 @@ CLIPCASCADE_WINDOWS_GUI=1 ./build-scripts/build.sh cross
 | `CC_DATABASE_PATH` | `./database/clipcascade.db` | SQLite 数据库路径 |
 | `CC_FILE_RELAY_ENABLED` | `true` | 是否启用 HTTP 文件中转 |
 | `CC_FILE_RELAY_DIR` | `./uploads` | HTTP 文件中转存储目录 |
-| `CC_FILE_RELAY_MAX_BYTES` | `2147483648` | HTTP 文件中转单文件最大大小，默认 2 GiB |
+| `CC_FILE_RELAY_MAX_BYTES` | `2147483648` | HTTP 文件中转单文件上限，默认 2 GiB；支持字节数或 `20GiB` 等整数单位；启动参数优先 |
 | `CC_FILE_RELAY_TTL_SECONDS` | `86400` | HTTP 文件中转文件保留时间 |
 | `CC_EXTERNAL_BROKER_ENABLED` | `false` | 是否启用外部 STOMP broker |
 | `CC_BROKER_HOST` | `localhost` | 外部 broker 主机 |

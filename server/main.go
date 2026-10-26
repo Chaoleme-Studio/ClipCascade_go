@@ -6,6 +6,7 @@ package main
 
 import (
 	"embed"
+	"flag"
 	"fmt"
 	"log/slog"
 	"net"
@@ -19,6 +20,7 @@ import (
 	"time"
 
 	"github.com/clipcascade/pkg/netutil"
+	"github.com/clipcascade/pkg/sizefmt"
 	"github.com/clipcascade/server/automation"
 	"github.com/clipcascade/server/config"
 	"github.com/clipcascade/server/handler"
@@ -52,6 +54,18 @@ func main() {
 
 	// 加载 config
 	cfg := config.Load()
+	flag.Func("file-relay-max-size", "Maximum relay file size, e.g. 2GiB, 20GiB or bytes (overrides CC_FILE_RELAY_MAX_BYTES)", func(value string) error {
+		size, err := config.ParseFileRelaySize(value)
+		if err == nil {
+			cfg.FileRelayMaxBytes = size
+		}
+		return err
+	})
+	flag.Parse()
+	if err := cfg.ValidateFileRelaySize(); err != nil {
+		slog.Error("文件大小上限配置无效", "error", err)
+		os.Exit(1)
+	}
 	slog.Info("配置已加载",
 		"port", cfg.Port,
 		"p2p", cfg.P2PEnabled,
@@ -262,11 +276,13 @@ func main() {
 			mode = "Peer-to-Peer (WebRTC)"
 		}
 		return c.Render("web/templates/home", fiber.Map{
-			"username":     c.Locals("username"),
-			"mode":         mode,
-			"port":         cfg.Port,
-			"max_size_mib": cfg.MaxMessageSizeMiB,
-			"is_admin":     c.Locals("role") == "ADMIN",
+			"username":           c.Locals("username"),
+			"mode":               mode,
+			"port":               cfg.Port,
+			"max_size_mib":       cfg.MaxMessageSizeMiB,
+			"is_admin":           c.Locals("role") == "ADMIN",
+			"file_relay_enabled": cfg.FileRelayEnabled,
+			"file_relay_max":     sizefmt.FormatBytes(cfg.FileRelayMaxBytes),
 		})
 	})
 	app.Get("/logout", authHandler.Logout)
@@ -275,6 +291,7 @@ func main() {
 	app.Get("/api/server-mode", statusHandler.ServerMode)
 	app.Get("/api/stun-url", statusHandler.GetStunURL)
 	app.Get("/api/max-size", statusHandler.GetMaxSizeAllowed)
+	app.Get("/api/files/config", statusHandler.FileRelayConfig)
 	app.Get("/api/validate-session", func(c *fiber.Ctx) error {
 		return c.JSON(fiber.Map{"valid": true})
 	})

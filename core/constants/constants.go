@@ -48,7 +48,7 @@ const (
 
 	AppName = "ClipCascade"
 	// AppVersion 是当前应用的版本号。
-	AppVersion = "2.5"
+	AppVersion = "2.6"
 
 	// --- 剪贴板内容类型 ---
 
@@ -80,7 +80,7 @@ const (
 	// DefaultFileAutoRelayMaxBytes 是 HTTP relay 自动同步的文件大小上限（25 MiB）。
 	// 超过此大小的文件仅登记元数据，接收端请求时才由源设备上传。
 	DefaultFileAutoRelayMaxBytes int64 = 25 * 1024 * 1024
-	// DefaultFileRelayMaxBytes 是 HTTP 文件中转服务端允许的单文件最大大小。（2G）
+	// DefaultFileRelayMaxBytes 是 HTTP 文件中转服务端允许的单文件默认最大大小（2 GiB），可由服务端启动配置覆盖。
 	DefaultFileRelayMaxBytes int64 = 2 * 1024 * 1024 * 1024
 	// DefaultSessionTimeoutMin 是默认用户会话有效期（7 天）。
 	// 旧值约 1 年（525960），过长；可用 CC_SESSION_TIMEOUT 覆盖（单位分钟）。

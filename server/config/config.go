@@ -13,18 +13,18 @@ import (
 
 // Config 保存所有 server config。
 type Config struct {
-	Port                            int
-	MaxMessageSizeMiB               int
-	MaxMessageSizeBytes             int64
-	P2PEnabled                      bool
-	P2PStunURL                      string
-	AllowedOrigins                  string
-	SignupEnabled                   bool
-	MaxUserAccounts                 int
-	SessionTimeoutMinutes           int
-	MaxAttemptsPerIP                int
+	Port                  int
+	MaxMessageSizeMiB     int
+	MaxMessageSizeBytes   int64
+	P2PEnabled            bool
+	P2PStunURL            string
+	AllowedOrigins        string
+	SignupEnabled         bool
+	MaxUserAccounts       int
+	SessionTimeoutMinutes int
+	MaxAttemptsPerIP      int
 	// APIRateLimit 每 IP 对 /api/* 的每分钟请求上限（<=0 关闭）
-	APIRateLimit int
+	APIRateLimit                    int
 	LockTimeoutSeconds              int
 	LockScalingFactor               int
 	BFACacheEnabled                 bool
@@ -53,27 +53,27 @@ type Config struct {
 func Load() *Config {
 	baseDir := executableDir()
 	c := &Config{
-		Port:                            envInt("CC_PORT", constants.DefaultPort),
-		MaxMessageSizeMiB:               envInt("CC_MAX_MESSAGE_SIZE_IN_MiB", constants.DefaultMaxMessageSizeMiB),
-		MaxMessageSizeBytes:             envInt64("CC_MAX_MESSAGE_SIZE_IN_BYTES", 0),
-		P2PEnabled:                      envBool("CC_P2P_ENABLED", false),
-		P2PStunURL:                      envStr("CC_P2P_STUN_URL", constants.DefaultStunURL),
+		Port:                envInt("CC_PORT", constants.DefaultPort),
+		MaxMessageSizeMiB:   envInt("CC_MAX_MESSAGE_SIZE_IN_MiB", constants.DefaultMaxMessageSizeMiB),
+		MaxMessageSizeBytes: envInt64("CC_MAX_MESSAGE_SIZE_IN_BYTES", 0),
+		P2PEnabled:          envBool("CC_P2P_ENABLED", false),
+		P2PStunURL:          envStr("CC_P2P_STUN_URL", constants.DefaultStunURL),
 		// 默认空 = 仅同源（浏览器同源请求不需要 CORS 头，WS 做 Origin 同源校验）；
 		// 需要跨域时显式设置 CC_ALLOWED_ORIGINS（逗号分隔）或 "*"（不限制）
-		AllowedOrigins:                  envStr("CC_ALLOWED_ORIGINS", ""),
-		SignupEnabled:                   envBool("CC_SIGNUP_ENABLED", false),
-		MaxUserAccounts:                 envInt("CC_MAX_USER_ACCOUNTS", -1),
-		SessionTimeoutMinutes:           envInt("CC_SESSION_TIMEOUT", constants.DefaultSessionTimeoutMin),
-		MaxAttemptsPerIP:                envInt("CC_MAX_ATTEMPTS_PER_IP", constants.DefaultMaxAttemptsPerIP),
+		AllowedOrigins:        envStr("CC_ALLOWED_ORIGINS", ""),
+		SignupEnabled:         envBool("CC_SIGNUP_ENABLED", false),
+		MaxUserAccounts:       envInt("CC_MAX_USER_ACCOUNTS", -1),
+		SessionTimeoutMinutes: envInt("CC_SESSION_TIMEOUT", constants.DefaultSessionTimeoutMin),
+		MaxAttemptsPerIP:      envInt("CC_MAX_ATTEMPTS_PER_IP", constants.DefaultMaxAttemptsPerIP),
 		// 每 IP 对 /api/* 的每分钟请求上限；<=0 关闭。局域网自用默认宽松
-		APIRateLimit: envInt("CC_API_RATE_LIMIT", 240),
+		APIRateLimit:                    envInt("CC_API_RATE_LIMIT", 240),
 		LockTimeoutSeconds:              envInt("CC_LOCK_TIMEOUT_SECONDS", constants.DefaultLockTimeoutSeconds),
 		LockScalingFactor:               envInt("CC_LOCK_TIMEOUT_SCALING_FACTOR", constants.DefaultLockScalingFactor),
 		BFACacheEnabled:                 envBool("CC_BFA_CACHE_ENABLED", true),
 		DatabasePath:                    resolveRuntimePath(baseDir, envStr("CC_DATABASE_PATH", "./database/clipcascade.db")),
 		FileRelayEnabled:                envBool("CC_FILE_RELAY_ENABLED", true),
 		FileRelayDir:                    resolveRuntimePath(baseDir, envStr("CC_FILE_RELAY_DIR", "./uploads")),
-		FileRelayMaxBytes:               envInt64("CC_FILE_RELAY_MAX_BYTES", constants.DefaultFileRelayMaxBytes),
+		FileRelayMaxBytes:               fileRelayMaxBytesFromEnv(),
 		FileRelayTTLSeconds:             envInt64("CC_FILE_RELAY_TTL_SECONDS", 86400),
 		ExternalBrokerEnabled:           envBool("CC_EXTERNAL_BROKER_ENABLED", false),
 		BrokerHost:                      envStr("CC_BROKER_HOST", "localhost"),

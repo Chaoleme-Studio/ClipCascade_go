@@ -97,12 +97,7 @@ class ShareActivity : Activity() {
                 finish()
             }
             ShareDecision.TooLarge -> {
-                val message = if (intent.type?.startsWith("image/") == true) {
-                    "图片超过 25 MiB，Android 端不自动发送"
-                } else {
-                    "文件超过 2 GiB，暂不支持"
-                }
-                Toast.makeText(this, message, Toast.LENGTH_LONG).show()
+                Toast.makeText(this, "图片超过 25 MiB，Android 端不自动发送", Toast.LENGTH_LONG).show()
                 finish()
             }
             ShareDecision.UnsupportedFile -> {

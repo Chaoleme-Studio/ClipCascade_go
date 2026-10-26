@@ -96,9 +96,6 @@ class DeferredFileTransferService : Service() {
     private fun prepareDeferredSource(uri: Uri, fileName: String, sizeHint: Long, mimeType: String) {
         var stagedFile: File? = null
         try {
-            if (sizeHint > AndroidSharePolicy.MAX_RELAY_BYTES) {
-                throw DeferredFileTooLargeException()
-            }
             val prefs = getSharedPreferences("clipcascade", Context.MODE_PRIVATE)
             val serverURL = normalizeServerUrl(prefs.getString("ServerURL", "") ?: "")
             val username = prefs.getString("Username", "")?.trim().orEmpty()
@@ -107,7 +104,13 @@ class DeferredFileTransferService : Service() {
                 throw IllegalStateException("请先保存服务器账号")
             }
 
-            val staged = copyToPrivateSource(uri, sizeHint) { copied, total ->
+            val policy = apiSessionManager.withSession(serverURL, username, password) { cookie ->
+                fetchFileRelayPolicy(serverURL, cookie)
+            }
+            if (sizeHint > 0L) {
+                policy.checkSize(sizeHint)
+            }
+            val staged = copyToPrivateSource(uri, sizeHint, policy) { copied, total ->
                 updateProgressNotification("正在保存 $fileName", copied, total)
             }
             stagedFile = staged
@@ -141,10 +144,10 @@ class DeferredFileTransferService : Service() {
             updateNotification("已登记：${registration.fileName}")
             showToast("大文件已登记，其他设备请求下载时再上传")
             Log.i(tag, "延迟文件已登记: id=${registration.deferredID} name=${registration.fileName} size=${registration.fileSize}")
-        } catch (e: DeferredFileTooLargeException) {
-            Log.i(tag, "分享文件超过 2 GiB")
-            updateNotification("文件超过 2 GiB，无法登记")
-            showToast("文件超过 2 GiB，暂不支持")
+        } catch (e: FileRelayTooLargeException) {
+            Log.i(tag, e.message.orEmpty())
+            updateNotification(e.message.orEmpty())
+            showToast(e.message.orEmpty())
         } catch (e: Exception) {
             Log.e(tag, "延迟文件准备失败", e)
             updateNotification("大文件登记失败")
@@ -157,6 +160,7 @@ class DeferredFileTransferService : Service() {
     private fun copyToPrivateSource(
         uri: Uri,
         sizeHint: Long,
+        policy: FileRelayPolicy,
         onProgress: (copiedBytes: Long, totalBytes: Long) -> Unit
     ): File {
         val dir = DeferredFileSourceStore.sourceDirectory(this)
@@ -176,9 +180,7 @@ class DeferredFileTransferService : Service() {
                             break
                         }
                         copied += read.toLong()
-                        if (copied > AndroidSharePolicy.MAX_RELAY_BYTES) {
-                            throw DeferredFileTooLargeException()
-                        }
+                        policy.checkSize(copied)
                         output.write(buffer, 0, read)
                         val now = System.currentTimeMillis()
                         if (now - lastNotificationAt >= 500L) {
@@ -257,5 +259,4 @@ class DeferredFileTransferService : Service() {
         super.onDestroy()
     }
 
-    private class DeferredFileTooLargeException : Exception()
 }

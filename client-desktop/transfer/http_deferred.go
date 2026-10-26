@@ -34,6 +34,13 @@ func RegisterDeferredFile(client *http.Client, serverURL string, reqBody *Deferr
 	if reqBody == nil {
 		return nil, fmt.Errorf("register request is nil")
 	}
+	policy, err := FetchFileRelayConfig(client, serverURL)
+	if err != nil {
+		return nil, err
+	}
+	if err := policy.CheckSize(reqBody.FileSize); err != nil {
+		return nil, err
+	}
 	body, err := json.Marshal(reqBody)
 	if err != nil {
 		return nil, err
