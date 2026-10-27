@@ -73,7 +73,11 @@ class MainActivity : Activity() {
     private var discoveryRunning = false
     private var discoveryRestartPending = false
     private var discoveryUiScanning = false
-    private var openDiscoveryMenuWhenReady = false
+    private var discoveryRound = 0
+    private var discoveryBatchActive = false
+    private var discoveryStopRequested = false
+    private var discoveryStopFailed = false
+    private var discoveryNetworkFingerprint: String? = null
     private var resolveInFlight = false
     private var activityResumed = false
     private var connectivityManager: ConnectivityManager? = null
@@ -82,10 +86,10 @@ class MainActivity : Activity() {
     private var activeNetworkFingerprint = ""
     private var discoveryRestartTask: Runnable? = null
     private var discoveryUiTimeoutTask: Runnable? = null
-    private var discoveryMenuTask: Runnable? = null
 
     private lateinit var serverAddressInput: EditText
     private lateinit var discoverButton: MaterialButton
+    private lateinit var discoveryStatusText: TextView
     private lateinit var clipboardList: LinearLayout
     private lateinit var deferredFileListView: LinearLayout
     private lateinit var clipboardTabButton: MaterialButton
@@ -188,13 +192,17 @@ class MainActivity : Activity() {
                 if (synchronized(discoveredServers) { discoveredServers.isNotEmpty() }) {
                     showDiscoveredServersMenu(this, serverAddressInput)
                 } else {
-                    restartServerDiscovery(serverAddressInput, this, showMenuWhenFound = true)
+                    restartServerDiscovery(this)
                 }
             }
             setOnLongClickListener {
-                restartServerDiscovery(serverAddressInput, this, showMenuWhenFound = true)
+                restartServerDiscovery(this)
                 true
             }
+        }
+        discoveryStatusText = TextView(this).apply {
+            textSize = 12f
+            setTextColor(color(R.color.cc_text_secondary))
         }
         val serverRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
@@ -356,6 +364,7 @@ class MainActivity : Activity() {
         }, blockParams())
         layout.addView(card("连接", "填写服务端和账号，启动后通知栏会显示同步状态").apply {
             addView(serverRow)
+            addView(discoveryStatusText, blockParams(top = 4))
             addView(userInput, blockParams(top = 10))
             addView(passInput, blockParams(top = 10))
             addView(e2eeCheck, blockParams(top = 8))
@@ -717,7 +726,7 @@ class MainActivity : Activity() {
     private fun registerConnectivityMonitoring() {
         if (connectivityCallback != null) return
         val manager = getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager ?: run {
-            restartServerDiscovery(serverAddressInput, discoverButton)
+            restartServerDiscovery(discoverButton)
             return
         }
         connectivityManager = manager
@@ -745,7 +754,10 @@ class MainActivity : Activity() {
                             activeNetwork,
                             activeNetwork?.let(manager::getLinkProperties)
                         )
-                        scheduleDiscoveryRestart()
+                        if (activityResumed && discoveryNetworkFingerprint != activeNetworkFingerprint) {
+                            discoveryNetworkFingerprint = activeNetworkFingerprint
+                            scheduleDiscoveryRestart()
+                        }
                     }
                 }
             }
@@ -757,7 +769,10 @@ class MainActivity : Activity() {
             connectivityCallback = null
             Log.w(tag, "无法监听网络变化，局域网发现仍可手动刷新", e)
         }
-        scheduleDiscoveryRestart(delayMillis = 0L)
+        if (discoveryNetworkFingerprint != activeNetworkFingerprint) {
+            discoveryNetworkFingerprint = activeNetworkFingerprint
+            scheduleDiscoveryRestart(delayMillis = 0L)
+        }
     }
 
     private fun unregisterConnectivityMonitoring() {
@@ -775,10 +790,12 @@ class MainActivity : Activity() {
     }
 
     private fun handleNetworkChanged(network: Network, linkProperties: LinkProperties?) {
+        if (!activityResumed) return
         val fingerprint = networkFingerprint(network, linkProperties)
         if (network == activeNetwork && fingerprint == activeNetworkFingerprint) return
         activeNetwork = network
         activeNetworkFingerprint = fingerprint
+        discoveryNetworkFingerprint = fingerprint
         Log.i(tag, "局域网地址发生变化，重新发现服务: $fingerprint")
         scheduleDiscoveryRestart()
     }
@@ -798,7 +815,7 @@ class MainActivity : Activity() {
         val task = Runnable {
             discoveryRestartTask = null
             if (activityResumed) {
-                restartServerDiscovery(serverAddressInput, discoverButton)
+                restartServerDiscovery(discoverButton, networkChanged = true)
             }
         }
         discoveryRestartTask = task
@@ -806,37 +823,80 @@ class MainActivity : Activity() {
     }
 
     private fun restartServerDiscovery(
-        serverInput: EditText,
         discoverMenuBtn: Button,
-        showMenuWhenFound: Boolean = false
+        networkChanged: Boolean = false
     ) {
-        discoveryGeneration++
-        clearServiceResolutions()
-        discoveryRestartPending = false
-        resolveInFlight = false
-        pendingServiceResolutions.clear()
+        if (!activityResumed) return
+        if (discoveryStopFailed) {
+            discoveryStatusText.text = "搜索停止失败，请稍后重试"
+            stopServerDiscovery()
+            return
+        }
+        // 连续点击不能重新计时；真实网络变化才替换正在运行的一批搜索。
+        if (!networkChanged && (discoveryUiScanning || discoveryStopRequested)) return
+        cancelDiscoveryCallbacks()
+        discoveryRound = 0
+        discoveryBatchActive = true
         synchronized(discoveredServers) {
             discoveredServers.clear()
             discoveredServiceUrls.clear()
         }
-        openDiscoveryMenuWhenReady = showMenuWhenFound
-        discoveryUiScanning = true
         updateDiscoverButton(discoverMenuBtn)
-        scheduleDiscoveryTimeout(discoverMenuBtn)
-
         if (discoveryListener != null) {
-            discoveryRestartPending = true
             stopServerDiscovery(restartAfterStop = true)
             return
         }
-        startServerDiscovery(serverInput, discoverMenuBtn, discoveryGeneration)
+        startNextDiscoveryRound(discoverMenuBtn)
     }
 
-    private fun startServerDiscovery(serverInput: EditText, discoverMenuBtn: Button, generation: Int) {
+    private fun startNextDiscoveryRound(discoverMenuBtn: Button) {
+        if (!activityResumed || !discoveryBatchActive || discoveryListener != null || discoveryStopFailed || discoveryRound >= 3) return
+        discoveryRound++
+        discoveryGeneration++
+        discoveryUiScanning = true
+        discoveryStatusText.text = "正在搜索局域网服务（第 $discoveryRound/3 轮）"
+        updateDiscoverButton(discoverMenuBtn)
+        scheduleDiscoveryTimeout(discoverMenuBtn, discoveryGeneration)
+        Log.i(tag, "mDNS round $discoveryRound/3 started, generation=$discoveryGeneration")
+        startServerDiscovery(discoverMenuBtn, discoveryGeneration)
+    }
+
+    private fun continueDiscoveryBatch() {
+        if (!activityResumed || !discoveryBatchActive || discoveryStopFailed) return
+        val count = synchronized(discoveredServers) { discoveredServers.size }
+        if (count > 0) {
+            discoveryBatchActive = false
+            discoveryStatusText.text = "发现 $count 个服务，点击“发现”选择"
+            return
+        }
+        if (discoveryRound >= 3) {
+            discoveryBatchActive = false
+            discoveryStatusText.text = "未发现服务，点击“发现”重试"
+            Log.i(tag, "mDNS batch exhausted; no discovery retry scheduled")
+            return
+        }
+        val delay = if (discoveryRound == 1) 10_000L else 30_000L
+        discoveryStatusText.text = "暂未发现服务，${delay / 1000} 秒后进行第 ${discoveryRound + 1}/3 轮搜索"
+        val generation = discoveryGeneration
+        val task = Runnable {
+            discoveryRestartTask = null
+            if (activityResumed && generation == discoveryGeneration) {
+                startNextDiscoveryRound(discoverButton)
+            }
+        }
+        discoveryRestartTask?.let(uiHandler::removeCallbacks)
+        discoveryRestartTask = task
+        uiHandler.postDelayed(task, delay)
+    }
+
+    private fun startServerDiscovery(discoverMenuBtn: Button, generation: Int) {
         if (!activityResumed || generation != discoveryGeneration) return
         val manager = (getSystemService(Context.NSD_SERVICE) as? NsdManager) ?: run {
             discoveryUiScanning = false
+            discoveryUiTimeoutTask?.let(uiHandler::removeCallbacks)
+            discoveryUiTimeoutTask = null
             updateDiscoverButton(discoverMenuBtn)
+            continueDiscoveryBatch()
             return
         }
         nsdManager = manager
@@ -860,17 +920,17 @@ class MainActivity : Activity() {
                 discoveryListener = null
                 discoveryRunning = false
                 discoveryUiScanning = false
+                discoveryUiTimeoutTask?.let(uiHandler::removeCallbacks)
+                discoveryUiTimeoutTask = null
+                discoveryGeneration++
                 updateDiscoverButton(discoverMenuBtn)
-                if (openDiscoveryMenuWhenReady && activityResumed) {
-                    openDiscoveryMenuWhenReady = false
-                    Toast.makeText(this@MainActivity, "局域网扫描启动失败，请重试", Toast.LENGTH_SHORT).show()
-                }
+                continueDiscoveryBatch()
             }
 
             override fun onStopDiscoveryFailed(serviceType: String, errorCode: Int) {
                 Log.w(tag, "mDNS discovery failed to stop: $errorCode")
                 val listener = this
-                uiHandler.post { finishDiscoveryStop(listener) }
+                uiHandler.post { handleDiscoveryStopFailed(listener) }
             }
 
             override fun onDiscoveryStopped(serviceType: String) {
@@ -911,11 +971,11 @@ class MainActivity : Activity() {
                     return
                 }
                 if (Build.VERSION.SDK_INT >= 34) {
-                    resolveServiceUpdates(manager, serviceInfo, serverInput, discoverMenuBtn, generation)
+                    resolveServiceUpdates(manager, serviceInfo, discoverMenuBtn, generation)
                     return
                 }
                 pendingServiceResolutions.addLast(serviceInfo)
-                resolveNextService(serverInput, discoverMenuBtn, generation)
+                resolveNextService(discoverMenuBtn, generation)
             }
         }
 
@@ -925,8 +985,12 @@ class MainActivity : Activity() {
         } catch (e: Exception) {
             discoveryListener = null
             discoveryUiScanning = false
+            discoveryUiTimeoutTask?.let(uiHandler::removeCallbacks)
+            discoveryUiTimeoutTask = null
+            discoveryGeneration++
             updateDiscoverButton(discoverMenuBtn)
             Log.w(tag, "mDNS discover start failed", e)
+            continueDiscoveryBatch()
         }
     }
 
@@ -936,7 +1000,6 @@ class MainActivity : Activity() {
     private fun resolveServiceUpdates(
         manager: NsdManager,
         service: NsdServiceInfo,
-        serverInput: EditText,
         discoverMenuBtn: Button,
         generation: Int
     ) {
@@ -968,7 +1031,7 @@ class MainActivity : Activity() {
                         discoveryRank(buildHttpUrl(it.hostAddress.orEmpty(), info.port))
                     }))
                 val host = candidates.firstOrNull()?.hostAddress ?: return
-                addDiscoveredServer(buildHttpUrl(host, info.port), service.serviceName, serverInput, discoverMenuBtn)
+                addDiscoveredServer(buildHttpUrl(host, info.port), service.serviceName, discoverMenuBtn)
             }
 
             override fun onServiceLost() {
@@ -1003,7 +1066,7 @@ class MainActivity : Activity() {
     }
 
     @Suppress("DEPRECATION")
-    private fun resolveNextService(serverInput: EditText, discoverMenuBtn: Button, generation: Int) {
+    private fun resolveNextService(discoverMenuBtn: Button, generation: Int) {
         if (resolveInFlight || generation != discoveryGeneration) return
         val serviceInfo = pendingServiceResolutions.pollFirst() ?: return
         val manager = nsdManager ?: return
@@ -1015,7 +1078,7 @@ class MainActivity : Activity() {
                         if (generation != discoveryGeneration) return@post
                         resolveInFlight = false
                         Log.d(tag, "mDNS resolve failed: $errorCode")
-                        resolveNextService(serverInput, discoverMenuBtn, generation)
+                        resolveNextService(discoverMenuBtn, generation)
                     }
                 }
 
@@ -1028,64 +1091,86 @@ class MainActivity : Activity() {
                             addDiscoveredServer(
                                 url = buildHttpUrl(host, info.port),
                                 serviceName = info.serviceName,
-                                serverInput = serverInput,
                                 discoverMenuBtn = discoverMenuBtn
                             )
                         }
-                        resolveNextService(serverInput, discoverMenuBtn, generation)
+                        resolveNextService(discoverMenuBtn, generation)
                     }
                 }
             })
         } catch (e: Exception) {
             resolveInFlight = false
             Log.d(tag, "mDNS resolve failed to run", e)
-            resolveNextService(serverInput, discoverMenuBtn, generation)
+            resolveNextService(discoverMenuBtn, generation)
         }
     }
 
     private fun stopServerDiscovery(restartAfterStop: Boolean = false) {
+        // 先使旧解析结果失效，停止系统搜索与 UI 超时必须是同一个生命周期。
+        discoveryGeneration++
+        discoveryUiScanning = false
+        discoveryUiTimeoutTask?.let(uiHandler::removeCallbacks)
+        discoveryUiTimeoutTask = null
         clearServiceResolutions()
+        resolveInFlight = false
+        pendingServiceResolutions.clear()
         discoveryRestartPending = discoveryRestartPending || restartAfterStop
         val manager = nsdManager
         val listener = discoveryListener
         if (manager == null || listener == null) {
             if (discoveryRestartPending && activityResumed) {
                 discoveryRestartPending = false
-                startServerDiscovery(serverAddressInput, discoverButton, discoveryGeneration)
+                startNextDiscoveryRound(discoverButton)
             }
             return
         }
+        if (discoveryStopRequested) return
+        discoveryStopRequested = true
         try {
             manager.stopServiceDiscovery(listener)
         } catch (e: Exception) {
             Log.d(tag, "mDNS stop failed", e)
-            finishDiscoveryStop(listener)
+            handleDiscoveryStopFailed(listener)
         }
+    }
+
+    private fun handleDiscoveryStopFailed(listener: NsdManager.DiscoveryListener) {
+        if (discoveryListener !== listener) return
+        discoveryStopRequested = false
+        discoveryStopFailed = true
+        cancelDiscoveryCallbacks()
+        discoveryStatusText.text = "搜索停止失败，请稍后重试"
+        updateDiscoverButton(discoverButton)
+        // 保留 listener，后续清理仍可尝试停止；禁止同时开启另一轮搜索。
     }
 
     private fun finishDiscoveryStop(listener: NsdManager.DiscoveryListener) {
         if (discoveryListener !== listener) return
+        val previouslyFailed = discoveryStopFailed
         discoveryListener = null
+        discoveryStopRequested = false
+        discoveryStopFailed = false
         discoveryRunning = false
         resolveInFlight = false
         pendingServiceResolutions.clear()
-        if (discoveryRestartPending && activityResumed) {
+        updateDiscoverButton(discoverButton)
+        if (previouslyFailed || !activityResumed || !discoveryBatchActive) return
+        if (discoveryRestartPending) {
             discoveryRestartPending = false
-            uiHandler.postDelayed({
-                startServerDiscovery(serverAddressInput, discoverButton, discoveryGeneration)
-            }, 200L)
+            startNextDiscoveryRound(discoverButton)
+        } else {
+            continueDiscoveryBatch()
         }
     }
 
     private fun addDiscoveredServer(
         url: String,
         serviceName: String,
-        serverInput: EditText,
         discoverMenuBtn: Button
     ) {
         val normalized = url.trim()
         if (normalized.isBlank() || !isUsableDiscoveryUrl(normalized)) return
-        val added = synchronized(discoveredServers) {
+        synchronized(discoveredServers) {
             val oldUrl = discoveredServiceUrls.put(serviceName, normalized)
             if (oldUrl != null && oldUrl != normalized && !discoveredServiceUrls.containsValue(oldUrl)) {
                 discoveredServers.remove(oldUrl)
@@ -1093,46 +1178,37 @@ class MainActivity : Activity() {
             discoveredServers.add(normalized)
         }
         updateDiscoverButton(discoverMenuBtn)
-        val current = serverInput.text?.toString()?.trim().orEmpty()
-        if (current.isBlank() || current == "http://localhost:8080" || !isUsableDiscoveryUrl(current)) {
-            serverInput.setText(normalized)
-        }
-        if (added && openDiscoveryMenuWhenReady) {
-            openDiscoveryMenuWhenReady = false
-            discoveryMenuTask?.let(uiHandler::removeCallbacks)
-            val task = Runnable {
-                discoveryMenuTask = null
-                if (activityResumed) showDiscoveredServersMenu(discoverMenuBtn, serverInput)
-            }
-            discoveryMenuTask = task
-            uiHandler.post(task)
-        }
+        discoveryStatusText.text = "发现服务，搜索结束后点击“发现”选择"
     }
 
-    private fun scheduleDiscoveryTimeout(discoverMenuBtn: Button) {
+    private fun scheduleDiscoveryTimeout(discoverMenuBtn: Button, generation: Int) {
         discoveryUiTimeoutTask?.let(uiHandler::removeCallbacks)
         val task = Runnable {
+            if (generation != discoveryGeneration || !activityResumed) return@Runnable
             discoveryUiTimeoutTask = null
             discoveryUiScanning = false
             updateDiscoverButton(discoverMenuBtn)
-            if (openDiscoveryMenuWhenReady) {
-                openDiscoveryMenuWhenReady = false
-                Toast.makeText(this, "未发现局域网中的 ClipCascade 服务", Toast.LENGTH_SHORT).show()
-            }
+            Log.i(tag, "mDNS round $discoveryRound/3 timed out; stopping discovery and resolutions")
+            stopServerDiscovery()
         }
         discoveryUiTimeoutTask = task
         uiHandler.postDelayed(task, 5000L)
     }
 
     private fun cancelDiscoveryCallbacks() {
+        val hadPendingSearch = discoveryBatchActive || discoveryUiScanning || discoveryRestartTask != null || discoveryStopRequested
+        discoveryBatchActive = false
+        discoveryGeneration++
         discoveryRestartTask?.let(uiHandler::removeCallbacks)
         discoveryUiTimeoutTask?.let(uiHandler::removeCallbacks)
-        discoveryMenuTask?.let(uiHandler::removeCallbacks)
         discoveryRestartTask = null
         discoveryUiTimeoutTask = null
-        discoveryMenuTask = null
         discoveryUiScanning = false
-        openDiscoveryMenuWhenReady = false
+        discoveryRestartPending = false
+        if (!activityResumed && hadPendingSearch && ::discoveryStatusText.isInitialized) {
+            discoveryStatusText.text = "搜索已暂停，点击“发现”继续"
+        }
+        if (::discoverButton.isInitialized) updateDiscoverButton(discoverButton)
     }
 
     private fun updateDiscoverButton(btn: Button) {

@@ -48,7 +48,7 @@ const (
 
 	AppName = "ClipCascade"
 	// AppVersion 是当前应用的版本号。
-	AppVersion = "2.7"
+	AppVersion = "2.8"
 
 	// --- 剪贴板内容类型 ---
 

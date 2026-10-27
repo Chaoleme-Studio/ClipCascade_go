@@ -24,7 +24,6 @@ import android.webkit.MimeTypeMap
 import android.widget.LinearLayout
 import androidx.core.content.ContextCompat
 import bridge.bridge.Bridge
-import bridge.bridge.Engine
 import bridge.bridge.MessageCallback
 import java.io.File
 import java.io.FileOutputStream
@@ -32,6 +31,7 @@ import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
 import java.util.concurrent.RejectedExecutionException
+import java.util.concurrent.atomic.AtomicInteger
 
 class ClipCascadeBackgroundService : Service(), MessageCallback {
 
@@ -66,7 +66,7 @@ class ClipCascadeBackgroundService : Service(), MessageCallback {
     
     // 后台同步引擎实例
     @Volatile
-    private var engine: Engine? = null
+    private var engine: ClipboardSyncEngine? = null
     @Volatile
     private var engineStarting = false
     
@@ -77,6 +77,7 @@ class ClipCascadeBackgroundService : Service(), MessageCallback {
     // 用于透明悬浮窗的视图
     private var overlayLayout: LinearLayout? = null
     private var clipboardReadTask: Runnable? = null
+    private val clipboardReadGeneration = AtomicInteger()
     private var pendingClipboardText: String? = null
     private var destroyed = false
     private val outgoingClipboardExecutor = Executors.newSingleThreadExecutor()
@@ -94,6 +95,7 @@ class ClipCascadeBackgroundService : Service(), MessageCallback {
         override fun onAvailable(network: Network) {
             Log.i(TAG, "🌐 网络恢复可用，触发引擎重连/补发")
             mainHandler.post {
+                cancelClipboardRead("network changed")
                 engine?.reconnectNow()
                 startEngineIfNeeded()
             }
@@ -142,11 +144,14 @@ class ClipCascadeBackgroundService : Service(), MessageCallback {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         Log.i(TAG, "🚀 后台服务已启动 (onStartCommand)")
+        // 复制事件不负责拉起连接重试；离线时不能为了读取剪贴板抢窗口焦点。
+        if (intent?.action == ACTION_SYNC_CLIPBOARD_NOW) {
+            requestClipboardReadForSync()
+            return START_STICKY
+        }
         startEngineIfNeeded()
         if (intent?.action == ACTION_REFRESH_DEVICE_COUNTS) {
             refreshDeviceCounts()
-        } else if (intent?.action == ACTION_SYNC_CLIPBOARD_NOW) {
-            requestClipboardReadForSync()
         } else if (intent?.action == ACTION_SEND_SHARED_TEXT) {
             val sharedText = intent.getStringExtra(EXTRA_SHARED_TEXT)?.trim().orEmpty()
             if (sharedText.isNotBlank()) {
@@ -182,21 +187,28 @@ class ClipCascadeBackgroundService : Service(), MessageCallback {
      * addView 后焦点授予是异步的，等窗口拿到焦点再读；窗口不能成为输入法目标。
      */
     fun requestClipboardReadForSync() {
-        Log.i(TAG, "🔍 开始请求读取剪贴板...")
-        startEngineIfNeeded()
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
-            // Android 10 以前没有后台读取限制，不需要悬浮窗。
-            readClipboardAndSyncToServer()
+        if (engine?.isConnected != true) {
+            Log.d(TAG, "跳过主动读取剪贴板：引擎未连接，不创建焦点窗口")
             return
         }
+        val generation = clipboardReadGeneration.get()
         mainHandler.post {
-            if (destroyed || clipboardReadTask != null) return@post
+            if (destroyed || generation != clipboardReadGeneration.get() || clipboardReadTask != null ||
+                engine?.isConnected != true) return@post
+            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+                readClipboardAndSyncToServer()
+                return@post
+            }
             try {
                 showInvisibleOverlay()
                 // 等待悬浮窗获得窗口焦点，最多约 2.4s（16 × 150ms）
                 var attempts = 0
                 val tryRead = object : Runnable {
                     override fun run() {
+                        if (destroyed || generation != clipboardReadGeneration.get() || engine?.isConnected != true) {
+                            cancelClipboardRead("connection lost before read")
+                            return
+                        }
                         val view = overlayLayout
                         val hasFocus = view?.hasWindowFocus() == true
                         if (!hasFocus && attempts < 16) {
@@ -221,9 +233,17 @@ class ClipCascadeBackgroundService : Service(), MessageCallback {
                 mainHandler.postDelayed(tryRead, 50L)
             } catch (e: Exception) {
                 Log.e(TAG, "悬浮窗或剪贴板操作失败: ${e.message}", e)
-                removeInvisibleOverlay() // 确保即使崩溃也要尝试移掉视图
+                cancelClipboardRead("read failed")
             }
         }
+    }
+
+    private fun cancelClipboardRead(reason: String, invalidateRequests: Boolean = true) {
+        if (invalidateRequests) clipboardReadGeneration.incrementAndGet()
+        clipboardReadTask?.let(mainHandler::removeCallbacks)
+        clipboardReadTask = null
+        if (overlayLayout != null) Log.d(TAG, "取消剪贴板读取: $reason")
+        removeInvisibleOverlay()
     }
 
     /**
@@ -434,9 +454,15 @@ class ClipCascadeBackgroundService : Service(), MessageCallback {
     }
 
     override fun onStatusChange(status: String) {
+        val cancelRead = status == "disconnected" || status == "reconnecting" || status == "error"
+        // Go 回调可能来自工作线程。立即使排队请求失效，避免主线程处理前已重连而复活旧请求。
+        if (cancelRead) clipboardReadGeneration.incrementAndGet()
         mainHandler.post {
             if (destroyed) return@post
             Log.i(TAG, "网络状态变更: $status")
+            if (cancelRead) {
+                cancelClipboardRead("engine status: $status", invalidateRequests = false)
+            }
             when (status) {
                 "connected" -> updateStatus("connected", "已连接到服务器，实时同步中")
                 "disconnected" -> updateStatus("disconnected", "连接已断开，等待自动重连")
@@ -632,7 +658,7 @@ class ClipCascadeBackgroundService : Service(), MessageCallback {
                     if (destroyed) {
                         created.stop()
                     } else {
-                        engine = created
+                        engine = GoClipboardSyncEngine(created)
                         updateStatus("connected", "已连接到 $url")
                         flushPendingClipboard()
                         refreshDeviceCounts()
@@ -830,8 +856,7 @@ class ClipCascadeBackgroundService : Service(), MessageCallback {
     override fun onDestroy() {
         Log.i(TAG, "🔴 后台服务被销毁")
         destroyed = true
-        clipboardReadTask?.let(mainHandler::removeCallbacks)
-        clipboardReadTask = null
+        cancelClipboardRead("service destroyed")
         clipboardManager.removePrimaryClipChangedListener(onClipChangeListener)
         try {
             val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
@@ -848,7 +873,6 @@ class ClipCascadeBackgroundService : Service(), MessageCallback {
         incomingPayloadExecutor.shutdownNow()
         deferredUploadExecutor.shutdownNow()
         outgoingClipboardExecutor.shutdownNow()
-        removeInvisibleOverlay()
         
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
             stopForeground(STOP_FOREGROUND_REMOVE)
