@@ -5,80 +5,77 @@ import android.content.Intent
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.util.Log
 import android.view.accessibility.AccessibilityEvent
+import java.util.Locale
 
 class ClipCascadeAccessibilityService : AccessibilityService() {
 
     private val TAG = "ClipCascade_A11y"
 
     private val handler = Handler(Looper.getMainLooper())
-    private var lastTriggerTime: Long = 0
+    private var lastTriggerTime: Long? = null
     private val DEBOUNCE_DELAY_MS = 1000L // 1秒防抖，防止短时间多次触发
+    private val copyActionLabels = setOf(
+        "复制", "复制链接", "复制链接地址", "复制文本", "复制文字", "复制内容", "复制地址", "复制网址", "复制图片", "复制代码", "复制到剪贴板",
+        "複製", "複製連結", "複製文字", "複製內容", "複製網址", "複製圖片", "複製到剪貼簿",
+        "copy", "copy link", "copy link address", "copy text", "copy image", "copy address", "copy url", "copy code", "copy to clipboard",
+        "剪切", "剪下", "cut"
+    )
+    private val copiedFeedback = Regex(
+        "已(?:成功)?复制|复制成功|复制完成|已(?:成功)?複製|複製成功|複製完成|\\bcopied\\b",
+        RegexOption.IGNORE_CASE
+    )
 
     // 延迟执行实际读取动作的 Runnable
     private val copyTriggerRunnable = Runnable {
         Log.i(TAG, "🟢 触发剪贴板同步检测流程...")
-        startBackgroundClipboardSync()
+        startBackgroundService(ClipCascadeBackgroundService.ACTION_SYNC_CLIPBOARD_NOW)
     }
 
     override fun onServiceConnected() {
         super.onServiceConnected()
         Log.i(TAG, "🚀 ClipCascade 无障碍服务已启动")
-        startBackgroundClipboardSync()
+        // 启动同步引擎即可；连接无障碍服务本身不是复制动作。
+        startBackgroundService()
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
         if (event == null) return
 
-        // 排除自身应用产生的事件，防止无限循环
-        if (event.packageName?.toString() == packageName) {
+        // 自身事件会造成回环；输入框中的文字不能被当作复制按钮标签。
+        if (event.packageName?.toString() == packageName || event.isPassword ||
+            event.className?.toString()?.endsWith("EditText") == true) {
             return
         }
 
-        // 核心逻辑：监听系统“复制”相关的事件。
-        // 由于不同手机厂商对“已复制到剪贴板”的提示不同（可能是 Toast，可能是系统 Announcement）
-        // 我们通过多种事件类型综合判断。
-        when (event.eventType) {
-            // 类型1: 文本发生选择或改变，极大可能是复制前奏或复制动作
-            AccessibilityEvent.TYPE_VIEW_TEXT_SELECTION_CHANGED,
+        val labels = event.text.map { it.toString().trim() } +
+            listOfNotNull(event.contentDescription?.toString()?.trim())
+        val isCopyEvent = when (event.eventType) {
             AccessibilityEvent.TYPE_VIEW_CLICKED -> {
-                // 不严格检测，直接尝试进入防抖阶段触发读取
-                debounceAndTriggerCopy()
+                labels.any { it.lowercase(Locale.ROOT) in copyActionLabels }
             }
-            
-            // 类型2: 系统吐司 (Toast) 或弹窗通知状态改变
-            AccessibilityEvent.TYPE_NOTIFICATION_STATE_CHANGED -> {
-                val text = event.text.toString()
-                // 大部分手机复制时会弹 Toast，例如 "已复制到剪贴板"
-                if (text.contains("复制") || text.contains("copy") || text.contains("Copied")) {
-                    Log.i(TAG, "🎯 识别到强特征复制 Toast，立即触发同步")
-                    debounceAndTriggerCopy(forceImmediate = true)
-                } else {
-                     debounceAndTriggerCopy()
-                }
-            }
-            
-            // 类型3: 系统的无障碍语音播报
+            AccessibilityEvent.TYPE_NOTIFICATION_STATE_CHANGED,
             AccessibilityEvent.TYPE_ANNOUNCEMENT -> {
-                val text = event.text.toString()
-                if (text.contains("复制") || text.contains("copy")) {
-                    debounceAndTriggerCopy(forceImmediate = true)
-                } else {
-                     debounceAndTriggerCopy()
-                }
+                labels.any(copiedFeedback::containsMatchIn)
             }
+            else -> false
+        }
+        if (isCopyEvent) {
+            debounceAndTriggerCopy(isCopyAction = event.eventType == AccessibilityEvent.TYPE_VIEW_CLICKED)
         }
     }
 
     /**
      * 防抖触发器：过滤高频连续事件，降低功耗
      */
-    private fun debounceAndTriggerCopy(forceImmediate: Boolean = false) {
-        val currentTime = System.currentTimeMillis()
+    private fun debounceAndTriggerCopy(isCopyAction: Boolean) {
+        val currentTime = SystemClock.uptimeMillis()
+        val previousTrigger = lastTriggerTime
         
-        // 如果距离上次触发太近（小于防抖时间），且不是强制立刻触发，就跳过
-        if (!forceImmediate && currentTime - lastTriggerTime < DEBOUNCE_DELAY_MS) {
+        // 忽略同一次复制随后发出的 Toast；新的明确复制动作仍须读取最新内容。
+        if (!isCopyAction && previousTrigger != null && currentTime - previousTrigger < DEBOUNCE_DELAY_MS) {
             return
         }
 
@@ -87,17 +84,13 @@ class ClipCascadeAccessibilityService : AccessibilityService() {
         // 移除之前还在等待中的任务
         handler.removeCallbacks(copyTriggerRunnable)
         
-        if (forceImmediate) {
-            // 延迟一点点时间（例如 300ms），等待系统把文本实际写入系统剪贴板
-            handler.postDelayed(copyTriggerRunnable, 300)
-        } else {
-            // 普通猜测事件，延迟时间长一点，确保是真的复制完在操作
-            handler.postDelayed(copyTriggerRunnable, 1200)
-        }
+        // 等待系统完成剪贴板写入；普通点击、打字、光标移动不再安排读取。
+        handler.postDelayed(copyTriggerRunnable, 300)
     }
 
     override fun onInterrupt() {
         Log.i(TAG, "⏸️ 无障碍服务被中断")
+        handler.removeCallbacks(copyTriggerRunnable)
     }
 
     override fun onUnbind(intent: Intent?): Boolean {
@@ -106,9 +99,9 @@ class ClipCascadeAccessibilityService : AccessibilityService() {
         return super.onUnbind(intent)
     }
 
-    private fun startBackgroundClipboardSync() {
+    private fun startBackgroundService(action: String? = null) {
         val intent = Intent(this, ClipCascadeBackgroundService::class.java).apply {
-            action = ClipCascadeBackgroundService.ACTION_SYNC_CLIPBOARD_NOW
+            this.action = action
         }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             startForegroundService(intent)

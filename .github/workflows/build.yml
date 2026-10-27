@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       release_ref:
-        description: "Optional Git ref to build (for example v2.6)"
+        description: "Optional Git ref to build (for example v2.7)"
         required: false
         default: ""
 
@@ -328,7 +328,7 @@ jobs:
           APK=build/ClipCascade-Android-Installable.apk
           TOOLS="$ANDROID_SDK_ROOT/build-tools/34.0.0"
           "$TOOLS/aapt" dump badging "$APK" > build/android-package-badging.txt
-          grep -m1 "^package:.*versionCode='26' versionName='2.6'" build/android-package-badging.txt
+          grep -m1 "^package:.*versionCode='27' versionName='2.7'" build/android-package-badging.txt
           "$TOOLS/apksigner" verify --verbose "$APK"
       - uses: actions/upload-artifact@v4
         with:
@@ -389,5 +389,5 @@ jobs:
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
-          body_path: CHANGELOG-2.6.md
+          body_path: CHANGELOG-2.7.md
           files: artifacts/*

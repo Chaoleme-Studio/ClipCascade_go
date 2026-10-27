@@ -178,18 +178,14 @@ class ClipCascadeBackgroundService : Service(), MessageCallback {
     }
 
     /**
-     * 【核心】主动通过悬浮窗焦点获取剪贴板数据。
-     * 就算我们在后台，只要弹出一个瞬间的悬浮窗，系统就会认为我们在前台。
-     *
-     * 注意：addView 后焦点授予是【异步】的，必须轮询等待窗口真正拿到焦点后再读，
-     * 否则 Android 10+ 的 primaryClip 会静默返回 null —— 这正是"后台发不出去、
-     * 切前台才行"的根因（前台 Activity 自带焦点所以必然成功）。
+     * Android 10+ 后台读取需要窗口焦点，仅由明确的复制事件触发。
+     * addView 后焦点授予是异步的，等窗口拿到焦点再读；窗口不能成为输入法目标。
      */
     fun requestClipboardReadForSync() {
         Log.i(TAG, "🔍 开始请求读取剪贴板...")
         startEngineIfNeeded()
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) {
-            // 老系统直接读
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+            // Android 10 以前没有后台读取限制，不需要悬浮窗。
             readClipboardAndSyncToServer()
             return
         }
@@ -262,23 +258,14 @@ class ClipCascadeBackgroundService : Service(), MessageCallback {
                 return
             }
 
-            try {
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                    showInvisibleOverlay()
-                }
-
-                // 写入前记录一下，防止 OnPrimaryClipChangedListener 再次触发发送
-                markLocalClipboardWrite(payload)
-                val clip = ClipData.newPlainText("ClipCascade", payload)
-                clipboardManager.setPrimaryClip(clip)
-                ClipboardHistoryStore.append(this, payload, "received")
-                notifyHistoryChanged()
-                Log.i(TAG, "✅ 成功写入 Android 系统剪贴板")
-            } finally {
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                    removeInvisibleOverlay()
-                }
-            }
+            // 后台写入不要求窗口焦点，不能为接收文本打断用户输入。
+            // 写入前记录，防止 OnPrimaryClipChangedListener 再次触发发送。
+            markLocalClipboardWrite(payload)
+            val clip = ClipData.newPlainText("ClipCascade", payload)
+            clipboardManager.setPrimaryClip(clip)
+            ClipboardHistoryStore.append(this, payload, "received")
+            notifyHistoryChanged()
+            Log.i(TAG, "✅ 成功写入 Android 系统剪贴板")
         } catch (e: Exception) {
             Log.e(TAG, "写入剪贴板失败: ${e.message}", e)
         }
@@ -461,7 +448,7 @@ class ClipCascadeBackgroundService : Service(), MessageCallback {
     }
 
     private val onClipChangeListener = ClipboardManager.OnPrimaryClipChangedListener {
-        // 前台/悬浮窗期间系统会触发此回调；无障碍服务负责全天候兜底触发。
+        // 前台/悬浮窗期间系统会触发此回调；无障碍仅在明确的复制事件后补充触发。
         // 这里真正执行同步：读取 guard 在 readClipboardAndSyncToServer 内部，
         // 自己写入引发的回调会被 lastWrittenText + 时间窗守卫拦下，不会造成回环。
         Log.d(TAG, "系统 OnPrimaryClipChanged 触发，尝试同步剪贴板")
@@ -684,23 +671,26 @@ class ClipCascadeBackgroundService : Service(), MessageCallback {
         val layoutParams = WindowManager.LayoutParams(
             1, 1, // 越小越好，1x1 像素
             WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY, // API 26+ Android 8.0 强制
-            // 设置不可触摸，也不截获点击，防止影响用户原本的操作
-            WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
+            // 保留剪贴板读取所需焦点，但禁止成为输入法目标，避免键盘弹出/收起。
+            WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
+                WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
+                WindowManager.LayoutParams.FLAG_ALT_FOCUSABLE_IM,
             PixelFormat.TRANSPARENT
-        )
-        // 去除焦点标记，改为只接收一次轻微获取焦点。这里是一个微妙的点，如果系统不给焦点，可以用 FLAG_NOT_TOUCH_MODAL 试试。
-        // 但根据 CopyCat 的经验，只要 mView 被添加到 WindowManager，就已经算作是“该应用持有的活跃视图”了。
-        layoutParams.flags = WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL
+        ).apply {
+            alpha = 0f
+            softInputMode = WindowManager.LayoutParams.SOFT_INPUT_STATE_UNCHANGED or
+                WindowManager.LayoutParams.SOFT_INPUT_ADJUST_NOTHING
+        }
         
         windowManager.addView(overlayLayout, layoutParams)
-        Log.v(TAG, "👻 [Hack] 添加了 1x1 透明悬浮窗骗取焦点")
+        Log.v(TAG, "添加剪贴板读取窗口（不参与输入法）")
     }
 
     private fun removeInvisibleOverlay() {
         overlayLayout?.let {
             try {
                 windowManager.removeView(it)
-                Log.v(TAG, "👻 [Hack] 移除了悬浮窗")
+                Log.v(TAG, "移除剪贴板读取窗口")
             } catch (e: Exception) {
                 Log.w(TAG, "移除悬浮窗出错: ${e.message}")
             }
