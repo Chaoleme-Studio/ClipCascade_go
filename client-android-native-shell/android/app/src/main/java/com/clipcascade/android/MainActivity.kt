@@ -9,6 +9,7 @@ import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.content.res.ColorStateList
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.Color
@@ -39,6 +40,7 @@ import android.widget.ImageButton
 import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.PopupMenu
+import android.widget.ProgressBar
 import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
@@ -106,6 +108,11 @@ class MainActivity : Activity() {
     private var deferredFileItems: List<DeferredFileItem> = emptyList()
     private var activeHistoryTab: HistoryTab = HistoryTab.CLIPBOARD
     private var deferredRefreshTask: Runnable? = null
+    private val deferredDownloadListener: () -> Unit = {
+        uiHandler.post {
+            if (activityResumed) showDeferredDownloadUpdates()
+        }
+    }
     private val apiSessionManager by lazy {
         ApiSessionManager(
             context = applicationContext,
@@ -431,6 +438,8 @@ class MainActivity : Activity() {
     override fun onResume() {
         super.onResume()
         activityResumed = true
+        deferredDownloads.addListener(deferredDownloadListener)
+        showDeferredDownloadUpdates()
         ContextCompat.registerReceiver(
             this,
             statusReceiver,
@@ -450,6 +459,7 @@ class MainActivity : Activity() {
 
     override fun onPause() {
         activityResumed = false
+        deferredDownloads.removeListener(deferredDownloadListener)
         unregisterConnectivityMonitoring()
         cancelDiscoveryCallbacks()
         stopServerDiscovery()
@@ -1355,6 +1365,10 @@ class MainActivity : Activity() {
     }
 
     private fun handleDeferredFileClick(item: DeferredFileItem) {
+        if (deferredDownloads.snapshot()[item.deferredID]?.finished == false) {
+            Toast.makeText(this, "文件正在下载", Toast.LENGTH_SHORT).show()
+            return
+        }
         downloadedUriFor(item)?.let { uri ->
             openDownloadedFile(uri, item.mimeType, item.fileName)
             return
@@ -1378,6 +1392,10 @@ class MainActivity : Activity() {
             withDownloadsPermission {
                 downloadReadyDeferredFile(item, serverURL, username, password)
             }
+            return
+        }
+        if (item.status == "requested" || item.status == "uploading") {
+            Toast.makeText(this, "正在等待源设备上传", Toast.LENGTH_SHORT).show()
             return
         }
         Toast.makeText(this, "正在请求文件：${item.fileName}", Toast.LENGTH_SHORT).show()
@@ -1426,25 +1444,53 @@ class MainActivity : Activity() {
         username: String,
         password: String
     ) {
+        if (!deferredDownloads.start(item.deferredID, item.fileSize)) {
+            Toast.makeText(this, "文件正在下载", Toast.LENGTH_SHORT).show()
+            return
+        }
         Toast.makeText(this, "正在下载：${item.fileName}", Toast.LENGTH_SHORT).show()
+        val appContext = applicationContext
+        val sessionManager = ApiSessionManager(
+            context = appContext,
+            normalizeServerUrl = ::normalizeServerUrl,
+            login = ::loginForApi
+        )
         Thread {
             try {
-                val download = apiSessionManager.withSession(serverURL, username, password) { cookie ->
-                    downloadDeferredFile(serverURL, cookie, item, this)
+                val download = sessionManager.withSession(serverURL, username, password) { cookie ->
+                    downloadDeferredFile(serverURL, cookie, item, appContext) { bytes, total ->
+                        deferredDownloads.progress(item.deferredID, bytes, total)
+                    }
                 }
-                markFileDownloaded(item, download.uri)
-                runOnUiThread {
-                    updateFileList()
-                    Toast.makeText(this, "已保存到 Download/${download.fileName}", Toast.LENGTH_LONG).show()
-                    openDownloadedFile(download.uri, item.mimeType, download.fileName)
+                val key = item.relayID.ifBlank { item.deferredID }
+                if (key.isNotBlank()) {
+                    appContext.getSharedPreferences("clipcascade", Context.MODE_PRIVATE).edit()
+                        .putString("DownloadedFileUri_$key", download.uri.toString())
+                        .remove("DownloadedFile_$key")
+                        .apply()
                 }
+                deferredDownloads.finish(item.deferredID, result = DeferredDownloadTracker.Result(
+                    download.uri.toString(), download.fileName, item.mimeType
+                ))
             } catch (e: Exception) {
-                Log.e(tag, "下载服务端大文件失败", e)
-                runOnUiThread {
-                    Toast.makeText(this, "文件下载失败：${e.message}", Toast.LENGTH_LONG).show()
-                }
+                Log.e("ClipCascade_UI", "下载服务端大文件失败", e)
+                deferredDownloads.finish(item.deferredID, error = e.message ?: "未知错误")
             }
         }.start()
+    }
+
+    private fun showDeferredDownloadUpdates() {
+        val finished = deferredDownloads.consumeFinished()
+        updateFileList()
+        finished.forEach { state ->
+            val result = state.result
+            if (result != null) {
+                Toast.makeText(this, "已保存到 Download/${result.fileName}", Toast.LENGTH_LONG).show()
+                openDownloadedFile(Uri.parse(result.uri), result.mimeType, result.fileName)
+            } else {
+                Toast.makeText(this, "文件下载失败：${state.error}", Toast.LENGTH_LONG).show()
+            }
+        }
     }
 
     private fun openHistoryImage(item: ClipboardHistoryItem) {
@@ -1667,11 +1713,6 @@ class MainActivity : Activity() {
         return oldFile?.takeIf { it.isFile }
     }
 
-    private fun markFileDownloaded(item: DeferredFileItem, uri: Uri) {
-        val key = item.relayID.ifBlank { item.deferredID }
-        markRelayDownloaded(key, uri)
-    }
-
     private fun markRelayDownloaded(key: String, uri: Uri) {
         if (key.isBlank()) return
         getSharedPreferences("clipcascade", Context.MODE_PRIVATE)
@@ -1786,8 +1827,18 @@ class MainActivity : Activity() {
     }
 
     private fun fileHistoryRow(item: DeferredFileItem): View {
-        val status = deferredStatusLabel(item)
-        val progress = if (item.uploadPercent > 0 && item.uploadPercent < 100) " ${item.uploadPercent}%" else ""
+        val download = deferredDownloads.snapshot()[item.deferredID]?.takeIf { !it.finished }
+        val percent = when {
+            download != null -> download.percent
+            item.status == "uploading" -> item.uploadPercent.coerceIn(0, 100)
+            else -> null
+        }
+        val status = when {
+            download != null && percent == 100 -> "正在保存"
+            download != null -> "下载中"
+            else -> deferredStatusLabel(item)
+        }
+        val progressLabel = percent?.let { " $it%" }.orEmpty()
         return LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(10), dp(8), dp(10), dp(8))
@@ -1797,7 +1848,7 @@ class MainActivity : Activity() {
             }
             setOnClickListener { handleDeferredFileClick(item) }
             addView(TextView(this@MainActivity).apply {
-                text = "$status$progress · ${item.fileSizeHuman}"
+                text = "$status$progressLabel · ${item.fileSizeHuman}"
                 textSize = 12f
                 setTextColor(color(R.color.cc_text_secondary))
             })
@@ -1807,6 +1858,16 @@ class MainActivity : Activity() {
                 maxLines = 2
                 setTextColor(color(R.color.cc_text_primary))
             })
+            if (download != null || item.status == "uploading" || item.status == "requested") {
+                addView(ProgressBar(this@MainActivity, null, android.R.attr.progressBarStyleHorizontal).apply {
+                    max = 100
+                    isIndeterminate = percent == null
+                    if (percent != null) progress = percent
+                    progressTintList = ColorStateList.valueOf(color(R.color.cc_primary))
+                    indeterminateTintList = ColorStateList.valueOf(color(R.color.cc_primary))
+                    contentDescription = "$status$progressLabel"
+                }, blockParams(top = 6))
+            }
         }
     }
 
@@ -1829,6 +1890,7 @@ class MainActivity : Activity() {
         styleTabButton(filesTabButton, tab == HistoryTab.FILES)
         if (tab == HistoryTab.FILES) {
             refreshDeferredFiles()
+            if (activityResumed) startDeferredRefreshLoop()
         }
     }
 
@@ -1845,7 +1907,7 @@ class MainActivity : Activity() {
                 if (activeHistoryTab == HistoryTab.FILES) {
                     refreshDeferredFiles()
                 }
-                uiHandler.postDelayed(this, 8000L)
+                uiHandler.postDelayed(this, if (activeHistoryTab == HistoryTab.FILES) 2000L else 8000L)
             }
         }
         uiHandler.post(deferredRefreshTask!!)

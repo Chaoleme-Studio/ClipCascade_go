@@ -5,6 +5,9 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.io.BufferedOutputStream
 import java.io.File
+import java.io.InputStream
+import java.io.OutputStream
+import java.io.IOException
 import java.net.HttpURLConnection
 import java.net.URL
 import java.time.Instant
@@ -13,6 +16,7 @@ import java.util.UUID
 data class DeferredFileItem(
     val deferredID: String,
     val fileName: String,
+    val fileSize: Long,
     val fileSizeHuman: String,
     val mimeType: String,
     val status: String,
@@ -232,7 +236,8 @@ fun downloadDeferredFile(
     serverURL: String,
     cookie: String,
     item: DeferredFileItem,
-    context: Context
+    context: Context,
+    onProgress: ((Long, Long) -> Unit)? = null
 ): PublicDownload {
     val baseURL = normalizeServerUrl(serverURL)
     val url = if (item.downloadURL.startsWith("http")) {
@@ -240,7 +245,7 @@ fun downloadDeferredFile(
     } else {
         "${baseURL.trimEnd('/')}/${item.downloadURL.trimStart('/')}"
     }
-    return downloadHttpFile(url, cookie, item.fileName, item.mimeType, context)
+    return downloadHttpFile(url, cookie, item.fileName, item.mimeType, context, item.fileSize, onProgress)
 }
 
 fun downloadRelayFile(
@@ -261,7 +266,9 @@ private fun downloadHttpFile(
     cookie: String,
     fileName: String,
     mimeType: String,
-    context: Context
+    context: Context,
+    sizeHint: Long = -1L,
+    onProgress: ((Long, Long) -> Unit)? = null
 ): PublicDownload {
     val conn = (URL(url).openConnection() as HttpURLConnection).apply {
         requestMethod = "GET"
@@ -279,9 +286,10 @@ private fun downloadHttpFile(
         val resolvedMimeType = conn.contentType?.substringBefore(';')?.trim().orEmpty().ifBlank {
             mimeType.ifBlank { "application/octet-stream" }
         }
+        val total = conn.contentLengthLong.takeIf { it > 0L } ?: sizeHint.takeIf { it > 0L } ?: -1L
         return PublicDownloadStore.save(context, fileName, resolvedMimeType) { output ->
             conn.inputStream.buffered(256 * 1024).use { input ->
-                input.copyTo(output, 256 * 1024)
+                copyDownloadWithProgress(input, output, total, onProgress)
             }
         }
     } finally {
@@ -289,10 +297,33 @@ private fun downloadHttpFile(
     }
 }
 
+internal fun copyDownloadWithProgress(
+    input: InputStream,
+    output: OutputStream,
+    total: Long,
+    onProgress: ((Long, Long) -> Unit)? = null
+) {
+    val buffer = ByteArray(256 * 1024)
+    var copied = 0L
+    onProgress?.invoke(copied, total)
+    while (true) {
+        val count = input.read(buffer)
+        if (count < 0) break
+        if (count == 0) continue
+        output.write(buffer, 0, count)
+        copied += count
+        onProgress?.invoke(copied, total)
+    }
+    if (total > 0L && copied != total) {
+        throw IOException("下载不完整：收到 $copied / $total 字节")
+    }
+}
+
 private fun parseDeferredFile(obj: JSONObject): DeferredFileItem {
     return DeferredFileItem(
         deferredID = obj.optString("deferred_id"),
         fileName = obj.optString("file_name"),
+        fileSize = obj.optLong("file_size", -1L),
         fileSizeHuman = obj.optString("file_size_human"),
         mimeType = obj.optString("mime_type", "application/octet-stream"),
         status = obj.optString("status"),
