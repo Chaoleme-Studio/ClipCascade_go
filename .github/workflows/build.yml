@@ -91,11 +91,11 @@ jobs:
       matrix:
         include:
           - os: macos-arm64
-            runner: macos-14
+            runner: macos-26
             goos: darwin
             goarch: arm64
           - os: macos-amd64
-            runner: macos-14
+            runner: macos-26
             goos: darwin
             goarch: amd64
           - os: windows-amd64
@@ -194,7 +194,7 @@ jobs:
       matrix:
         include:
           - os: macos-arm64
-            runner: macos-14
+            runner: macos-26
             goos: darwin
             goarch: arm64
           - os: windows-amd64
