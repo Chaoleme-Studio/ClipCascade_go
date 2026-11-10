@@ -184,7 +184,7 @@ class MainActivity : Activity() {
         }
 
         serverAddressInput = EditText(this).apply {
-            hint = "服务器地址，例如 http://192.168.1.8:8080"
+            hint = "服务器地址，例如 http://192.168.1.8:5008"
             setText(normalizeServerUrl(prefs.getString("ServerURL", "") ?: ""))
             setSingleLine(true)
             inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI

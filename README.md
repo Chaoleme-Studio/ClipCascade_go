@@ -129,7 +129,7 @@ ClipCascade 的定位是：以剪贴板为中心，做一个可自部署、可�
 
 如果要手动指定账户密码的话，可以这样
 ```
-./build/clipcascade-desktop-ui-darwin-arm64 --server http://127.0.0.1:8080 --username admin --password admin123 --save
+./build/clipcascade-desktop-ui-darwin-arm64 --server http://127.0.0.1:5008 --username admin --password admin123 --save
 ```
 
 ## 解决什么问题
@@ -158,7 +158,7 @@ ClipCascade 的定位是：以剪贴板为中心，做一个可自部署、可�
 ```
   database : /path/to/binary/data.db
   uploads  : /path/to/binary/uploads/
-  ➜  http://localhost:8090/
+  ➜  http://localhost:5009/
 ```
 
 **命令行参数：**
@@ -173,7 +173,7 @@ ClipCascade 的定位是：以剪贴板为中心，做一个可自部署、可�
 
 | 环境变量 | 默认值 | 说明 |
 | --- | --- | --- |
-| `WEBCLIP_PORT` | `8090` | 端口，占用自动+1 |
+| `WEBCLIP_PORT` | `5009` | 端口，占用自动+1 |
 | `WEBCLIP_DB_PATH` | 二进制目录/data.db | 数据库路径 |
 | `WEBCLIP_UPLOAD_DIR` | 二进制目录/uploads | 上传目录 |
 | `WEBCLIP_PASSWORD` | 空 | 设置后全站启用访问口令 |
@@ -219,7 +219,7 @@ ClipCascade 的定位是：以剪贴板为中心，做一个可自部署、可�
 首次保存配置：
 
 ```bash
-./build/clipcascade-desktop-darwin-arm64 --server http://127.0.0.1:8080 --username admin --password admin123 --save
+./build/clipcascade-desktop-darwin-arm64 --server http://127.0.0.1:5008 --username admin --password admin123 --save
 ```
 
 调试日志：
@@ -551,7 +551,7 @@ CLIPCASCADE_WINDOWS_GUI=1 ./build-scripts/build.sh cross
 
 | 环境变量 | 默认值 | 说明 |
 | --- | --- | --- |
-| `CC_PORT` | `8080` | 服务端监听端口 |
+| `CC_PORT` | `5008` | 服务端监听端口 |
 | `CC_MAX_MESSAGE_SIZE_IN_MiB` | `20` | WebSocket 单消息大小上限，单位 MiB |
 | `CC_MAX_MESSAGE_SIZE_IN_BYTES` | `0` | WebSocket 单消息大小上限，单位字节；大于 0 时优先生效 |
 | `CC_P2P_ENABLED` | `false` | 是否启用 P2P 信令与 P2P 同步模式 |
@@ -590,7 +590,7 @@ CLIPCASCADE_WINDOWS_GUI=1 ./build-scripts/build.sh cross
 
 | 环境变量 | 默认值 | 说明 |
 | --- | --- | --- |
-| `WEBCLIP_PORT` | `8090` | Web 剪贴板端口，占用时自动加 1 |
+| `WEBCLIP_PORT` | `5009` | Web 剪贴板端口，占用时自动加 1 |
 | `WEBCLIP_DB_PATH` | 二进制目录 `data.db` | Web 剪贴板数据库路径 |
 | `WEBCLIP_UPLOAD_DIR` | 二进制目录 `uploads/` | Web 剪贴板上传目录 |
 | `WEBCLIP_PASSWORD` | 空 | 设置后全站启用访问口令 |

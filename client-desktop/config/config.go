@@ -17,7 +17,7 @@ import (
 
 // Config 保存 client config。
 type Config struct {
-	ServerURL      string `json:"server_url"` // e.g. "http://localhost:8080"
+	ServerURL      string `json:"server_url"` // e.g. "http://localhost:5008"
 	Username       string `json:"username"`
 	Password       string `json:"password"`
 	DeviceID       string `json:"device_id,omitempty"` // 稳定设备标识，用于回环过滤与消息溯源

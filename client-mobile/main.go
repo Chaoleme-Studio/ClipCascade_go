@@ -84,7 +84,7 @@ func main() {
 		fyne.Do(func() {
 			serverEntry.SetOptions(options)
 			current := strings.TrimSpace(serverEntry.Text)
-			if current == "" || current == "http://localhost:8080" {
+			if current == "" || current == "http://localhost:5008" {
 				serverEntry.SetText(options[0])
 			}
 		})

@@ -112,7 +112,7 @@ ClipCascade_go/
 
 | 环境变量 | 默认 |
 |---------|------|
-| WEBCLIP_PORT | 8090（占用自动+1）|
+| WEBCLIP_PORT | 5009（占用自动+1）|
 | WEBCLIP_DB_PATH | 二进制目录/data.db |
 | WEBCLIP_UPLOAD_DIR | 二进制目录/uploads |
 | WEBCLIP_PASSWORD | 空（不启用访问口令）|

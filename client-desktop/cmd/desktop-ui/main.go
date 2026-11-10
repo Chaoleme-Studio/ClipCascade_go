@@ -92,7 +92,7 @@ func main() {
 	lastEvent.Wrapping = fyne.TextWrapWord
 
 	serverEntry := widget.NewSelectEntry(nil)
-	serverEntry.SetPlaceHolder("服务器地址，例如 http://192.168.1.8:8080")
+	serverEntry.SetPlaceHolder("服务器地址，例如 http://192.168.1.8:5008")
 	serverEntry.SetText(cfg.ServerURL)
 	userEntry := widget.NewEntry()
 	userEntry.SetPlaceHolder("用户名")

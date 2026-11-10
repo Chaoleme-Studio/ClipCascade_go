@@ -20,9 +20,9 @@ COPY --from=builder /clipcascade-server /usr/local/bin/clipcascade-server
 RUN mkdir -p /data/database
 
 ENV CC_DATABASE_PATH=/data/database/clipcascade.db
-ENV CC_PORT=8080
+ENV CC_PORT=5008
 
-EXPOSE 8080
+EXPOSE 5008
 
 VOLUME ["/data"]
 

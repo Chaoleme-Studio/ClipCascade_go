@@ -129,7 +129,7 @@ Yes, brother, we've got you covered. The PC version also includes a UI component
 
 To manually specify account and password:
 ```bash
-./build/clipcascade-desktop-ui-darwin-arm64 --server http://127.0.0.1:8080 --username admin --password admin123 --save
+./build/clipcascade-desktop-ui-darwin-arm64 --server http://127.0.0.1:5008 --username admin --password admin123 --save
 ```
 
 ## Problems it Solves
@@ -157,7 +157,7 @@ Prints data path and access address upon startup:
 ```
   database : /path/to/binary/data.db
   uploads  : /path/to/binary/uploads/
-  ➜  http://localhost:8090/
+  ➜  http://localhost:5009/
 ```
 
 **Command Line Arguments:**
@@ -172,7 +172,7 @@ Prints data path and access address upon startup:
 
 | env | default | description |
 | --- | --- | --- |
-| `WEBCLIP_PORT` | `8090` | Port, auto-increments if occupied |
+| `WEBCLIP_PORT` | `5009` | Port, auto-increments if occupied |
 | `WEBCLIP_DB_PATH` | binary dir/data.db | Database path |
 | `WEBCLIP_UPLOAD_DIR` | binary dir/uploads | Upload directory |
 | `WEBCLIP_PASSWORD` | empty | Enables password access for the whole site |
@@ -218,7 +218,7 @@ Default credentials: `admin / admin123`
 First-time configuration save:
 
 ```bash
-./build/clipcascade-desktop-darwin-arm64 --server http://127.0.0.1:8080 --username admin --password admin123 --save
+./build/clipcascade-desktop-darwin-arm64 --server http://127.0.0.1:5008 --username admin --password admin123 --save
 ```
 
 Debug logging:
@@ -532,7 +532,7 @@ Relative paths are resolved from the server binary directory. The recommended re
 
 | Variable | Default | Description |
 | --- | --- | --- |
-| `CC_PORT` | `8080` | Server listen port |
+| `CC_PORT` | `5008` | Server listen port |
 | `CC_MAX_MESSAGE_SIZE_IN_MiB` | `20` | WebSocket single-message limit in MiB |
 | `CC_MAX_MESSAGE_SIZE_IN_BYTES` | `0` | WebSocket single-message limit in bytes; takes priority when greater than 0 |
 | `CC_P2P_ENABLED` | `false` | Enables P2P signaling and P2P sync mode |
@@ -571,7 +571,7 @@ Relative paths are resolved from the server binary directory. The recommended re
 
 | Variable | Default | Description |
 | --- | --- | --- |
-| `WEBCLIP_PORT` | `8090` | Web clipboard port; auto-increments when occupied |
+| `WEBCLIP_PORT` | `5009` | Web clipboard port; auto-increments when occupied |
 | `WEBCLIP_DB_PATH` | binary dir `data.db` | Web clipboard database path |
 | `WEBCLIP_UPLOAD_DIR` | binary dir `uploads/` | Web clipboard upload directory |
 | `WEBCLIP_PASSWORD` | empty | Enables password access for the whole site |

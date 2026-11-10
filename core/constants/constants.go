@@ -70,7 +70,7 @@ const (
 	// --- 默认服务器安全配置 ---
 
 	// DefaultPort 是服务器默认监听的端口。
-	DefaultPort = 8080
+	DefaultPort = 5008
 	// DefaultMaxMessageSizeMiB 是服务器处理的默认最大消息大小 (单位: MiB)。
 	DefaultMaxMessageSizeMiB = 20
 	// DefaultFileEagerThresholdBytes 是桌面端仍采用 base64 直传（TypeFileEager via STOMP）的文件上限。

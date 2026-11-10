@@ -238,7 +238,7 @@ func main() {
 	if uploadDir == "" {
 		uploadDir = filepath.Join(exeDir, "uploads")
 	}
-	startPort := 8090
+	startPort := 5009
 	if portFlag > 0 {
 		startPort = portFlag
 	} else if p := strings.TrimSpace(os.Getenv("WEBCLIP_PORT")); p != "" {

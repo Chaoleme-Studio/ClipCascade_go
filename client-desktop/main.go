@@ -21,7 +21,7 @@ var Version = "2.9"
 
 func main() {
 	// 为初始设置解析命令行参数 (flags)
-	serverURL := flag.String("server", "", "Server URL (e.g. http://localhost:8080)")
+	serverURL := flag.String("server", "", "Server URL (e.g. http://localhost:5008)")
 	username := flag.String("username", "", "Login username")
 	password := flag.String("password", "", "Login password")
 	noE2EE := flag.Bool("no-e2ee", false, "Disable end-to-end encryption")
@@ -83,7 +83,7 @@ func main() {
 		fmt.Println("   you need to configure credentials before connecting.")
 		fmt.Println()
 		fmt.Println("Quick start:")
-		fmt.Println("  clipcascade-desktop --server http://localhost:8080 --username admin --password admin123 --save")
+		fmt.Println("  clipcascade-desktop --server http://localhost:5008 --username admin --password admin123 --save")
 		fmt.Println()
 		fmt.Println("Or edit config file at:", cfgPath)
 		fmt.Println()
